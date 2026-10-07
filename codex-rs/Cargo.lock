@@ -2061,6 +2061,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-antfly-import"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "codex-antfly",
+ "codex-protocol",
+ "codex-rollout",
+ "codex-state",
+ "codex-thread-store",
+ "codex-utils-absolute-path",
+ "pretty_assertions",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "codex-api"
 version = "0.0.0"
 dependencies = [

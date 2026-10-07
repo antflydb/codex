@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "antfly",
+    "antfly-import",
     "aws-auth",
     "analytics",
     "agent-graph-store",
@@ -282,6 +283,7 @@ codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
 codex-antfly = { path = "antfly" }
 codex-antfly-extension = { path = "ext/antfly" }
+codex-antfly-import = { path = "antfly-import" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-terminal-detection = { path = "terminal-detection" }
