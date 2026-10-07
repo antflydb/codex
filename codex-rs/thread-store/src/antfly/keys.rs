@@ -7,6 +7,12 @@
 //!                                       newest first; value is the record
 //! ts:s:{section}:{position}:{thread}    section membership, in position order
 //! ts:rp:{path}                          legacy rollout path -> thread id
+//! ts:scn:{id}                           thread section definition
+//! ts:att:{thread}:{type}:{key}          canonical thread attachment
+//! ts:atl:{thread}:{asc created}:{id}    attachment listing for one thread
+//! ts:ato:{type}:{key}:{thread}          attachment owners for one identity
+//! ts:proj:{id}                          project record
+//! ts:pik:{key}                          project idempotency key -> project id
 //! ```
 
 use codex_antfly::keys;
@@ -19,6 +25,12 @@ pub(crate) const ITEM_PREFIX: &str = "ts:i:";
 pub(crate) const INDEX_PREFIX: &str = "ts:x:";
 pub(crate) const SECTION_PREFIX: &str = "ts:s:";
 pub(crate) const ROLLOUT_PATH_PREFIX: &str = "ts:rp:";
+pub(crate) const SECTION_DEF_PREFIX: &str = "ts:scn:";
+pub(crate) const ATTACHMENT_PREFIX: &str = "ts:att:";
+pub(crate) const ATTACHMENT_LIST_PREFIX: &str = "ts:atl:";
+pub(crate) const ATTACHMENT_OWNER_PREFIX: &str = "ts:ato:";
+pub(crate) const PROJECT_PREFIX: &str = "ts:proj:";
+pub(crate) const PROJECT_KEY_PREFIX: &str = "ts:pik:";
 
 pub(crate) fn thread(thread_id: ThreadId) -> String {
     format!("{THREAD_PREFIX}{thread_id}")
@@ -86,4 +98,63 @@ pub(crate) fn rollout_path(path: &std::path::Path) -> String {
         "{ROLLOUT_PATH_PREFIX}{}",
         keys::escape(&path.to_string_lossy())
     )
+}
+
+pub(crate) fn section_def(id: &str) -> String {
+    format!("{SECTION_DEF_PREFIX}{}", keys::escape(id))
+}
+
+pub(crate) fn attachment(thread_id: ThreadId, attachment_type: &str, identity_key: &str) -> String {
+    format!(
+        "{ATTACHMENT_PREFIX}{thread_id}:{}:{}",
+        keys::escape(attachment_type),
+        keys::escape(identity_key)
+    )
+}
+
+pub(crate) fn attachments_prefix(thread_id: ThreadId) -> String {
+    format!("{ATTACHMENT_PREFIX}{thread_id}:")
+}
+
+pub(crate) fn attachment_list_entry(
+    thread_id: ThreadId,
+    created_at: i64,
+    attachment_id: &str,
+) -> String {
+    format!(
+        "{ATTACHMENT_LIST_PREFIX}{thread_id}:{}:{attachment_id}",
+        keys::ascending(created_at)
+    )
+}
+
+pub(crate) fn attachment_list_prefix(thread_id: ThreadId) -> String {
+    format!("{ATTACHMENT_LIST_PREFIX}{thread_id}:")
+}
+
+pub(crate) fn attachment_owner_entry(
+    attachment_type: &str,
+    identity_key: &str,
+    thread_id: ThreadId,
+) -> String {
+    format!(
+        "{ATTACHMENT_OWNER_PREFIX}{}:{}:{thread_id}",
+        keys::escape(attachment_type),
+        keys::escape(identity_key)
+    )
+}
+
+pub(crate) fn attachment_owner_prefix(attachment_type: &str, identity_key: &str) -> String {
+    format!(
+        "{ATTACHMENT_OWNER_PREFIX}{}:{}:",
+        keys::escape(attachment_type),
+        keys::escape(identity_key)
+    )
+}
+
+pub(crate) fn project(id: &str) -> String {
+    format!("{PROJECT_PREFIX}{}", keys::escape(id))
+}
+
+pub(crate) fn project_idempotency_key(key: &str) -> String {
+    format!("{PROJECT_KEY_PREFIX}{}", keys::escape(key))
 }

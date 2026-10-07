@@ -36,6 +36,13 @@ pub(crate) struct ThreadRecord {
     pub(crate) section: Option<String>,
     pub(crate) section_position: Option<i64>,
     pub(crate) section_entered_at: Option<DateTime<Utc>>,
+    /// Denormalized from the section definition at the time the thread was
+    /// moved in, so listings do not need a read per thread. `None` for a
+    /// section id with no persisted definition (an ad hoc section tag).
+    #[serde(default)]
+    pub(crate) section_name: Option<String>,
+    #[serde(default)]
+    pub(crate) section_appearance: Option<codex_state::ThreadSectionAppearance>,
     /// Rollout path this thread was imported from, if any.
     pub(crate) legacy_rollout_path: Option<PathBuf>,
 }
@@ -51,6 +58,8 @@ impl ThreadRecord {
             section: None,
             section_position: None,
             section_entered_at: None,
+            section_name: None,
+            section_appearance: None,
             legacy_rollout_path: None,
         }
     }
@@ -158,14 +167,20 @@ impl ThreadRecord {
             updated_at: self.updated_at(),
             recency_at: self.recency_at(),
             archived_at: self.archived_at,
-            section: self.section.clone().map(|id| codex_state::ThreadSection {
-                name: if id == codex_state::PINNED_THREAD_SECTION_ID {
-                    codex_state::PINNED_THREAD_SECTION_NAME.to_string()
+            section: self.section.clone().map(|id| {
+                let (name, appearance) = if id == codex_state::PINNED_THREAD_SECTION_ID {
+                    (codex_state::PINNED_THREAD_SECTION_NAME.to_string(), None)
                 } else {
-                    id.clone()
-                },
-                id,
-                appearance: None,
+                    (
+                        self.section_name.clone().unwrap_or_else(|| id.clone()),
+                        self.section_appearance.clone(),
+                    )
+                };
+                codex_state::ThreadSection {
+                    id,
+                    name,
+                    appearance,
+                }
             }),
             section_position: self.section_position,
             section_entered_at: self.section_entered_at,

@@ -9,10 +9,14 @@
 //! memory like the local store; nothing is written for a thread until it is
 //! persisted or receives its first durable item.
 
+mod attachments;
+mod fork;
 mod keys;
 mod listing;
+mod projects;
 mod record;
 mod search;
+mod sections;
 #[cfg(test)]
 mod tests;
 
@@ -36,22 +40,47 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::AddThreadAttachmentOutcome;
+use crate::AddThreadAttachmentParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
+use crate::CreateProjectParams;
 use crate::CreateThreadParams;
+use crate::CreateThreadSectionParams;
+use crate::CreatedProject;
 use crate::DeleteThreadParams;
+use crate::DeleteThreadSectionParams;
+use crate::DeletedProject;
+use crate::ListProjectsParams;
+use crate::ListThreadAttachmentThreadsParams;
+use crate::ListThreadAttachmentsParams;
+use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
+use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
+use crate::PrepareForkParams;
+use crate::PreparedFork;
+use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RemoveThreadAttachmentOutcome;
+use crate::RemoveThreadAttachmentParams;
+use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
+use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredProject;
+use crate::StoredProjectsPage;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
+use crate::StoredThreadSection;
+use crate::StoredThreadSectionsPage;
+use crate::ThreadAttachmentOwnerPage;
+use crate::ThreadAttachmentPage;
 use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
@@ -61,7 +90,9 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::UpdatedProject;
 use record::ThreadRecord;
 use record::visible_text;
 
@@ -475,11 +506,26 @@ impl AntflyThreadStore {
     }
 
     async fn require_live(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        if Arc::clone(&self.state).lock_owned().await.live.contains_key(&thread_id) {
+        if Arc::clone(&self.state)
+            .lock_owned()
+            .await
+            .live
+            .contains_key(&thread_id)
+        {
             Ok(())
         } else {
             Err(ThreadStoreError::ThreadNotFound { thread_id })
         }
+    }
+
+    /// Whether `thread_id` has a live writer in this process, for operations
+    /// that require the caller to close it first (for example `revert_thread`).
+    pub(crate) async fn has_live_writer(&self, thread_id: ThreadId) -> bool {
+        Arc::clone(&self.state)
+            .lock_owned()
+            .await
+            .live
+            .contains_key(&thread_id)
     }
 
     async fn shutdown_thread_impl(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
@@ -670,6 +716,7 @@ impl AntflyThreadStore {
                 writes.push(Write::delete(keys::rollout_path(path)));
             }
         }
+        writes.extend(attachments::delete_writes_for_thread(self, thread_id).await?);
         self.antfly.write(writes).await.map_err(internal)?;
         state.live.remove(&thread_id);
         state.staged_metadata.remove(&thread_id);
@@ -709,6 +756,8 @@ impl AntflyThreadStore {
                 record.section = None;
                 record.section_position = None;
                 record.section_entered_at = None;
+                record.section_name = None;
+                record.section_appearance = None;
             }
             Some(section) => {
                 if let Some(before) = params.before_thread_id
@@ -741,6 +790,16 @@ impl AntflyThreadStore {
                 if previous.section.as_deref() != Some(section) {
                     record.section = Some(section.to_owned());
                     record.section_entered_at = Some(Utc::now());
+                }
+                match sections::load_section(self, section).await? {
+                    Some(definition) => {
+                        record.section_name = Some(definition.name);
+                        record.section_appearance = definition.appearance;
+                    }
+                    None => {
+                        record.section_name = None;
+                        record.section_appearance = None;
+                    }
                 }
                 let insert_at = params
                     .before_thread_id
@@ -839,7 +898,11 @@ impl ThreadStore for AntflyThreadStore {
 
     fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            Arc::clone(&self.state).lock_owned().await.staged_metadata.remove(&thread_id);
+            Arc::clone(&self.state)
+                .lock_owned()
+                .await
+                .staged_metadata
+                .remove(&thread_id);
             Ok(())
         })
     }
@@ -954,5 +1017,126 @@ impl ThreadStore for AntflyThreadStore {
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(self.delete_thread_impl(params))
+    }
+
+    fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
+        Box::pin(fork::prepare_fork(self, params))
+    }
+
+    fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(fork::revert_thread(self, params))
+    }
+
+    fn supports_thread_sections(&self) -> bool {
+        true
+    }
+
+    fn list_thread_sections(
+        &self,
+        params: ListThreadSectionsParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadSectionsPage> {
+        Box::pin(sections::list_thread_sections(self, params))
+    }
+
+    fn create_thread_section(
+        &self,
+        params: CreateThreadSectionParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadSection> {
+        Box::pin(sections::create_thread_section(self, params))
+    }
+
+    fn rename_thread_section(
+        &self,
+        params: RenameThreadSectionParams,
+    ) -> ThreadStoreFuture<'_, Option<StoredThreadSection>> {
+        Box::pin(sections::rename_thread_section(self, params))
+    }
+
+    fn delete_thread_section(
+        &self,
+        params: DeleteThreadSectionParams,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(sections::delete_thread_section(self, params))
+    }
+
+    fn supports_thread_attachments(&self) -> bool {
+        true
+    }
+
+    fn copy_thread_attachments(
+        &self,
+        source_thread_id: ThreadId,
+        destination_thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(attachments::copy_thread_attachments(
+            self,
+            source_thread_id,
+            destination_thread_id,
+        ))
+    }
+
+    fn add_thread_attachment(
+        &self,
+        params: AddThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, AddThreadAttachmentOutcome> {
+        Box::pin(attachments::add_thread_attachment(self, params))
+    }
+
+    fn list_thread_attachments(
+        &self,
+        params: ListThreadAttachmentsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentPage> {
+        Box::pin(attachments::list_thread_attachments(self, params))
+    }
+
+    fn list_thread_attachment_threads(
+        &self,
+        params: ListThreadAttachmentThreadsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentOwnerPage> {
+        Box::pin(attachments::list_thread_attachment_threads(self, params))
+    }
+
+    fn remove_thread_attachment(
+        &self,
+        params: RemoveThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, RemoveThreadAttachmentOutcome> {
+        Box::pin(attachments::remove_thread_attachment(self, params))
+    }
+
+    fn supports_projects(&self) -> bool {
+        true
+    }
+
+    fn list_projects(
+        &self,
+        params: ListProjectsParams,
+    ) -> ThreadStoreFuture<'_, StoredProjectsPage> {
+        Box::pin(projects::list_projects(self, params))
+    }
+
+    fn read_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<StoredProject>> {
+        Box::pin(projects::read_project(self, project_id))
+    }
+
+    fn create_project(&self, params: CreateProjectParams) -> ThreadStoreFuture<'_, CreatedProject> {
+        Box::pin(projects::create_project(self, params))
+    }
+
+    fn update_project(
+        &self,
+        params: UpdateProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<UpdatedProject>> {
+        Box::pin(projects::update_project(self, params))
+    }
+
+    fn move_project(
+        &self,
+        params: MoveProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<ProjectMoveOutcome>> {
+        Box::pin(projects::move_project(self, params))
+    }
+
+    fn delete_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<DeletedProject>> {
+        Box::pin(projects::delete_project(self, project_id))
     }
 }
