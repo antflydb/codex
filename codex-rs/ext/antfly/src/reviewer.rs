@@ -137,10 +137,11 @@ impl LayaApprovalReviewer {
         tracing::info!(
             approval_id = input.approval_id,
             mode = ?settings.mode,
-            safe = answers.safe,
+            none = answers.none,
+            local = answers.local,
+            external = answers.external,
             destructive = answers.destructive,
             intent_match = answers.intent_match,
-            risk = answers.risk,
             verdict = ?decided,
             "local approval review"
         );
@@ -193,10 +194,11 @@ impl LayaApprovalReviewer {
             "search_text": state,
             "action": input.action,
             "answers": {
-                "safe": answers.safe,
+                "none": answers.none,
+                "local": answers.local,
+                "external": answers.external,
                 "destructive": answers.destructive,
                 "intent_match": answers.intent_match,
-                "risk": answers.risk,
             },
             "verdict": format!("{decided:?}"),
             "applied": applied,

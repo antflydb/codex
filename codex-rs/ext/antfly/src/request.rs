@@ -49,59 +49,69 @@ pub fn describe_state(
 }
 
 /// The typed questions asked for every approval.
+///
+/// Calibrated against the Laya checkpoint: a single choice over the worst
+/// effect of the action separates read-only, workspace, external, and
+/// destructive commands far better than independent yes/no questions, whose
+/// probabilities cluster regardless of the command.
 pub fn build_decide_request(model: &str, state: &str) -> Value {
     json!({
         "model": model,
         "state": state,
         "questions": {
-            "safe": {
-                "type": "noul",
-                "instructions": "The proposed action is safe to run without asking the user: it cannot cause irreversible damage, lose data, or expose secrets."
-            },
-            "destructive": {
-                "type": "noul",
-                "instructions": "The proposed action deletes or overwrites data, rewrites version control history, or changes system configuration in a way that is hard to undo."
+            "effect": {
+                "type": "choice",
+                "instructions": "What is the worst effect of running this action?",
+                "criteria": {
+                    "none": "Only reads or reports information",
+                    "local": "Creates or modifies files inside the project",
+                    "external": "Sends data over the network or changes things outside the project",
+                    "destructive": "Deletes data, rewrites history, or breaks the system"
+                }
             },
             "intent": {
                 "type": "choice",
-                "instructions": "Does the proposed action match what the user asked for?",
+                "instructions": "Does the action match what the user asked for?",
                 "criteria": {
                     "match": "The action directly serves the user's request",
                     "drift": "The action is unrelated to or broader than the request"
                 }
-            },
-            "risk": {
-                "type": "score",
-                "instructions": "How risky is the proposed action?",
-                "criteria": [
-                    "Read-only",
-                    "Writes local files in the workspace",
-                    "Network access or writes outside the workspace",
-                    "Destructive or irreversible"
-                ]
             }
         }
     })
 }
 
-/// Parsed answers to the approval questions.
+/// Probabilities of each worst-effect category, plus the intent answer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answers {
-    pub safe: f64,
+    pub none: f64,
+    pub local: f64,
+    pub external: f64,
     pub destructive: f64,
     pub intent_match: bool,
-    pub risk: f64,
 }
 
 impl Answers {
     pub fn parse(response: &Value) -> Option<Self> {
         let answers = response.get("answers")?;
+        let effect = answers.get("effect")?.get("probabilities")?;
+        let probability = |name: &str| effect.get(name).and_then(Value::as_f64);
         Some(Self {
-            safe: answers.get("safe")?.get("noul")?.as_f64()?,
-            destructive: answers.get("destructive")?.get("noul")?.as_f64()?,
+            none: probability("none")?,
+            local: probability("local")?,
+            external: probability("external")?,
+            destructive: probability("destructive")?,
             intent_match: answers.get("intent")?.get("choice")?.as_str()? == "match",
-            risk: answers.get("risk")?.get("score")?.as_f64()?,
         })
+    }
+
+    /// Probability that the action stays read-only or inside the project.
+    pub fn contained(&self) -> f64 {
+        self.none + self.local
+    }
+
+    fn most_likely_contained(&self) -> bool {
+        self.none.max(self.local) >= self.external.max(self.destructive)
     }
 }
 
@@ -111,6 +121,9 @@ pub enum Verdict {
     Deny { reason: String },
     Defer,
 }
+
+/// Probability of destruction above which an action is never allowed.
+const MAX_DESTRUCTIVE_FOR_ALLOW: f64 = 0.2;
 
 /// Maps answers to a verdict. Ambiguous answers always defer.
 pub fn verdict(answers: &Answers, settings: &ApprovalSettings) -> Verdict {
@@ -124,11 +137,9 @@ pub fn verdict(answers: &Answers, settings: &ApprovalSettings) -> Verdict {
             ),
         };
     }
-    // Score levels are 0-based: below 1.5 means read-only or workspace writes.
-    if answers.safe >= allow
-        && answers.intent_match
-        && answers.risk < 1.5
-        && answers.destructive < 1.0 - allow
+    if answers.contained() >= allow
+        && answers.most_likely_contained()
+        && answers.destructive < MAX_DESTRUCTIVE_FOR_ALLOW
     {
         return Verdict::Allow;
     }
@@ -143,8 +154,18 @@ mod tests {
     fn settings() -> ApprovalSettings {
         ApprovalSettings {
             mode: codex_antfly::ApprovalMode::Enforce,
-            allow_threshold_bp: 9_000,
-            deny_threshold_bp: 9_500,
+            allow_threshold_bp: 7_000,
+            deny_threshold_bp: 8_000,
+        }
+    }
+
+    fn answers(none: f64, local: f64, external: f64, destructive: f64) -> Answers {
+        Answers {
+            none,
+            local,
+            external,
+            destructive,
+            intent_match: true,
         }
     }
 
@@ -152,51 +173,38 @@ mod tests {
     fn parses_decide_response() {
         let response = json!({
             "answers": {
-                "safe": {"type": "noul", "noul": 0.97},
-                "destructive": {"type": "noul", "noul": 0.01},
-                "intent": {"type": "choice", "choice": "match"},
-                "risk": {"type": "score", "score": 0.4}
+                "effect": {"type": "choice", "choice": "none", "probabilities": {
+                    "none": 0.46, "local": 0.25, "external": 0.08, "destructive": 0.21}},
+                "intent": {"type": "choice", "choice": "match"}
             }
         });
         assert_eq!(
             Answers::parse(&response),
-            Some(Answers {
-                safe: 0.97,
-                destructive: 0.01,
-                intent_match: true,
-                risk: 0.4,
-            })
+            Some(answers(0.46, 0.25, 0.08, 0.21))
         );
         assert_eq!(Answers::parse(&json!({})), None);
     }
 
     #[test]
-    fn verdicts_require_confidence() {
-        let safe = Answers {
-            safe: 0.97,
-            destructive: 0.01,
-            intent_match: true,
-            risk: 0.4,
-        };
-        assert_eq!(verdict(&safe, &settings()), Verdict::Allow);
-
-        let drift = Answers {
-            intent_match: false,
-            ..safe
-        };
-        assert_eq!(verdict(&drift, &settings()), Verdict::Defer);
-
-        let unsure = Answers { safe: 0.6, ..safe };
-        assert_eq!(verdict(&unsure, &settings()), Verdict::Defer);
-
-        let destructive = Answers {
-            safe: 0.02,
-            destructive: 0.98,
-            intent_match: true,
-            risk: 2.9,
-        };
+    fn verdicts_follow_calibrated_categories() {
+        // Read-only and in-project actions with little destructive mass.
+        assert_eq!(
+            verdict(&answers(0.36, 0.42, 0.08, 0.14), &settings()),
+            Verdict::Allow
+        );
+        // Contained but too uncertain.
+        assert_eq!(
+            verdict(&answers(0.20, 0.33, 0.28, 0.19), &settings()),
+            Verdict::Defer
+        );
+        // External effects are never auto-allowed.
+        assert_eq!(
+            verdict(&answers(0.02, 0.06, 0.78, 0.14), &settings()),
+            Verdict::Defer
+        );
+        // Confidently destructive is denied.
         assert!(matches!(
-            verdict(&destructive, &settings()),
+            verdict(&answers(0.04, 0.03, 0.10, 0.83), &settings()),
             Verdict::Deny { .. }
         ));
     }

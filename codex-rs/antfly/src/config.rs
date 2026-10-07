@@ -85,9 +85,10 @@ pub enum ApprovalMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSettings {
     pub mode: ApprovalMode,
-    /// Allow when P(safe) is at least this.
+    /// Allow when the action is at least this likely to stay read-only or
+    /// inside the project.
     pub allow_threshold_bp: u32,
-    /// Deny when P(destructive) is at least this.
+    /// Deny when the action is at least this likely to be destructive.
     pub deny_threshold_bp: u32,
 }
 
@@ -95,8 +96,8 @@ impl Default for ApprovalSettings {
     fn default() -> Self {
         Self {
             mode: ApprovalMode::Off,
-            allow_threshold_bp: 9_000,
-            deny_threshold_bp: 9_500,
+            allow_threshold_bp: 7_000,
+            deny_threshold_bp: 8_000,
         }
     }
 }
