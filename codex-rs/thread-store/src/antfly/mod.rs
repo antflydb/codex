@@ -739,6 +739,28 @@ impl AntflyThreadStore {
             .map(|document| Write::delete(document.key))
             .collect();
         writes.push(Write::delete(keys::thread(thread_id)));
+        // Clean up every paginated-history projection row for this thread
+        // (spec §2.25). Harmless no-op scans for Legacy threads.
+        for prefix in [
+            keys::turn_id_prefix(thread_id),
+            keys::turn_start_prefix(thread_id),
+            keys::turn_end_prefix(thread_id),
+            keys::item_id_prefix(thread_id),
+            keys::item_created_prefix(thread_id),
+            keys::item_updated_prefix(thread_id),
+            keys::realtime_prefix(thread_id),
+        ] {
+            let documents = self
+                .antfly
+                .scan(ScanRequest::prefix(&prefix))
+                .await
+                .map_err(internal)?;
+            writes.extend(
+                documents
+                    .into_iter()
+                    .map(|document| Write::delete(document.key)),
+            );
+        }
         if let Some(record) = &record {
             for sort_key in SORT_KEYS {
                 writes.push(Write::delete(keys::index_entry(

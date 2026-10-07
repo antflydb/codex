@@ -111,6 +111,10 @@ pub(crate) fn turn_id_key(thread_id: ThreadId, turn_id: &str) -> String {
     format!("{TURN_ID_PREFIX}{thread_id}:{}", keys::escape(turn_id))
 }
 
+pub(crate) fn turn_id_prefix(thread_id: ThreadId) -> String {
+    format!("{TURN_ID_PREFIX}{thread_id}:")
+}
+
 pub(crate) fn turn_by_start(thread_id: ThreadId, start_ordinal: u64, turn_id: &str) -> String {
     format!(
         "{TURN_START_PREFIX}{thread_id}:{}:{}",
@@ -135,12 +139,20 @@ pub(crate) fn turn_by_end(thread_id: ThreadId, end_ordinal: u64, turn_id: &str) 
     )
 }
 
+pub(crate) fn turn_end_prefix(thread_id: ThreadId) -> String {
+    format!("{TURN_END_PREFIX}{thread_id}:")
+}
+
 pub(crate) fn item_id_key(thread_id: ThreadId, turn_id: &str, item_id: &str) -> String {
     format!(
         "{ITEM_ID_PREFIX}{thread_id}:{}:{}",
         keys::escape(turn_id),
         keys::escape(item_id)
     )
+}
+
+pub(crate) fn item_id_prefix(thread_id: ThreadId) -> String {
+    format!("{ITEM_ID_PREFIX}{thread_id}:")
 }
 
 pub(crate) fn item_by_created(

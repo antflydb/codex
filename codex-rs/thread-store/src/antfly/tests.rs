@@ -999,3 +999,223 @@ async fn legacy_threads_still_use_full_replay_history() -> TestResult {
     settle(store, dir).await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forked_lineage_reads_see_ancestor_and_own_turns() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+
+    // Parent: one completed turn, then persisted so its projection and items
+    // are durable before the child's `history_base` is computed.
+    let parent_id = ThreadId::new();
+    store.create_thread(paginated_params(parent_id)).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: parent_id,
+            items: vec![
+                turn_started("parent-turn", 1_000),
+                item_completed(
+                    parent_id,
+                    "parent-turn",
+                    user_message_item("p-u", "parent question"),
+                    1_000,
+                    1_000,
+                ),
+                turn_complete("parent-turn", 1_000, 1_001),
+            ],
+        })
+        .await?;
+    store
+        .persist_thread(parent_id, PersistContext::Standard)
+        .await?;
+    let parent_record = store
+        .load_record(parent_id)
+        .await?
+        .expect("parent is durable");
+    let history_base = codex_protocol::protocol::HistoryPosition {
+        thread_id: parent_id,
+        end_ordinal_exclusive: parent_record.next_ordinal,
+        end_byte_offset: 0,
+    };
+
+    // Child: forked from the parent's end, with its own new turn.
+    let child_id = ThreadId::new();
+    store
+        .create_thread(CreateThreadParams {
+            history_base: Some(history_base),
+            forked_from_id: Some(parent_id),
+            parent_thread_id: Some(parent_id),
+            ..paginated_params(child_id)
+        })
+        .await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: child_id,
+            items: vec![
+                turn_started("child-turn", 2_000),
+                item_completed(
+                    child_id,
+                    "child-turn",
+                    user_message_item("c-u", "child question"),
+                    2_000,
+                    2_000,
+                ),
+                turn_complete("child-turn", 2_000, 2_001),
+            ],
+        })
+        .await?;
+    store
+        .persist_thread(child_id, PersistContext::Standard)
+        .await?;
+
+    // Listing the child's turns walks back into the parent's segment.
+    let turns = store
+        .list_turns(ListTurnsParams {
+            thread_id: child_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?;
+    assert_eq!(
+        turns
+            .turns
+            .iter()
+            .map(|turn| turn.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parent-turn", "child-turn"]
+    );
+
+    // Items across both segments, in creation order.
+    let items = store
+        .list_items(ListItemsParams {
+            thread_id: child_id,
+            turn_id: None,
+            include_archived: false,
+            position: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await?;
+    assert_eq!(
+        items
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p-u", "c-u"]
+    );
+
+    // The latest model context starts with the child's own canonical
+    // SessionMeta, followed by the parent's inherited suffix and the
+    // child's own records, without the parent's SessionMeta line.
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await?;
+    match &context.items[0] {
+        RolloutItem::SessionMeta(meta) => assert_eq!(meta.meta.id, child_id),
+        other => panic!("expected child session meta first, got {other:?}"),
+    }
+    assert_eq!(
+        context
+            .items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::SessionMeta(_)))
+            .count(),
+        1,
+        "the parent's own session meta line must not leak into the child's context"
+    );
+    assert!(context.items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "parent-turn"
+    )));
+    assert!(context.items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "child-turn"
+    )));
+
+    // Occurrence search on the child also walks into the parent's segment,
+    // with a turn cursor that resolves back through `list_turns`.
+    let occurrences = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id: child_id,
+            search_term: "question".to_string(),
+            cursor: None,
+            page_size: 10,
+        })
+        .await?;
+    assert_eq!(
+        occurrences
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p-u", "c-u"]
+    );
+
+    store.shutdown_thread(parent_id).await?;
+    store.shutdown_thread(child_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_thread_removes_paginated_projection_rows() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1", 1_000),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    user_message_item("u1", "hello"),
+                    1_000,
+                    1_000,
+                ),
+                turn_complete("turn-1", 1_000, 1_001),
+            ],
+        })
+        .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+    store.shutdown_thread(thread_id).await?;
+
+    store
+        .delete_thread(DeleteThreadParams { thread_id })
+        .await?;
+
+    for prefix in [
+        super::keys::turn_id_prefix(thread_id),
+        super::keys::turn_start_prefix(thread_id),
+        super::keys::turn_end_prefix(thread_id),
+        super::keys::item_id_prefix(thread_id),
+        super::keys::item_created_prefix(thread_id),
+        super::keys::item_updated_prefix(thread_id),
+        super::keys::realtime_prefix(thread_id),
+    ] {
+        let remaining = store
+            .antfly()
+            .scan(codex_antfly::ScanRequest::prefix(&prefix))
+            .await?;
+        assert!(
+            remaining.is_empty(),
+            "leftover projection rows under {prefix}"
+        );
+    }
+
+    settle(store, dir).await;
+    Ok(())
+}
