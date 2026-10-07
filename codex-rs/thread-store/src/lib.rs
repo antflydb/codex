@@ -4,6 +4,7 @@
 //! Implementations are responsible for resolving that id to local rollout files, RPC requests, or
 //! any other backing store.
 
+mod antfly;
 mod error;
 mod in_memory;
 mod live_thread;
@@ -16,6 +17,8 @@ mod thread_metadata_sync;
 mod thread_sections;
 mod types;
 
+pub use antfly::AntflyThreadStore;
+pub use antfly::ThreadDataCleanup;
 pub use codex_state::AddThreadAttachmentOutcome;
 pub use codex_state::MAX_QUEUE_ITEMS;
 pub use codex_state::MAX_THREAD_ATTACHMENT_PAYLOAD_BYTES;

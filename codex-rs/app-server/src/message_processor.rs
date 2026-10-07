@@ -309,6 +309,8 @@ impl MessageProcessor {
                 Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
             }),
             ThreadStoreConfig::InMemory { .. } => None,
+            // Wired to the Antfly queue store once it lands.
+            ThreadStoreConfig::Antfly(_) => None,
         };
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);

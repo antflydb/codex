@@ -605,6 +605,8 @@ pub enum ThreadStoreConfig {
     Local,
     /// In-memory thread store for test and debug configurations.
     InMemory { id: String },
+    /// Persist all Codex state in Antfly; no SQLite or rollout files.
+    Antfly(Box<codex_antfly::AntflyConfig>),
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -2533,12 +2535,35 @@ fn resolve_tool_suggest_config_from_config(
     }
 }
 
-fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
-    match thread_store {
+fn thread_store_config(
+    thread_store: Option<ThreadStoreToml>,
+    codex_home: &Path,
+) -> std::io::Result<ThreadStoreConfig> {
+    Ok(match thread_store {
         Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
+        Some(ThreadStoreToml::Antfly(antfly)) => ThreadStoreConfig::Antfly(Box::new(
+            codex_antfly::AntflyConfig::from_toml(codex_antfly::AntflyTomlSettings {
+                codex_home: codex_home.to_path_buf(),
+                path: antfly.path,
+                url: antfly.url,
+                table: antfly.table,
+                api_key_env: antfly.api_key_env,
+                models_dir: antfly.models_dir,
+                embedder_model: antfly.embedder_model,
+                embedder_dims: antfly.embedder_dims,
+                semantic_search: antfly.semantic_search,
+                decide_model: antfly.decide_model,
+                approvals_mode: antfly.approvals.as_ref().and_then(|a| a.mode.clone()),
+                allow_threshold: antfly.approvals.as_ref().and_then(|a| a.allow_threshold),
+                deny_threshold: antfly.approvals.as_ref().and_then(|a| a.deny_threshold),
+            })
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+            })?,
+        )),
         None => ThreadStoreConfig::Local,
-    }
+    })
 }
 
 fn is_session_layer(source: &ConfigLayerSource) -> bool {
@@ -4311,6 +4336,8 @@ impl Config {
         )
         .map_err(std::io::Error::from)?;
         let otel = otel::resolve_config(cfg.otel.unwrap_or_default(), &mut startup_warnings);
+        let experimental_thread_store =
+            thread_store_config(cfg.experimental_thread_store.clone(), codex_home.as_path())?;
         let config = Self {
             prefer_mxc,
             model,
@@ -4489,7 +4516,7 @@ impl Config {
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
             experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
-            experimental_thread_store: thread_store_config(cfg.experimental_thread_store),
+            experimental_thread_store,
             forced_chatgpt_workspace_id,
             forced_login_method,
             web_search_mode: constrained_web_search_mode.value,

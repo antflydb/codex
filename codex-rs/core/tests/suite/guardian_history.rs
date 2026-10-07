@@ -70,6 +70,7 @@ async fn guardian_history_survives_restart_and_user_fork(
     let pathless_store = match &store_config {
         ThreadStoreConfig::Local => None,
         ThreadStoreConfig::InMemory { id } => Some(InMemoryThreadStore::for_id(id)),
+        ThreadStoreConfig::Antfly(_) => None,
     };
     let mut builder = test_codex()
         .with_history_mode(history_mode)

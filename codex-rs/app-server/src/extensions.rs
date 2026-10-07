@@ -93,6 +93,9 @@ pub(crate) fn thread_extensions(
         git_attribution_base_url,
         http_client_factory,
     );
+    // Confident local typed decisions run before Guardian; when they defer,
+    // Guardian and the user flow proceed as usual.
+    codex_antfly_extension::install(&mut builder, thread_manager.clone());
     codex_guardian_v2::install(&mut builder, auth_manager.clone(), thread_manager);
     codex_memories_extension::install(&mut builder, codex_otel::global());
     codex_mcp_extension::install(&mut builder);

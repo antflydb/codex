@@ -91,6 +91,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
+use codex_thread_store::AntflyThreadStore;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
@@ -511,6 +512,9 @@ pub fn thread_store_from_config(
         }
         ThreadStoreConfig::InMemory { id } => {
             Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
+        }
+        ThreadStoreConfig::Antfly(antfly_config) => {
+            Arc::new(AntflyThreadStore::new(codex_antfly::shared(antfly_config)))
         }
     }
 }

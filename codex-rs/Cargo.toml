@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "antfly",
     "aws-auth",
     "analytics",
     "agent-graph-store",
@@ -60,6 +61,7 @@ members = [
     "exec-server",
     "exec-server/tests/support",
     "execpolicy",
+    "ext/antfly",
     "ext/agent",
     "ext/agent-message-board",
     "ext/connectors",
@@ -278,6 +280,8 @@ codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
 codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
+codex-antfly = { path = "antfly" }
+codex-antfly-extension = { path = "ext/antfly" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-terminal-detection = { path = "terminal-detection" }
@@ -324,6 +328,7 @@ core_test_support = { path = "core/tests/common" }
 # External
 age = "0.12.1"
 ansi-to-tui = "8.0.1"
+antfly-embedded = { path = "../../antfly/.worktrees/rust-embedded-sql-json/rs/crates/embedded", features = ["libantfly"] }
 anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::HooksToml;
 use crate::browser_use::BrowserUseConfigToml;
@@ -560,7 +561,7 @@ pub struct ConfigToml {
     pub oss_provider: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
@@ -568,6 +569,45 @@ pub enum ThreadStoreToml {
     InMemory {
         id: String,
     },
+    /// Persist all Codex state in Antfly instead of SQLite and rollout files.
+    Antfly(Box<AntflyStoreToml>),
+}
+
+/// Antfly-backed persistence. With no `url`, state lives in an embedded
+/// `.aflite` database at `path` (default `$CODEX_HOME/antfly.aflite`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AntflyStoreToml {
+    /// Embedded database file.
+    pub path: Option<PathBuf>,
+    /// Remote Antfly or Antfly Cloud base URL; selects the remote backend.
+    pub url: Option<String>,
+    /// Remote table holding Codex state (default `codex`).
+    pub table: Option<String>,
+    /// Environment variable holding the remote bearer token.
+    pub api_key_env: Option<String>,
+    /// Antfly inference models directory.
+    pub models_dir: Option<PathBuf>,
+    /// Embedding model for semantic search; `false` in `semantic_search`
+    /// disables dense indexing.
+    pub embedder_model: Option<String>,
+    pub embedder_dims: Option<u32>,
+    pub semantic_search: Option<bool>,
+    /// Typed-decision model used to review approvals (default `laya`).
+    pub decide_model: Option<String>,
+    pub approvals: Option<AntflyApprovalsToml>,
+}
+
+/// Local typed-decision review of approval requests.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AntflyApprovalsToml {
+    /// `off`, `shadow` (log decisions only), or `enforce`.
+    pub mode: Option<String>,
+    /// Minimum probability that an action is safe before it is allowed.
+    pub allow_threshold: Option<f64>,
+    /// Minimum probability that an action is destructive before it is denied.
+    pub deny_threshold: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
