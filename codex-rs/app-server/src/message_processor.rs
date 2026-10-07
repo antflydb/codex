@@ -302,15 +302,17 @@ impl MessageProcessor {
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
-        // Queue persistence requires SQLite, so in-memory thread stores and
-        // app servers without a state database do not have a queue backend.
+        // Queue persistence needs a state database (SQLite- or Antfly-backed);
+        // in-memory thread stores and app servers without one do not have a
+        // queue backend. `LocalQueueStore` only calls `StateRuntime` methods,
+        // so it works unchanged against either backend.
         let queue_store: Option<Arc<dyn QueueStore>> = match &config.experimental_thread_store {
-            ThreadStoreConfig::Local => state_db.as_ref().map(|state_db| {
-                Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
-            }),
+            ThreadStoreConfig::Local | ThreadStoreConfig::Antfly(_) => {
+                state_db.as_ref().map(|state_db| {
+                    Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
+                })
+            }
             ThreadStoreConfig::InMemory { .. } => None,
-            // Wired to the Antfly queue store once it lands.
-            ThreadStoreConfig::Antfly(_) => None,
         };
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
@@ -368,11 +370,10 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
-                Some({
-                    let time_provider =
-                        app_server_time_provider(outgoing.clone(), thread_state_manager.clone());
-                    time_provider
-                }),
+                Some(app_server_time_provider(
+                    outgoing.clone(),
+                    thread_state_manager.clone(),
+                )),
             );
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),

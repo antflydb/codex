@@ -16,6 +16,7 @@ workspace = true
 codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+codex-antfly = { workspace = true }
 codex-extension-items = { workspace = true }
 codex-file-search = { workspace = true }
 codex-git-utils = { workspace = true }

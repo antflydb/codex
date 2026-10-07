@@ -43,6 +43,13 @@ impl codex_rollout::RolloutConfigView for Config {
     fn generate_memories(&self) -> bool {
         self.memories.generate_memories
     }
+
+    fn antfly_config(&self) -> Option<&codex_antfly::AntflyConfig> {
+        match &self.experimental_thread_store {
+            crate::config::ThreadStoreConfig::Antfly(antfly_config) => Some(antfly_config.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) mod list {

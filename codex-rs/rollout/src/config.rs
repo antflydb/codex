@@ -9,6 +9,12 @@ pub trait RolloutConfigView {
     fn cwd(&self) -> &Path;
     fn model_provider_id(&self) -> &str;
     fn generate_memories(&self) -> bool;
+    /// `Some` selects the Antfly-backed `StateRuntime` (no SQLite files)
+    /// instead of the SQLite-backed one. Defaults to `None` so existing
+    /// implementers keep their current (SQLite) behavior unchanged.
+    fn antfly_config(&self) -> Option<&codex_antfly::AntflyConfig> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +82,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
     fn generate_memories(&self) -> bool {
         (*self).generate_memories()
     }
+
+    fn antfly_config(&self) -> Option<&codex_antfly::AntflyConfig> {
+        (*self).antfly_config()
+    }
 }
 
 impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
@@ -97,5 +107,9 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
 
     fn generate_memories(&self) -> bool {
         self.as_ref().generate_memories()
+    }
+
+    fn antfly_config(&self) -> Option<&codex_antfly::AntflyConfig> {
+        self.as_ref().antfly_config()
     }
 }

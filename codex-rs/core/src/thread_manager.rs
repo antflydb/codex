@@ -514,7 +514,12 @@ pub fn thread_store_from_config(
             Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
         }
         ThreadStoreConfig::Antfly(antfly_config) => {
-            Arc::new(AntflyThreadStore::new(codex_antfly::shared(antfly_config)))
+            let store = AntflyThreadStore::new(codex_antfly::shared(antfly_config));
+            let store = match state_db {
+                Some(state_db) => store.with_state_db(state_db),
+                None => store,
+            };
+            Arc::new(store)
         }
     }
 }

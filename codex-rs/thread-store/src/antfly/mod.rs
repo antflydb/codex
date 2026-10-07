@@ -98,6 +98,12 @@ pub struct AntflyThreadStore {
     antfly: Arc<Antfly>,
     state: Arc<tokio::sync::Mutex<WriterState>>,
     cleanup: Option<ThreadDataCleanup>,
+    /// The Antfly-backed `StateRuntime` sharing this same `Antfly` handle, so
+    /// sessions reach memories/goals/guardian-feedback/shell-snapshot state
+    /// the same way they do for `LocalThreadStore` (see
+    /// `core/src/session/session.rs`'s `LocalThreadStore` downcast, which
+    /// also checks for `AntflyThreadStore` and reads this field).
+    state_db: Option<codex_rollout::StateDbHandle>,
 }
 
 impl std::fmt::Debug for AntflyThreadStore {
@@ -170,6 +176,7 @@ impl AntflyThreadStore {
             antfly,
             state: Arc::new(tokio::sync::Mutex::new(WriterState::default())),
             cleanup: None,
+            state_db: None,
         }
     }
 
@@ -177,6 +184,21 @@ impl AntflyThreadStore {
     pub fn with_thread_data_cleanup(mut self, cleanup: ThreadDataCleanup) -> Self {
         self.cleanup = Some(cleanup);
         self
+    }
+
+    /// Attaches the Antfly-backed `StateRuntime` sharing this store's
+    /// `Antfly` handle, so sessions can reach memories, goals, guardian
+    /// feedback, and other `StateRuntime`-backed features.
+    pub fn with_state_db(mut self, state_db: codex_rollout::StateDbHandle) -> Self {
+        self.state_db = Some(state_db);
+        self
+    }
+
+    /// The attached `StateRuntime`, if one was set at construction. Async to
+    /// match `LocalThreadStore::state_db`'s signature, so downcast call
+    /// sites can treat both stores the same way.
+    pub async fn state_db(&self) -> Option<codex_rollout::StateDbHandle> {
+        self.state_db.clone()
     }
 
     pub fn antfly(&self) -> &Arc<Antfly> {
@@ -475,7 +497,12 @@ impl AntflyThreadStore {
     }
 
     async fn require_live(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        if Arc::clone(&self.state).lock_owned().await.live.contains_key(&thread_id) {
+        if Arc::clone(&self.state)
+            .lock_owned()
+            .await
+            .live
+            .contains_key(&thread_id)
+        {
             Ok(())
         } else {
             Err(ThreadStoreError::ThreadNotFound { thread_id })
@@ -839,7 +866,11 @@ impl ThreadStore for AntflyThreadStore {
 
     fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            Arc::clone(&self.state).lock_owned().await.staged_metadata.remove(&thread_id);
+            Arc::clone(&self.state)
+                .lock_owned()
+                .await
+                .staged_metadata
+                .remove(&thread_id);
             Ok(())
         })
     }

@@ -4495,6 +4495,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "codex-antfly",
  "codex-extension-items",
  "codex-file-search",
  "codex-git-utils",
@@ -4688,7 +4689,9 @@ name = "codex-state"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
+ "codex-antfly",
  "codex-git-utils",
  "codex-history",
  "codex-protocol",
