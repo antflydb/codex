@@ -9,8 +9,11 @@
 //! memory like the local store; nothing is written for a thread until it is
 //! persisted or receives its first durable item.
 
+mod history;
 mod keys;
 mod listing;
+mod occurrences;
+mod projection;
 mod record;
 mod search;
 #[cfg(test)]
@@ -40,7 +43,11 @@ use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::ItemPage;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
+use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
@@ -61,6 +68,8 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::TimelinePage;
+use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
 use record::ThreadRecord;
 use record::visible_text;
@@ -213,9 +222,30 @@ impl AntflyThreadStore {
         &self,
         thread_id: ThreadId,
     ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        self.load_items_before(thread_id, None).await
+    }
+
+    /// Raw rollout items for `thread_id`, in order, stopping before
+    /// `end_ordinal_exclusive` when given. Used by lineage scans over an
+    /// ancestor thread that kept receiving items after the ordinal a
+    /// descendant forked from.
+    pub(crate) async fn load_items_before(
+        &self,
+        thread_id: ThreadId,
+        end_ordinal_exclusive: Option<u64>,
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        let prefix = keys::items_prefix(thread_id);
+        let to = match end_ordinal_exclusive {
+            Some(ordinal) => keys::item(thread_id, ordinal),
+            None => codex_antfly::keys::prefix_end(&prefix),
+        };
         let documents = self
             .antfly
-            .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
+            .scan(ScanRequest {
+                from: prefix,
+                to,
+                limit: None,
+            })
             .await
             .map_err(internal)?;
         documents
@@ -334,6 +364,19 @@ impl AntflyThreadStore {
         for (offset, item) in items.iter().enumerate() {
             writes.push(Self::item_write(thread_id, base + offset as u64, item)?);
         }
+        if record.history_mode() == ThreadHistoryMode::Paginated {
+            writes.extend(
+                projection::build_writes(
+                    self,
+                    thread_id,
+                    live.created.subagent_history_start_ordinal,
+                    base,
+                    &items,
+                    Utc::now(),
+                )
+                .await?,
+            );
+        }
         record.next_ordinal = base + items.len() as u64;
         writes.extend(Self::record_writes(None, &record)?);
         self.antfly.write(writes).await.map_err(internal)?;
@@ -357,6 +400,19 @@ impl AntflyThreadStore {
                 record.next_ordinal + offset as u64,
                 item,
             )?);
+        }
+        if record.history_mode() == ThreadHistoryMode::Paginated {
+            writes.extend(
+                projection::build_writes(
+                    self,
+                    thread_id,
+                    live.created.subagent_history_start_ordinal,
+                    record.next_ordinal,
+                    &items,
+                    Utc::now(),
+                )
+                .await?,
+            );
         }
         let mut updated = record.clone();
         updated.next_ordinal += items.len() as u64;
@@ -414,6 +470,9 @@ impl AntflyThreadStore {
         });
         let history = match explicit_history {
             Some(history) => history,
+            None if record.history_mode() == ThreadHistoryMode::Paginated => {
+                Arc::new(history::load_latest_model_context_items(self, thread_id).await?)
+            }
             None => Arc::new(self.load_items(thread_id).await?),
         };
         state.live.insert(
@@ -475,7 +534,12 @@ impl AntflyThreadStore {
     }
 
     async fn require_live(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
-        if Arc::clone(&self.state).lock_owned().await.live.contains_key(&thread_id) {
+        if Arc::clone(&self.state)
+            .lock_owned()
+            .await
+            .live
+            .contains_key(&thread_id)
+        {
             Ok(())
         } else {
             Err(ThreadStoreError::ThreadNotFound { thread_id })
@@ -508,12 +572,37 @@ impl AntflyThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreResult<StoredThreadHistory> {
-        self.require_record(params.thread_id, params.include_archived)
+        let record = self
+            .require_record(params.thread_id, params.include_archived)
             .await?;
+        if record.history_mode() == ThreadHistoryMode::Paginated {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "paginated_threads",
+            });
+        }
         Ok(StoredThreadHistory {
             revision: None,
             thread_id: params.thread_id,
             items: self.load_items(params.thread_id).await?,
+        })
+    }
+
+    async fn load_latest_model_context_impl(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreResult<StoredModelContext> {
+        let record = self
+            .require_record(params.thread_id, params.include_archived)
+            .await?;
+        let items = if record.history_mode() == ThreadHistoryMode::Paginated {
+            history::load_latest_model_context_items(self, params.thread_id).await?
+        } else {
+            self.load_items(params.thread_id).await?
+        };
+        Ok(StoredModelContext {
+            revision: None,
+            thread_id: params.thread_id,
+            items,
         })
     }
 
@@ -789,7 +878,7 @@ impl ThreadStore for AntflyThreadStore {
     }
 
     fn default_history_mode(&self) -> ThreadHistoryMode {
-        ThreadHistoryMode::Legacy
+        ThreadHistoryMode::Paginated
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -839,7 +928,11 @@ impl ThreadStore for AntflyThreadStore {
 
     fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            Arc::clone(&self.state).lock_owned().await.staged_metadata.remove(&thread_id);
+            Arc::clone(&self.state)
+                .lock_owned()
+                .await
+                .staged_metadata
+                .remove(&thread_id);
             Ok(())
         })
     }
@@ -887,14 +980,23 @@ impl ThreadStore for AntflyThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
-        Box::pin(async move {
-            let history = self.load_history_impl(params).await?;
-            Ok(StoredModelContext {
-                revision: history.revision,
-                thread_id: history.thread_id,
-                items: history.items,
-            })
-        })
+        Box::pin(self.load_latest_model_context_impl(params))
+    }
+
+    fn supports_paginated_history_lists(&self) -> bool {
+        true
+    }
+
+    fn list_turns(&self, params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage> {
+        Box::pin(history::list_turns(self, params))
+    }
+
+    fn list_items(&self, params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
+        Box::pin(history::list_items(self, params))
+    }
+
+    fn list_timeline(&self, params: ListTimelineParams) -> ThreadStoreFuture<'_, TimelinePage> {
+        Box::pin(history::list_timeline(self, params))
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
@@ -923,7 +1025,7 @@ impl ThreadStore for AntflyThreadStore {
         &self,
         params: SearchThreadOccurrencesParams,
     ) -> ThreadStoreFuture<'_, ThreadOccurrenceSearchPage> {
-        Box::pin(search::search_thread_occurrences(self, params))
+        Box::pin(occurrences::search_thread_occurrences(self, params))
     }
 
     fn update_thread_metadata(

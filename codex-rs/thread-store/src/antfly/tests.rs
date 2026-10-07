@@ -6,14 +6,24 @@ use std::time::Duration;
 
 use codex_antfly::Antfly;
 use codex_antfly::AntflyConfig;
+use codex_app_server_protocol::ThreadTimelineEntry;
 use codex_protocol::ThreadId;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use pretty_assertions::assert_eq;
 
@@ -22,13 +32,21 @@ use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::ItemSortKey;
+use crate::ListItemsParams;
+use crate::ListItemsPosition;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
+use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
 use crate::ReadThreadParams;
+use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::SortDirection;
+use crate::StoredTurnItemsView;
+use crate::StoredTurnStatus;
 use crate::ThreadMetadataPatch;
 use crate::ThreadPersistenceMetadata;
 use crate::ThreadSortKey;
@@ -81,6 +99,78 @@ fn agent_message(text: &str) -> RolloutItem {
         memory_citation: None,
         delivery: None,
         questions: None,
+    }))
+}
+
+fn paginated_params(thread_id: ThreadId) -> CreateThreadParams {
+    CreateThreadParams {
+        history_mode: ThreadHistoryMode::Paginated,
+        ..create_params(thread_id)
+    }
+}
+
+fn turn_started(turn_id: &str, started_at: i64) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
+        turn_id: turn_id.to_string(),
+        root_turn_id: None,
+        trace_id: None,
+        started_at: Some(started_at),
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    }))
+}
+
+fn turn_complete(turn_id: &str, started_at: i64, completed_at: i64) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
+        turn_id: turn_id.to_string(),
+        last_agent_message: None,
+        error: None,
+        started_at: Some(started_at),
+        completed_at: Some(completed_at),
+        duration_ms: Some((completed_at - started_at) * 1000),
+        time_to_first_token_ms: None,
+    }))
+}
+
+fn user_message_item(id: &str, text: &str) -> TurnItem {
+    TurnItem::UserMessage(UserMessageItem {
+        id: id.to_string(),
+        client_id: None,
+        content: vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+    })
+}
+
+fn agent_message_item(id: &str, text: &str, phase: Option<MessagePhase>) -> TurnItem {
+    TurnItem::AgentMessage(AgentMessageItem {
+        id: id.to_string(),
+        content: vec![AgentMessageContent::Text {
+            text: text.to_string(),
+        }],
+        phase,
+        memory_citation: None,
+        delivery: None,
+        questions: None,
+    })
+}
+
+fn item_completed(
+    thread_id: ThreadId,
+    turn_id: &str,
+    item: TurnItem,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        thread_id,
+        turn_id: turn_id.to_string(),
+        item,
+        started_at_ms: Some(started_at_ms),
+        completed_at_ms,
     }))
 }
 
@@ -392,6 +482,520 @@ async fn search_threads_finds_message_text() -> TestResult {
     assert!(results[0].snippet.contains("snapshot"));
     store.shutdown_thread(raft).await?;
     store.shutdown_thread(other).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_history_mode_is_paginated() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    assert_eq!(store.default_history_mode(), ThreadHistoryMode::Paginated);
+    assert!(store.supports_paginated_history_lists());
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paginated_projection_builds_turns_and_items() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+
+    // One full turn: started, a user item, an in-progress agent item (no
+    // phase) that a later duplicate completion then supersedes with the
+    // final phased answer, then the turn completes.
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1", 1_000),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    user_message_item("item-user", "please fix the widget counter"),
+                    1_000,
+                    1_000,
+                ),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    agent_message_item("item-agent", "working on it", None),
+                    1_001,
+                    1_001,
+                ),
+            ],
+        })
+        .await?;
+
+    // Duplicate completion of the same item id: updated_at_ordinal moves,
+    // rollout_ordinal (creation) and created_at_ms must not.
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    agent_message_item(
+                        "item-agent",
+                        "fixed the widget counter",
+                        Some(MessagePhase::FinalAnswer),
+                    ),
+                    1_002,
+                    1_003,
+                ),
+                turn_complete("turn-1", 1_000, 1_003),
+            ],
+        })
+        .await?;
+
+    let turns = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::Summary,
+        })
+        .await?;
+    assert_eq!(turns.turns.len(), 1);
+    let turn = &turns.turns[0];
+    assert_eq!(turn.turn_id, "turn-1");
+    assert_eq!(turn.status, StoredTurnStatus::Completed);
+    assert_eq!(turn.started_at, Some(1_000));
+    assert_eq!(turn.completed_at, Some(1_003));
+    // Summary is [first_user_item, final_agent_item], ordinal order.
+    assert_eq!(turn.items.len(), 2);
+    assert_eq!(turn.items[0].item_id, "item-user");
+    assert_eq!(turn.items[1].item_id, "item-agent");
+
+    let items = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: None,
+            include_archived: false,
+            position: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await?;
+    assert_eq!(items.items.len(), 2);
+    let agent_item = items
+        .items
+        .iter()
+        .find(|item| item.item_id == "item-agent")
+        .expect("agent item present");
+    assert!(agent_item.updated_at_ordinal > items.items[0].updated_at_ordinal);
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_turns_and_items_page_both_directions_with_anchor() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+
+    let mut items = Vec::new();
+    for index in 0..5i64 {
+        let turn_id = format!("turn-{index}");
+        items.push(turn_started(&turn_id, 1_000 + index));
+        items.push(item_completed(
+            thread_id,
+            &turn_id,
+            user_message_item(&format!("u{index}"), &format!("message {index}")),
+            1_000 + index,
+            1_000 + index,
+        ));
+        items.push(item_completed(
+            thread_id,
+            &turn_id,
+            agent_message_item(
+                &format!("a{index}"),
+                &format!("reply {index}"),
+                Some(MessagePhase::FinalAnswer),
+            ),
+            1_000 + index,
+            1_000 + index,
+        ));
+        items.push(turn_complete(&turn_id, 1_000 + index, 1_000 + index));
+    }
+    store
+        .append_items(AppendThreadItemsParams { thread_id, items })
+        .await?;
+
+    let turn_ids = |page: &crate::TurnPage| {
+        page.turns
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let first = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 2,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?;
+    assert_eq!(turn_ids(&first), vec!["turn-0", "turn-1"]);
+    assert!(first.next_cursor.is_some());
+
+    let second = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: first.next_cursor.clone(),
+            page_size: 2,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?;
+    assert_eq!(turn_ids(&second), vec!["turn-2", "turn-3"]);
+
+    let desc_first = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 2,
+            sort_direction: SortDirection::Desc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?;
+    assert_eq!(turn_ids(&desc_first), vec!["turn-4", "turn-3"]);
+
+    // Paging backwards from `second`'s backwards_cursor returns to `first`.
+    let back = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: second.backwards_cursor.clone(),
+            page_size: 2,
+            sort_direction: SortDirection::Desc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?;
+    assert_eq!(turn_ids(&back), vec!["turn-2", "turn-1"]);
+
+    // Item anchor: the item after "u2" within turn-2, in creation order.
+    let anchored = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: Some("turn-2".to_string()),
+            include_archived: false,
+            position: Some(ListItemsPosition::ItemAnchor {
+                item_id: "u2".to_string(),
+            }),
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await?;
+    assert_eq!(anchored.items.len(), 1);
+    assert_eq!(anchored.items[0].item_id, "a2");
+
+    // An anchor outside the requested turn is rejected.
+    let bad_anchor = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: Some("turn-2".to_string()),
+            include_archived: false,
+            position: Some(ListItemsPosition::ItemAnchor {
+                item_id: "u3".to_string(),
+            }),
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await;
+    assert!(matches!(
+        bad_anchor,
+        Err(ThreadStoreError::InvalidRequest { .. })
+    ));
+
+    // An item anchor without a turn id is rejected.
+    let missing_turn = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: None,
+            include_archived: false,
+            position: Some(ListItemsPosition::ItemAnchor {
+                item_id: "u2".to_string(),
+            }),
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await;
+    assert!(matches!(
+        missing_turn,
+        Err(ThreadStoreError::InvalidRequest { .. })
+    ));
+
+    let timeline = store
+        .list_timeline(ListTimelineParams {
+            thread_id,
+            cursor: None,
+            page_size: 100,
+        })
+        .await?;
+    let positions: Vec<u64> = timeline
+        .items
+        .iter()
+        .map(|entry| match entry {
+            ThreadTimelineEntry::TurnStarted { position, .. }
+            | ThreadTimelineEntry::Item { position, .. }
+            | ThreadTimelineEntry::Realtime { position, .. }
+            | ThreadTimelineEntry::TurnCompleted { position, .. } => *position,
+        })
+        .collect();
+    let mut sorted_positions = positions.clone();
+    sorted_positions.sort_unstable();
+    assert_eq!(positions, sorted_positions, "timeline must be ascending");
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_thread_occurrences_finds_matches_with_utf16_ranges() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+
+    let user_text = "please check the Widget count";
+    let agent_text = "The widget count is 42.";
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1", 1_000),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    user_message_item("u1", user_text),
+                    1_000,
+                    1_000,
+                ),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    agent_message_item("a1", agent_text, Some(MessagePhase::FinalAnswer)),
+                    1_001,
+                    1_002,
+                ),
+                turn_complete("turn-1", 1_000, 1_002),
+            ],
+        })
+        .await?;
+
+    let page = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "widget".to_string(),
+            cursor: None,
+            page_size: 10,
+        })
+        .await?;
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].item_id, "u1");
+    assert_eq!(page.items[1].item_id, "a1");
+
+    let match_start = user_text.to_lowercase().find("widget").unwrap();
+    let expected_utf16_start = user_text[..match_start].encode_utf16().count() as u32;
+    assert_eq!(
+        page.items[0].snippet_match_range.start,
+        expected_utf16_start
+    );
+    assert_eq!(
+        page.items[0].snippet_match_range.end - page.items[0].snippet_match_range.start,
+        "widget".encode_utf16().count() as u32
+    );
+    assert!(page.items[0].snippet.contains("Widget"));
+    assert!(page.items[1].snippet.contains("widget"));
+
+    // page_size of 1 should page across the two matching items via a cursor.
+    let limited = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "widget".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await?;
+    assert_eq!(limited.items.len(), 1);
+    assert_eq!(limited.items[0].item_id, "u1");
+    let next = limited.next_cursor.clone().expect("more matches remain");
+    let continued = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "widget".to_string(),
+            cursor: Some(next),
+            page_size: 1,
+        })
+        .await?;
+    assert_eq!(continued.items.len(), 1);
+    assert_eq!(continued.items[0].item_id, "a1");
+    assert!(continued.next_cursor.is_none());
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_history_rejects_paginated_threads_use_model_context_instead() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1", 1_000)],
+        })
+        .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+
+    let rejected = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(ThreadStoreError::Unsupported {
+            operation: "paginated_threads"
+        })
+    ));
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await?;
+    assert!(matches!(context.items[0], RolloutItem::SessionMeta(_)));
+    assert!(
+        context
+            .items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
+    );
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_paginated_thread_returns_latest_model_context() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1", 1_000),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    user_message_item("u1", "hello"),
+                    1_000,
+                    1_000,
+                ),
+                turn_complete("turn-1", 1_000, 1_001),
+            ],
+        })
+        .await?;
+    store.shutdown_thread(thread_id).await?;
+
+    let resumed = store
+        .resume_thread(crate::ResumeThreadParams {
+            thread_id,
+            rollout_path: None,
+            history: None,
+            history_revision: None,
+            include_archived: false,
+            metadata: paginated_params(thread_id).metadata,
+        })
+        .await?;
+    assert!(matches!(resumed[0], RolloutItem::SessionMeta(_)));
+    assert!(
+        resumed
+            .iter()
+            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
+    );
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_threads_still_use_full_replay_history() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = start_thread(
+        &store,
+        "legacy preview",
+        &[user_message("hello from legacy"), agent_message("hi back")],
+    )
+    .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+
+    let history = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await?;
+    assert_eq!(history.items.len(), 3);
+    assert!(matches!(history.items[0], RolloutItem::SessionMeta(_)));
+
+    // Paginated-only reads are unsupported for a Legacy thread.
+    let turns = store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await;
+    assert!(matches!(
+        turns,
+        Err(ThreadStoreError::Unsupported {
+            operation: "list_turns"
+        })
+    ));
+
+    store.shutdown_thread(thread_id).await?;
     settle(store, dir).await;
     Ok(())
 }
