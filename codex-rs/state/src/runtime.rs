@@ -39,6 +39,7 @@ use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 use tracing::warn;
 
+pub(crate) mod antfly_backend;
 mod backfill;
 mod external_agent_config_imports;
 mod goals;
@@ -105,6 +106,17 @@ pub struct StateRuntime {
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
     reclamation: Arc<reclamation::SqliteReclamationWorker>,
+    /// `Some` selects the Antfly backend for every method in this file that
+    /// has a real external caller under `ThreadStoreConfig::Antfly` (guardian
+    /// feedback, remote control, external-agent imports, spawn edges, and
+    /// the thread-metadata adapter). Methods that only ever serve
+    /// `LocalThreadStore` keep running against `pool`/`logs_pool`, which for
+    /// the Antfly backend are process-local, migrated, in-memory SQLite
+    /// connections (`sqlite::memory:`) opened by `init_antfly` — never a
+    /// file on disk, so "no SQLite files" still holds, but those methods
+    /// remain safe no-ops (schema-valid, just non-persistent) rather than
+    /// hard errors if anything ever calls them.
+    antfly: Option<Arc<codex_antfly::Antfly>>,
 }
 
 impl StateRuntime {
@@ -116,6 +128,48 @@ impl StateRuntime {
     /// lock contention with the rest of the state store.
     pub async fn init(sqlite: SqliteConfig, default_provider: String) -> anyhow::Result<Arc<Self>> {
         Self::init_inner(sqlite, default_provider, /*telemetry_override*/ None).await
+    }
+
+    /// Initializes the state runtime backed by Antfly instead of SQLite.
+    ///
+    /// No SQLite file is ever created: `pool` and `logs_pool` (used only by
+    /// methods that exclusively serve `LocalThreadStore`, which never calls
+    /// into a Antfly-backed `StateRuntime`) are single-connection, migrated,
+    /// in-memory SQLite databases (`sqlite::memory:`), not files. Goals,
+    /// memories, and the queue are backed directly by `antfly` via
+    /// `GoalStore::new_antfly`/`MemoryStore::new_antfly`/
+    /// `SqliteQueueStore::new_antfly`. `get_thread`, `get_thread_memory_mode`,
+    /// `set_thread_preview_if_empty`, spawn edges, guardian feedback, remote
+    /// control, and external-agent imports are also Antfly-backed (see the
+    /// `self.antfly.is_some()` guard at the top of each such method); logs
+    /// are a no-op sink (tracing still writes to files, just not to a DB).
+    pub async fn init_antfly(
+        antfly: Arc<codex_antfly::Antfly>,
+        default_provider: String,
+    ) -> anyhow::Result<Arc<Self>> {
+        let pool = Arc::new(crate::sqlite::open_memory_pool(&runtime_state_migrator()).await?);
+        let logs_pool = match crate::sqlite::open_memory_pool(&runtime_logs_migrator()).await {
+            Ok(db) => Arc::new(db),
+            Err(err) => {
+                pool.close().await;
+                return Err(err);
+            }
+        };
+        let sqlite = SqliteConfig::from_sqlite_home(antfly_placeholder_home(&antfly)?);
+        Ok(Arc::new(Self {
+            reclamation: reclamation::SqliteReclamationWorker::noop(),
+            thread_goals: GoalStore::new_antfly(Arc::clone(&antfly)),
+            memories: MemoryStore::new_antfly(Arc::clone(&antfly), "v1"),
+            memories_v2: Arc::new(tokio::sync::OnceCell::new()),
+            thread_queue: SqliteQueueStore::new_antfly(Arc::clone(&antfly)),
+            pool,
+            logs_pool,
+            sqlite,
+            default_provider,
+            thread_updated_at_millis: Arc::new(AtomicI64::new(0)),
+            thread_recency_at_millis: Arc::new(AtomicI64::new(0)),
+            antfly: Some(antfly),
+        }))
     }
 
     #[cfg(test)]
@@ -271,6 +325,7 @@ impl StateRuntime {
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
+            antfly: None,
         });
         // Existing v2 state must participate in startup corruption recovery.
         // Keep creation lazy for users who have never used v2.
@@ -353,6 +408,28 @@ impl StateRuntime {
 async fn close_sqlite_pools(pools: &[&SqlitePool]) {
     for pool in pools {
         pool.close().await;
+    }
+}
+
+/// A representative (never read from or written to) `SqliteConfig` home for
+/// the Antfly backend, used only by diagnostics (`SqliteConfig::home`) and
+/// the `ctx.sqlite() != sqlite` equality check some callers run before
+/// deciding whether to reopen a store — neither of which is reachable once
+/// `ThreadStoreConfig::Antfly` is selected, since `AntflyThreadStore` never
+/// consults `StateRuntime::sqlite()`.
+fn antfly_placeholder_home(
+    antfly: &codex_antfly::Antfly,
+) -> anyhow::Result<codex_utils_absolute_path::AbsolutePathBuf> {
+    let path = match &antfly.config().backend {
+        codex_antfly::BackendConfig::Embedded { path } => path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.clone()),
+        codex_antfly::BackendConfig::Remote { .. } => PathBuf::from("antfly-remote"),
+    };
+    match codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&path) {
+        Ok(home) => Ok(home),
+        Err(_) => Ok(codex_utils_absolute_path::AbsolutePathBuf::current_dir()?),
     }
 }
 

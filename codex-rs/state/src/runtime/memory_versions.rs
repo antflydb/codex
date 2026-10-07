@@ -12,6 +12,13 @@ impl StateRuntime {
         &self,
         version: MemoryVersion,
     ) -> anyhow::Result<MemoryStore> {
+        if let Some(antfly) = &self.antfly {
+            let version_tag = match version {
+                MemoryVersion::V1 => "v1",
+                MemoryVersion::V2 => "v2",
+            };
+            return Ok(MemoryStore::new_antfly(Arc::clone(antfly), version_tag));
+        }
         match version {
             MemoryVersion::V1 => Ok(self.memories.clone()),
             MemoryVersion::V2 => self
@@ -27,7 +34,12 @@ impl StateRuntime {
 
     pub async fn clear_all_memory_data(&self) -> anyhow::Result<()> {
         self.memories.clear_memory_data().await?;
-        if tokio::fs::try_exists(self.sqlite.memories_v2_db_path()).await? {
+        // On Antfly, V1 and V2 share one handle keyed by a `v1`/`v2` prefix
+        // rather than separate files, so there is no "does the V2 file
+        // exist" check: always also clear V2 (a harmless no-op if it was
+        // never used).
+        if self.antfly.is_some() || tokio::fs::try_exists(self.sqlite.memories_v2_db_path()).await?
+        {
             self.memories_for_version(MemoryVersion::V2)
                 .await?
                 .clear_memory_data()
@@ -41,7 +53,8 @@ impl StateRuntime {
         thread_id: ThreadId,
     ) -> anyhow::Result<()> {
         self.memories.delete_thread_memory(thread_id).await?;
-        if tokio::fs::try_exists(self.sqlite.memories_v2_db_path()).await? {
+        if self.antfly.is_some() || tokio::fs::try_exists(self.sqlite.memories_v2_db_path()).await?
+        {
             self.memories_for_version(MemoryVersion::V2)
                 .await?
                 .delete_thread_memory(thread_id)

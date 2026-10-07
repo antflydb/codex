@@ -34,6 +34,12 @@ impl StateRuntime {
         &self,
         record: &GuardianReviewRecord,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::guardian_feedback::record_guardian_review_failure(
+                antfly, record,
+            )
+            .await;
+        }
         anyhow::ensure!(
             record.record.len() < MAX_GUARDIAN_REVIEW_BYTES,
             "Guardian feedback record exceeds its size limit"
@@ -72,6 +78,10 @@ impl StateRuntime {
 
     /// Read the bounded retained history, oldest first. Callers must scope exports to a task.
     pub async fn list_guardian_review_records(&self) -> anyhow::Result<Vec<GuardianReviewRecord>> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::guardian_feedback::list_guardian_review_records(antfly)
+                .await;
+        }
         sqlx::query("SELECT id, thread_id, record FROM guardian_review_feedback ORDER BY id")
             .fetch_all(self.pool.as_ref())
             .await?

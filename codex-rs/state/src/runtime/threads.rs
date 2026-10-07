@@ -1,3 +1,4 @@
+use super::antfly_backend::thread_adapter;
 use super::*;
 use crate::SortDirection;
 use codex_protocol::SanitizedGitUrl;
@@ -7,6 +8,9 @@ use std::sync::atomic::Ordering;
 
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::get_thread_metadata(antfly, id).await;
+        }
         let row = sqlx::query(
             r#"
 SELECT
@@ -99,6 +103,9 @@ WHERE id = ?
         Ok(result.rows_affected() > 0)
     }
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::get_memory_mode(antfly, id).await;
+        }
         let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(self.pool.as_ref())
@@ -111,6 +118,9 @@ WHERE id = ?
         thread_id: ThreadId,
         preview: &str,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::set_preview_if_empty(antfly, thread_id, preview).await;
+        }
         let preview = preview.trim();
         if preview.is_empty() {
             return Ok(false);
@@ -136,6 +146,15 @@ WHERE id = ? AND preview = ''
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::upsert_spawn_edge(
+                antfly,
+                parent_thread_id,
+                child_thread_id,
+                status,
+            )
+            .await;
+        }
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -162,6 +181,9 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::set_spawn_edge_status(antfly, child_thread_id, status).await;
+        }
         sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
             .bind(status.as_ref())
             .bind(child_thread_id.to_string())
@@ -218,6 +240,10 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         parent_thread_id: ThreadId,
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::find_spawn_child_by_path(antfly, parent_thread_id, agent_path)
+                .await;
+        }
         let rows = sqlx::query(
             r#"
 SELECT threads.id
@@ -242,6 +268,14 @@ LIMIT 2
         root_thread_id: ThreadId,
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::find_spawn_descendant_by_path(
+                antfly,
+                root_thread_id,
+                agent_path,
+            )
+            .await;
+        }
         let rows = sqlx::query(
             r#"
 WITH RECURSIVE subtree(child_thread_id) AS (
@@ -273,6 +307,9 @@ LIMIT 2
         parent_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::list_spawn_children(antfly, parent_thread_id, status).await;
+        }
         let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ",
         );
@@ -295,6 +332,9 @@ LIMIT 2
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        if let Some(antfly) = &self.antfly {
+            return thread_adapter::list_spawn_descendants(antfly, root_thread_id, status).await;
+        }
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 WITH RECURSIVE subtree(child_thread_id, depth) AS (

@@ -1,19 +1,36 @@
 use super::*;
 use crate::model::ThreadGoalRow;
+use crate::runtime::antfly_backend::goals as antfly_goals;
 use uuid::Uuid;
 
 #[derive(Clone)]
+enum GoalBackend {
+    Sqlite(Arc<SqlitePool>),
+    Antfly(Arc<codex_antfly::Antfly>),
+}
+
+#[derive(Clone)]
 pub struct GoalStore {
-    pool: Arc<SqlitePool>,
+    backend: GoalBackend,
 }
 
 impl GoalStore {
     pub(crate) fn new(pool: Arc<SqlitePool>) -> Self {
-        Self { pool }
+        Self {
+            backend: GoalBackend::Sqlite(pool),
+        }
+    }
+
+    pub(crate) fn new_antfly(antfly: Arc<codex_antfly::Antfly>) -> Self {
+        Self {
+            backend: GoalBackend::Antfly(antfly),
+        }
     }
 
     pub(crate) async fn close(&self) {
-        self.pool.close().await;
+        if let GoalBackend::Sqlite(pool) = &self.backend {
+            pool.close().await;
+        }
     }
 }
 
@@ -42,6 +59,12 @@ impl GoalStore {
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::get_thread_goal(antfly, thread_id).await;
+            }
+        };
         let row = sqlx::query(
             r#"
 SELECT
@@ -59,7 +82,7 @@ WHERE thread_id = ?
             "#,
         )
         .bind(thread_id.to_string())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -69,7 +92,13 @@ WHERE thread_id = ?
         &self,
         goal: &crate::ThreadGoal,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::replace_thread_goal_snapshot(antfly, goal).await;
+            }
+        };
+        let mut transaction = pool.begin().await?;
         sqlx::query(
             r#"
 INSERT INTO thread_goals (
@@ -126,6 +155,13 @@ ON CONFLICT(thread_id) DO NOTHING
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::has_thread_goal_continuation_deferral(antfly, thread_id)
+                    .await;
+            }
+        };
         sqlx::query_scalar(
             r#"
 SELECT EXISTS(
@@ -136,7 +172,7 @@ SELECT EXISTS(
             "#,
         )
         .bind(thread_id.to_string())
-        .fetch_one(self.pool.as_ref())
+        .fetch_one(pool.as_ref())
         .await
         .map_err(Into::into)
     }
@@ -145,9 +181,16 @@ SELECT EXISTS(
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<()> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::clear_thread_goal_continuation_deferral(antfly, thread_id)
+                    .await;
+            }
+        };
         sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute(pool.as_ref())
             .await?;
 
         Ok(())
@@ -160,6 +203,19 @@ SELECT EXISTS(
         status: crate::ThreadGoalStatus,
         token_budget: Option<i64>,
     ) -> anyhow::Result<crate::ThreadGoal> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::replace_thread_goal(
+                    antfly,
+                    thread_id,
+                    objective,
+                    status,
+                    token_budget,
+                )
+                .await;
+            }
+        };
         let goal_id = Uuid::new_v4().to_string();
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
@@ -204,7 +260,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one(pool.as_ref())
         .await?;
 
         thread_goal_from_row(&row)
@@ -217,6 +273,19 @@ RETURNING
         status: crate::ThreadGoalStatus,
         token_budget: Option<i64>,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::insert_thread_goal(
+                    antfly,
+                    thread_id,
+                    objective,
+                    status,
+                    token_budget,
+                )
+                .await;
+            }
+        };
         let goal_id = Uuid::new_v4().to_string();
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
@@ -262,7 +331,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -273,6 +342,12 @@ RETURNING
         thread_id: ThreadId,
         update: GoalUpdate,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::update_thread_goal(antfly, thread_id, update).await;
+            }
+        };
         let GoalUpdate {
             objective,
             status,
@@ -315,7 +390,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute(pool.as_ref())
                 .await?
             }
             (Some(status), None) => {
@@ -346,7 +421,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute(pool.as_ref())
                 .await?
             }
             (None, Some(token_budget)) => {
@@ -374,7 +449,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute(pool.as_ref())
                 .await?
             }
             (None, None) => {
@@ -394,7 +469,7 @@ WHERE thread_id = ?
                     .bind(thread_id.to_string())
                     .bind(expected_goal_id)
                     .bind(expected_goal_id)
-                    .execute(self.pool.as_ref())
+                    .execute(pool.as_ref())
                     .await?
                 } else {
                     let goal = self.get_thread_goal(thread_id).await?;
@@ -438,6 +513,17 @@ WHERE thread_id = ?
         thread_id: ThreadId,
         status: crate::ThreadGoalStatus,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => match status {
+                crate::ThreadGoalStatus::Paused => {
+                    return antfly_goals::pause_active_thread_goal(antfly, thread_id).await;
+                }
+                _ => {
+                    return antfly_goals::usage_limit_active_thread_goal(antfly, thread_id).await;
+                }
+            },
+        };
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let result = sqlx::query(
             r#"
@@ -459,7 +545,7 @@ WHERE thread_id = ?
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(status.as_str())
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?;
 
         if result.rows_affected() == 0 {
@@ -473,6 +559,12 @@ WHERE thread_id = ?
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::delete_thread_goal(antfly, thread_id).await;
+            }
+        };
         let row = sqlx::query(
             r#"
 DELETE FROM thread_goals
@@ -490,7 +582,7 @@ RETURNING
             "#,
         )
         .bind(thread_id.to_string())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -504,6 +596,20 @@ RETURNING
         mode: GoalAccountingMode,
         expected_goal_id: Option<&str>,
     ) -> anyhow::Result<GoalAccountingOutcome> {
+        let pool = match &self.backend {
+            GoalBackend::Sqlite(pool) => pool,
+            GoalBackend::Antfly(antfly) => {
+                return antfly_goals::account_thread_goal_usage(
+                    antfly,
+                    thread_id,
+                    time_delta_seconds,
+                    token_delta,
+                    mode,
+                    expected_goal_id,
+                )
+                .await;
+            }
+        };
         let time_delta_seconds = time_delta_seconds.max(0);
         let token_delta = token_delta.max(0);
         if time_delta_seconds == 0 && token_delta == 0 {
@@ -598,7 +704,7 @@ RETURNING
             "#,
         );
 
-        let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
+        let row = builder.build().fetch_optional(pool.as_ref()).await?;
 
         let Some(row) = row else {
             return Ok(GoalAccountingOutcome::Unchanged(

@@ -6,8 +6,11 @@ impl StateRuntime {
     }
 
     /// Insert a batch of log entries into the logs table.
+    ///
+    /// On the Antfly backend this is a true no-op: logs are never written to
+    /// Antfly (tracing still writes to files; see `init_antfly`'s docs).
     pub async fn insert_logs(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
-        if entries.is_empty() {
+        if entries.is_empty() || self.antfly.is_some() {
             return Ok(());
         }
 
@@ -279,7 +282,13 @@ WHERE id IN (
     }
 
     /// Query logs with optional filters.
+    ///
+    /// On the Antfly backend this always returns empty: logs are never
+    /// written to Antfly in the first place.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
+        if self.antfly.is_some() {
+            return Ok(Vec::new());
+        }
         let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
         );
@@ -301,11 +310,14 @@ WHERE id IN (
     }
 
     /// Query feedback logs for a set of threads, capped to the SQLite retention budget.
+    ///
+    /// On the Antfly backend this always returns empty: logs are never
+    /// written to Antfly in the first place.
     pub async fn query_feedback_logs_for_threads(
         &self,
         thread_ids: &[&str],
     ) -> anyhow::Result<Vec<u8>> {
-        if thread_ids.is_empty() {
+        if thread_ids.is_empty() || self.antfly.is_some() {
             return Ok(Vec::new());
         }
 
@@ -405,7 +417,13 @@ WHERE cumulative_estimated_bytes <=
     }
 
     /// Return the max log id matching optional filters.
+    ///
+    /// On the Antfly backend this always returns `0`: logs are never
+    /// written to Antfly in the first place.
     pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
+        if self.antfly.is_some() {
+            return Ok(0);
+        }
         let mut builder =
             QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
         push_log_filters(&mut builder, query);

@@ -3,7 +3,7 @@ use super::*;
 const REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE: &str = "";
 
 /// Persisted remote-control server enrollment, including the lookup key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteControlEnrollmentRecord {
     pub websocket_url: String,
     pub account_id: String,
@@ -33,6 +33,15 @@ impl StateRuntime {
         account_id: &str,
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<Option<RemoteControlEnrollmentRecord>> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::remote_control::get_remote_control_enrollment(
+                antfly,
+                websocket_url,
+                account_id,
+                app_server_client_name,
+            )
+            .await;
+        }
         let row = sqlx::query(
             r#"
 SELECT websocket_url, account_id, app_server_client_name, server_id, environment_id, server_name,
@@ -68,6 +77,12 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         &self,
         enrollment: &RemoteControlEnrollmentRecord,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::remote_control::upsert_remote_control_enrollment(
+                antfly, enrollment,
+            )
+            .await;
+        }
         sqlx::query(
             r#"
 INSERT INTO remote_control_enrollments (
@@ -109,6 +124,16 @@ ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE SET
         app_server_client_name: Option<&str>,
         remote_control_enabled: bool,
     ) -> anyhow::Result<u64> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::remote_control::set_remote_control_enabled(
+                antfly,
+                websocket_url,
+                account_id,
+                app_server_client_name,
+                remote_control_enabled,
+            )
+            .await;
+        }
         let result = sqlx::query(
             r#"
 UPDATE remote_control_enrollments
@@ -134,6 +159,15 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         account_id: &str,
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<u64> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::remote_control::delete_remote_control_enrollment(
+                antfly,
+                websocket_url,
+                account_id,
+                app_server_client_name,
+            )
+            .await;
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM remote_control_enrollments

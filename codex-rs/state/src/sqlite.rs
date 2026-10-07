@@ -467,6 +467,29 @@ impl SqliteConfig {
     }
 }
 
+/// Opens a single-connection, migrated, in-memory SQLite database: never a
+/// file on disk. Used by `StateRuntime::init_antfly` so methods that only
+/// ever serve `LocalThreadStore` have a schema-valid (but non-persistent)
+/// pool to run against instead of touching `self.pool`/`self.logs_pool`
+/// through a dangling or absent file. `max_connections(1)` is load-bearing:
+/// a second connection to `sqlite::memory:` would see an independent, empty
+/// database, so every caller must share this exact connection.
+pub(crate) async fn open_memory_pool(migrator: &Migrator) -> anyhow::Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(":memory:")
+        .create_if_missing(true)
+        .log_statements(LevelFilter::Off);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(options)
+        .await?;
+    migrator.run(&pool).await?;
+    Ok(pool)
+}
+
 #[cfg(test)]
 #[path = "sqlite_tests.rs"]
 mod tests;

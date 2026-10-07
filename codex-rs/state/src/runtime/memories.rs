@@ -1,6 +1,7 @@
 #[path = "memory_readiness.rs"]
 mod readiness;
 
+use super::antfly_backend::memories as antfly_memories;
 use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
@@ -26,20 +27,54 @@ const PHASE2_INPUT_SELECTION_PAGE_SIZE: usize = 512;
 
 const DEFAULT_RETRY_REMAINING: i64 = 3;
 
+#[derive(Clone)]
+pub(super) enum MemoryBackend {
+    Sqlite {
+        pool: Arc<SqlitePool>,
+        state_pool: Arc<SqlitePool>,
+    },
+    Antfly {
+        antfly: Arc<codex_antfly::Antfly>,
+        version: &'static str,
+    },
+}
+
 /// Store for generated memory state and memory extraction/consolidation jobs.
 #[derive(Clone)]
 pub struct MemoryStore {
-    pool: Arc<SqlitePool>,
-    state_pool: Arc<SqlitePool>,
+    pub(super) backend: MemoryBackend,
 }
 
 impl MemoryStore {
     pub(crate) fn new(pool: Arc<SqlitePool>, state_pool: Arc<SqlitePool>) -> Self {
-        Self { pool, state_pool }
+        Self {
+            backend: MemoryBackend::Sqlite { pool, state_pool },
+        }
+    }
+
+    pub(crate) fn new_antfly(antfly: Arc<codex_antfly::Antfly>, version: &'static str) -> Self {
+        Self {
+            backend: MemoryBackend::Antfly { antfly, version },
+        }
     }
 
     pub(crate) async fn close(&self) {
-        self.pool.close().await;
+        if let MemoryBackend::Sqlite { pool, .. } = &self.backend {
+            pool.close().await;
+        }
+    }
+
+    /// Test-only access to the raw SQLite pool for assertions/fixtures that
+    /// manipulate rows directly. Panics on the Antfly backend; every test
+    /// that uses it builds a SQLite-backed `StateRuntime`.
+    #[cfg(test)]
+    pub(crate) fn sqlite_pool(&self) -> &Arc<SqlitePool> {
+        match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { .. } => {
+                unreachable!("sqlite_pool() called on an Antfly-backed MemoryStore in a test")
+            }
+        }
     }
 
     /// Deletes all persisted memory state in one transaction.
@@ -48,7 +83,13 @@ impl MemoryStore {
     /// stage-1 (`memory_stage1`) and phase-2 (`memory_consolidate_global`)
     /// memory pipelines.
     pub async fn clear_memory_data(&self) -> anyhow::Result<()> {
-        clear_memory_data_in_pool(self.pool.as_ref()).await
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::clear_memory_data(antfly, version).await;
+            }
+        };
+        clear_memory_data_in_pool(pool.as_ref()).await
     }
 
     /// Record usage for cited stage-1 outputs.
@@ -62,9 +103,16 @@ impl MemoryStore {
         if thread_ids.is_empty() {
             return Ok(0);
         }
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::record_stage1_output_usage(antfly, version, thread_ids)
+                    .await;
+            }
+        };
 
         let now = Utc::now().timestamp();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = pool.begin().await?;
         let mut updated_rows = 0;
 
         for thread_id in thread_ids {
@@ -88,11 +136,15 @@ WHERE thread_id = ?
         Ok(updated_rows)
     }
 
+    /// Only called from the SQLite path (see `enabled_thread_metadata`).
     async fn stage1_source_needs_update(
         &self,
         thread_id: ThreadId,
         source_updated_at: i64,
     ) -> anyhow::Result<bool> {
+        let MemoryBackend::Sqlite { pool, .. } = &self.backend else {
+            anyhow::bail!("stage1_source_needs_update is only called on the SQLite backend");
+        };
         let thread_id = thread_id.to_string();
         let existing_output = sqlx::query(
             r#"
@@ -102,7 +154,7 @@ WHERE thread_id = ?
             "#,
         )
         .bind(thread_id.as_str())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
         if let Some(existing_output) = existing_output {
             let existing_source_updated_at: i64 = existing_output.try_get("source_updated_at")?;
@@ -120,7 +172,7 @@ WHERE kind = ? AND job_key = ?
         )
         .bind(JOB_KIND_MEMORY_STAGE1)
         .bind(thread_id.as_str())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
         if let Some(existing_job) = existing_job {
             let last_success_watermark =
@@ -153,6 +205,18 @@ WHERE kind = ? AND job_key = ?
         current_thread_id: ThreadId,
         params: Stage1StartupClaimParams<'_>,
     ) -> anyhow::Result<Vec<Stage1JobClaim>> {
+        let (_pool, state_pool) = match &self.backend {
+            MemoryBackend::Sqlite { pool, state_pool } => (pool, state_pool),
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::claim_stage1_jobs_for_startup(
+                    antfly,
+                    version,
+                    current_thread_id,
+                    params,
+                )
+                .await;
+            }
+        };
         let Stage1StartupClaimParams {
             scan_limit,
             max_claimed,
@@ -258,7 +322,7 @@ FROM threads
 
         let items = builder
             .build()
-            .fetch_all(self.state_pool.as_ref())
+            .fetch_all(state_pool.as_ref())
             .await?
             .into_iter()
             .map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
@@ -297,9 +361,15 @@ FROM threads
     }
 
     pub(super) async fn delete_thread_memory(&self, thread_id: ThreadId) -> anyhow::Result<()> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::delete_thread_memory(antfly, version, thread_id).await;
+            }
+        };
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = pool.begin().await?;
 
         let existing_output = sqlx::query(
             r#"
@@ -358,6 +428,12 @@ WHERE kind = ? AND job_key = ?
         &self,
         n: usize,
     ) -> anyhow::Result<Vec<Stage1Output>> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::list_stage1_outputs_for_global(antfly, version, n).await;
+            }
+        };
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -376,7 +452,7 @@ WHERE length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0
 ORDER BY so.source_updated_at DESC, so.thread_id DESC
             "#,
         )
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(pool.as_ref())
         .await?;
 
         let mut outputs = Vec::new();
@@ -405,6 +481,18 @@ ORDER BY so.source_updated_at DESC, so.thread_id DESC
         max_unused_days: i64,
         limit: usize,
     ) -> anyhow::Result<usize> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::prune_stage1_outputs_for_retention(
+                    antfly,
+                    version,
+                    max_unused_days,
+                    limit,
+                )
+                .await;
+            }
+        };
         if limit == 0 {
             return Ok(0);
         }
@@ -428,7 +516,7 @@ WHERE thread_id IN (
         )
         .bind(cutoff)
         .bind(limit as i64)
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?
         .rows_affected();
 
@@ -455,6 +543,18 @@ WHERE thread_id IN (
         n: usize,
         max_unused_days: i64,
     ) -> anyhow::Result<Vec<Stage1Output>> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::get_phase2_input_selection(
+                    antfly,
+                    version,
+                    n,
+                    max_unused_days,
+                )
+                .await;
+            }
+        };
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -489,7 +589,7 @@ LIMIT ? OFFSET ?
             .bind(cutoff)
             .bind(page_size_i64)
             .bind(offset)
-            .fetch_all(self.pool.as_ref())
+            .fetch_all(pool.as_ref())
             .await?;
 
             if candidate_rows.is_empty() {
@@ -532,7 +632,7 @@ WHERE so.thread_id = ? AND so.source_updated_at = ?
             )
             .bind(thread_id.as_str())
             .bind(source_updated_at)
-            .fetch_optional(self.pool.as_ref())
+            .fetch_optional(pool.as_ref())
             .await?
             else {
                 continue;
@@ -561,10 +661,16 @@ WHERE so.thread_id = ? AND so.source_updated_at = ?
         Ok(Some(stage1_output_from_row_and_thread(row, thread)?))
     }
 
+    /// Only called from the SQLite path; the Antfly backend's equivalent
+    /// lookups all short-circuit through `antfly_memories` before reaching
+    /// this helper.
     async fn enabled_thread_metadata(
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<ThreadMetadata>> {
+        let MemoryBackend::Sqlite { state_pool, .. } = &self.backend else {
+            anyhow::bail!("enabled_thread_metadata is only called on the SQLite backend");
+        };
         let row = sqlx::query(
             r#"
 SELECT
@@ -618,7 +724,7 @@ WHERE threads.id = ? AND threads.memory_mode = 'enabled'
             "#,
         )
         .bind(thread_id.to_string())
-        .fetch_optional(self.state_pool.as_ref())
+        .fetch_optional(state_pool.as_ref())
         .await?;
 
         row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
@@ -631,6 +737,15 @@ WHERE threads.id = ? AND threads.memory_mode = 'enabled'
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<bool> {
+        let (pool, state_pool) = match &self.backend {
+            MemoryBackend::Sqlite { pool, state_pool } => (pool, state_pool),
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_thread_memory_mode_polluted(
+                    antfly, version, thread_id,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
         let selected_for_phase2 = sqlx::query_scalar::<_, i64>(
@@ -641,7 +756,7 @@ WHERE thread_id = ?
             "#,
         )
         .bind(thread_id.as_str())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?
         .unwrap_or(0);
         let rows_affected = sqlx::query(
@@ -652,7 +767,7 @@ WHERE id = ? AND memory_mode != 'polluted'
             "#,
         )
         .bind(thread_id.as_str())
-        .execute(self.state_pool.as_ref())
+        .execute(state_pool.as_ref())
         .await?
         .rows_affected();
 
@@ -687,6 +802,21 @@ WHERE id = ? AND memory_mode != 'polluted'
         lease_seconds: i64,
         max_running_jobs: usize,
     ) -> anyhow::Result<Stage1JobClaimOutcome> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::try_claim_stage1_job(
+                    antfly,
+                    version,
+                    thread_id,
+                    worker_id,
+                    source_updated_at,
+                    lease_seconds,
+                    max_running_jobs,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
         let max_running_jobs = max_running_jobs as i64;
@@ -694,7 +824,7 @@ WHERE id = ? AND memory_mode != 'polluted'
         let thread_id = thread_id.to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let existing_output = sqlx::query(
             r#"
@@ -875,10 +1005,26 @@ WHERE kind = ? AND job_key = ?
         rollout_summary: &str,
         rollout_slug: Option<&str>,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_stage1_job_succeeded(
+                    antfly,
+                    version,
+                    thread_id,
+                    ownership_token,
+                    source_updated_at,
+                    raw_memory,
+                    rollout_summary,
+                    rollout_slug,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = pool.begin().await?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE jobs
@@ -952,10 +1098,22 @@ WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at
         thread_id: ThreadId,
         ownership_token: &str,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_stage1_job_succeeded_no_output(
+                    antfly,
+                    version,
+                    thread_id,
+                    ownership_token,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = pool.begin().await?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE jobs
@@ -1029,6 +1187,20 @@ WHERE thread_id = ?
         failure_reason: &str,
         retry_delay_seconds: i64,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_stage1_job_failed(
+                    antfly,
+                    version,
+                    thread_id,
+                    ownership_token,
+                    failure_reason,
+                    retry_delay_seconds,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
         let thread_id = thread_id.to_string();
@@ -1053,7 +1225,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_STAGE1)
         .bind(thread_id.as_str())
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1068,7 +1240,18 @@ WHERE kind = ? AND job_key = ?
     /// Phase 2 does not use this watermark as a dirty check; git workspace diffing
     /// decides whether consolidation work exists after the lock is claimed.
     pub async fn enqueue_global_consolidation(&self, input_watermark: i64) -> anyhow::Result<()> {
-        enqueue_global_consolidation_with_executor(self.pool.as_ref(), input_watermark).await
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::enqueue_global_consolidation(
+                    antfly,
+                    version,
+                    input_watermark,
+                )
+                .await;
+            }
+        };
+        enqueue_global_consolidation_with_executor(pool.as_ref(), input_watermark).await
     }
 
     /// Attempts to claim the global phase-2 consolidation lock.
@@ -1089,13 +1272,25 @@ WHERE kind = ? AND job_key = ?
         worker_id: ThreadId,
         lease_seconds: i64,
     ) -> anyhow::Result<Phase2JobClaimOutcome> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::try_claim_global_phase2_job(
+                    antfly,
+                    version,
+                    worker_id,
+                    lease_seconds,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
         let cooldown_cutoff = now.saturating_sub(PHASE2_SUCCESS_COOLDOWN_SECONDS);
         let ownership_token = Uuid::new_v4().to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let existing_job = sqlx::query(
             r#"
@@ -1226,6 +1421,18 @@ WHERE kind = ? AND job_key = ?
         ownership_token: &str,
         lease_seconds: i64,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::heartbeat_global_phase2_job(
+                    antfly,
+                    version,
+                    ownership_token,
+                    lease_seconds,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
         let rows_affected = sqlx::query(
@@ -1240,7 +1447,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1263,7 +1470,20 @@ WHERE kind = ? AND job_key = ?
         completed_watermark: i64,
         selected_outputs: &[Stage1Output],
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_global_phase2_job_succeeded(
+                    antfly,
+                    version,
+                    ownership_token,
+                    completed_watermark,
+                    selected_outputs,
+                )
+                .await;
+            }
+        };
+        let mut tx = pool.begin().await?;
         let rows_affected =
             mark_global_phase2_job_succeeded_row(&mut *tx, ownership_token, completed_watermark)
                 .await?;
@@ -1325,6 +1545,19 @@ WHERE thread_id = ? AND source_updated_at = ?
         failure_reason: &str,
         retry_delay_seconds: i64,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_global_phase2_job_failed(
+                    antfly,
+                    version,
+                    ownership_token,
+                    failure_reason,
+                    retry_delay_seconds,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
         let rows_affected = sqlx::query(
@@ -1347,7 +1580,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1366,6 +1599,19 @@ WHERE kind = ? AND job_key = ?
         failure_reason: &str,
         retry_delay_seconds: i64,
     ) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            MemoryBackend::Sqlite { pool, .. } => pool,
+            MemoryBackend::Antfly { antfly, version } => {
+                return antfly_memories::mark_global_phase2_job_failed_if_unowned(
+                    antfly,
+                    version,
+                    ownership_token,
+                    failure_reason,
+                    retry_delay_seconds,
+                )
+                .await;
+            }
+        };
         let now = Utc::now().timestamp();
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
         let rows_affected = sqlx::query(
@@ -1389,7 +1635,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute(pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1739,7 +1985,7 @@ mod tests {
     }
 
     fn memory_pool(runtime: &StateRuntime) -> &sqlx::SqlitePool {
-        runtime.memories().pool.as_ref()
+        runtime.memories().sqlite_pool().as_ref()
     }
 
     async fn age_phase2_success_beyond_cooldown(runtime: &StateRuntime) {
