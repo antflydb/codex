@@ -1965,6 +1965,7 @@ dependencies = [
  "base64 0.22.1",
  "caseless",
  "chrono",
+ "codex-antfly",
  "codex-extension-api",
  "codex-protocol",
  "codex-state",
@@ -3989,6 +3990,7 @@ dependencies = [
 name = "codex-memories-extension"
 version = "0.0.0"
 dependencies = [
+ "codex-antfly",
  "codex-core",
  "codex-extension-api",
  "codex-features",
@@ -4005,6 +4007,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

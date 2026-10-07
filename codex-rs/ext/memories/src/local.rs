@@ -19,6 +19,11 @@ mod path;
 mod read;
 mod search;
 
+// Reused by the Antfly backend, which runs the same line-matching logic over
+// hybrid-search candidates instead of walking the whole directory tree.
+pub(crate) use search::SearchMatcher;
+pub(crate) use search::search_file;
+
 #[derive(Debug, Clone)]
 pub(crate) struct LocalMemoriesBackend {
     root: PathBuf,

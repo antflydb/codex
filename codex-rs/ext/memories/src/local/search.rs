@@ -127,7 +127,11 @@ async fn search_entries(
     Ok(())
 }
 
-async fn search_file(
+/// Matches one file against `matcher`, appending results to `matches`.
+///
+/// Shared with the Antfly backend, which calls this for each candidate file
+/// returned by hybrid search instead of walking the whole directory tree.
+pub(crate) async fn search_file(
     root: &Path,
     path: &Path,
     matcher: &SearchMatcher,
@@ -250,7 +254,7 @@ fn build_search_match(
     }
 }
 
-struct SearchMatcher {
+pub(crate) struct SearchMatcher {
     queries: Vec<String>,
     prepared_queries: Vec<String>,
     comparison: SearchComparison,
@@ -258,7 +262,7 @@ struct SearchMatcher {
 }
 
 impl SearchMatcher {
-    fn new(
+    pub(crate) fn new(
         queries: Vec<String>,
         match_mode: SearchMatchMode,
         case_sensitive: bool,

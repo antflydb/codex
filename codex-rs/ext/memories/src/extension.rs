@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use codex_antfly::Antfly;
 use codex_core::config::Config;
+use codex_core::config::ThreadStoreConfig;
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::MemoryContextFragment;
 use codex_extension_api::ConfigContributor;
@@ -18,6 +20,7 @@ use codex_otel::MetricsClient;
 use codex_protocol::MemoryVersion;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+use crate::antfly_backend::AntflyMemoriesBackend;
 use crate::local::LocalMemoriesBackend;
 use crate::prompts::build_memory_tool_developer_instructions;
 use crate::tools;
@@ -40,15 +43,24 @@ pub(crate) struct MemoriesExtensionConfig {
     pub(crate) dedicated_tools: bool,
     pub(crate) codex_home: AbsolutePathBuf,
     pub(crate) version: MemoryVersion,
+    /// `Some` when `experimental_thread_store` selects the Antfly backend;
+    /// hybrid search then runs over notes indexed in Antfly instead of
+    /// walking the filesystem.
+    pub(crate) antfly: Option<Arc<Antfly>>,
 }
 
 impl MemoriesExtensionConfig {
     fn from_config(config: &Config) -> Self {
+        let antfly = match &config.experimental_thread_store {
+            ThreadStoreConfig::Antfly(antfly_config) => Some(codex_antfly::shared(antfly_config)),
+            ThreadStoreConfig::Local | ThreadStoreConfig::InMemory { .. } => None,
+        };
         Self {
             enabled: config.features.enabled(Feature::MemoryTool) && config.memories.use_memories,
             dedicated_tools: config.memories.dedicated_tools,
             codex_home: config.codex_home.clone(),
             version: config.memories.version,
+            antfly,
         }
     }
 }
@@ -147,15 +159,24 @@ impl ToolContributor for MemoriesExtension {
             return Vec::new();
         }
 
-        tools::memory_tools(
-            LocalMemoriesBackend::from_memory_root(
-                config
-                    .codex_home
-                    .join(config.version.directory_name())
-                    .to_path_buf(),
+        let root = config
+            .codex_home
+            .join(config.version.directory_name())
+            .to_path_buf();
+        match &config.antfly {
+            Some(antfly) => tools::memory_tools(
+                AntflyMemoriesBackend::new(
+                    root,
+                    Arc::clone(antfly),
+                    config.version.directory_name(),
+                ),
+                self.metrics_client.clone(),
             ),
-            self.metrics_client.clone(),
-        )
+            None => tools::memory_tools(
+                LocalMemoriesBackend::from_memory_root(root),
+                self.metrics_client.clone(),
+            ),
+        }
     }
 }
 
