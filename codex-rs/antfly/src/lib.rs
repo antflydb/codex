@@ -11,6 +11,7 @@ mod embedded;
 mod error;
 pub mod keys;
 mod remote;
+mod replicated;
 mod runtime;
 
 pub use backend::Backend;
@@ -32,6 +33,7 @@ pub use embedded::LocalDecider;
 pub use error::AntflyError;
 pub use error::AntflyResult;
 pub use remote::RemoteBackend;
+pub use replicated::ReplicatedBackend;
 pub use runtime::Antfly;
 pub use runtime::SEARCH_TEXT_FIELD;
 pub use runtime::shared;

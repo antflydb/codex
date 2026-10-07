@@ -2553,6 +2553,7 @@ fn thread_store_config(
                 embedder_model: antfly.embedder_model,
                 embedder_dims: antfly.embedder_dims,
                 semantic_search: antfly.semantic_search,
+                search_remote: antfly.search_remote,
                 decide_model: antfly.decide_model,
                 approvals_mode: antfly.approvals.as_ref().and_then(|a| a.mode.clone()),
                 allow_threshold: antfly.approvals.as_ref().and_then(|a| a.allow_threshold),

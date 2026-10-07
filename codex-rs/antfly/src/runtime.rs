@@ -21,6 +21,7 @@ use crate::embedded::LocalDecider;
 use crate::error::AntflyError;
 use crate::error::AntflyResult;
 use crate::remote::RemoteBackend;
+use crate::replicated::ReplicatedBackend;
 
 /// Field that every searchable Codex document puts its text into. The dense
 /// index embeds it and full-text search matches it.
@@ -68,6 +69,15 @@ pub fn shared(config: &AntflyConfig) -> Arc<Antfly> {
     antfly
 }
 
+fn api_key(api_key_env: Option<&String>) -> AntflyResult<Option<String>> {
+    match api_key_env {
+        Some(name) => std::env::var(name)
+            .map(Some)
+            .map_err(|_| AntflyError::Config(format!("environment variable {name} is not set"))),
+        None => Ok(None),
+    }
+}
+
 fn open_backend(config: &BackendConfig) -> AntflyResult<Arc<dyn Backend>> {
     Ok(match config {
         BackendConfig::Embedded { path } => Arc::new(EmbeddedBackend::open(path)?),
@@ -75,15 +85,26 @@ fn open_backend(config: &BackendConfig) -> AntflyResult<Arc<dyn Backend>> {
             url,
             table,
             api_key_env,
-        } => {
-            let api_key = match api_key_env {
-                Some(name) => Some(std::env::var(name).map_err(|_| {
-                    AntflyError::Config(format!("environment variable {name} is not set"))
-                })?),
-                None => None,
-            };
-            Arc::new(RemoteBackend::new(url, table, api_key)?)
-        }
+        } => Arc::new(RemoteBackend::new(
+            url,
+            table,
+            api_key(api_key_env.as_ref())?,
+        )?),
+        BackendConfig::Replicated {
+            path,
+            url,
+            table,
+            api_key_env,
+            search_remote,
+        } => Arc::new(ReplicatedBackend::new(
+            Arc::new(EmbeddedBackend::open(path)?),
+            Arc::new(RemoteBackend::new(
+                url,
+                table,
+                api_key(api_key_env.as_ref())?,
+            )?),
+            *search_remote,
+        )),
     })
 }
 

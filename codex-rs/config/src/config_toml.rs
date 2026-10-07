@@ -580,7 +580,8 @@ pub enum ThreadStoreToml {
 pub struct AntflyStoreToml {
     /// Embedded database file.
     pub path: Option<PathBuf>,
-    /// Remote Antfly or Antfly Cloud base URL; selects the remote backend.
+    /// Remote Antfly or Antfly Cloud base URL. Alone it selects the remote
+    /// backend; with `path` the local database replicates to it.
     pub url: Option<String>,
     /// Remote table holding Codex state (default `codex`).
     pub table: Option<String>,
@@ -593,6 +594,9 @@ pub struct AntflyStoreToml {
     pub embedder_model: Option<String>,
     pub embedder_dims: Option<u32>,
     pub semantic_search: Option<bool>,
+    /// With both `path` and `url`, search the remote replica instead of the
+    /// local copy.
+    pub search_remote: Option<bool>,
     /// Typed-decision model used to review approvals (default `laya`).
     pub decide_model: Option<String>,
     pub approvals: Option<AntflyApprovalsToml>,

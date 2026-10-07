@@ -20,6 +20,18 @@ pub enum BackendConfig {
         /// Environment variable that holds a bearer token, if any.
         api_key_env: Option<String>,
     },
+    /// A local `.aflite` database whose writes are replicated to a remote
+    /// instance through a durable outbox. Works offline; the remote catches
+    /// up when reachable.
+    Replicated {
+        path: PathBuf,
+        url: String,
+        table: String,
+        api_key_env: Option<String>,
+        /// Search the remote replica (which can include other machines'
+        /// threads) instead of the local copy.
+        search_remote: bool,
+    },
 }
 
 /// Embedding model used for semantic search over Codex state.
@@ -101,6 +113,7 @@ pub struct AntflyTomlSettings {
     pub embedder_model: Option<String>,
     pub embedder_dims: Option<u32>,
     pub semantic_search: Option<bool>,
+    pub search_remote: Option<bool>,
     pub decide_model: Option<String>,
     pub approvals_mode: Option<String>,
     pub allow_threshold: Option<f64>,
@@ -141,17 +154,23 @@ impl AntflyConfig {
 
     /// Applies defaults to settings read from `config.toml`.
     pub fn from_toml(settings: AntflyTomlSettings) -> Result<Self, AntflyError> {
-        let backend = match settings.url {
-            Some(url) => BackendConfig::Remote {
+        let local_path = settings.path.map(expand_home);
+        let table = settings.table.unwrap_or_else(|| "codex".to_string());
+        let backend = match (settings.url, local_path) {
+            (Some(url), Some(path)) => BackendConfig::Replicated {
+                path,
                 url,
-                table: settings.table.unwrap_or_else(|| "codex".to_string()),
+                table,
+                api_key_env: settings.api_key_env,
+                search_remote: settings.search_remote.unwrap_or(false),
+            },
+            (Some(url), None) => BackendConfig::Remote {
+                url,
+                table,
                 api_key_env: settings.api_key_env,
             },
-            None => BackendConfig::Embedded {
-                path: settings
-                    .path
-                    .map(expand_home)
-                    .unwrap_or_else(|| settings.codex_home.join("antfly.aflite")),
+            (None, path) => BackendConfig::Embedded {
+                path: path.unwrap_or_else(|| settings.codex_home.join("antfly.aflite")),
             },
         };
         let embedder = if settings.semantic_search == Some(false) {
