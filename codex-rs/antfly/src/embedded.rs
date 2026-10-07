@@ -322,6 +322,9 @@ impl Backend for EmbeddedBackend {
                 "kind": "dense_vector",
                 "config_json": json!({
                     "type": "embeddings",
+                    // Without a field the index reads `embedding` and never
+                    // sees the enriched text.
+                    "field": dense.field,
                     "dims": dense.dims,
                     "metric": "cosine",
                     "embedder": embedder,

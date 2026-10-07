@@ -179,3 +179,46 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
     settle();
     Ok(())
 }
+
+#[test]
+fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let models = std::path::Path::new(&home).join(".antfly/inference/models/BAAI");
+    if !models.exists() {
+        eprintln!("skipping: no BAAI embedder under {models:?}");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, true);
+        antfly
+            .write(vec![
+                Write::put(
+                    "turn:a",
+                    json!({"search_text": "fix the flaky raft snapshot test"}),
+                ),
+                Write::put(
+                    "turn:b",
+                    json!({"search_text": "write release notes for the cli"}),
+                ),
+            ])
+            .await?;
+        let mut hits = Vec::new();
+        for _ in 0..100 {
+            hits = antfly
+                .search_semantic("turn:", "consensus log compaction", 1)
+                .await?;
+            if !hits.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
+        assert_eq!(keys, vec!["turn:a"]);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    settle();
+    Ok(())
+}
