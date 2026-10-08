@@ -82,15 +82,43 @@ implementation differs and why.
 
 ### Status
 
+All phases are implemented on `antfly/integration`.
+
 | Phase | State |
 | --- | --- |
-| 0 Antfly prerequisites | `Database::sql_json` (antfly `feat/rust-embedded-sql-json`), Laya checkpoint, schema |
-| 1 Thread store | core lifecycle, listing, search, sections, attachments, projects, Legacy fork/revert merged; paginated history in progress |
-| 2 Other seams | agent message board and memories backend in progress |
-| 3 StateRuntime on Antfly | in progress |
-| 4 Laya approvals | reviewer, outcome recorder, calibration test merged |
-| 5 Migration | after paginated history lands |
-| 6 Remote | remote and replicated backends merged and tested against `antfly standalone` |
+| 0 Antfly prerequisites | `Database::sql_json` with SQL diagnostics (antfly branch `feat/rust-embedded-sql-json`), Laya checkpoint prepared from a pinned revision, dense index + enrichment over `search_text` |
+| 1 Thread store | `AntflyThreadStore`: lifecycle with lazy materialization, Legacy and Paginated history (projection of turns/items/realtime in the same write as items), `list_turns`/`list_items`/`list_timeline`, listing with local cursor formats, hybrid `search_threads`, literal `search_thread_occurrences`, sections (Pinned seeded), attachments, projects, fork/revert for both modes (forks reference their source through `history_base`; deleting or reverting history a fork inherits is refused) |
+| 2 Other seams | Antfly agent message board (with thread-deletion cleanup) and Antfly memories backend (hybrid search over notes, filesystem stays the source of truth) |
+| 3 StateRuntime on Antfly | `StateRuntime::init_antfly`; goals, memory jobs and leases, queue (same error shapes as SQLite), guardian feedback, remote control, external imports, spawn edges and the thread-metadata adapter on Antfly; logs are no-ops; startup builds it through `rollout::state_db` when the store is Antfly |
+| 4 Laya approvals | reviewer, latest-request capture, outcome recorder, calibrated verdicts (see above) |
+| 5 Migration | `codex-antfly-import`: plans from rollout headers plus read-only SQLite metadata, flattens fork/revert lineages, streams one thread at a time, chunked writes, `--since`/`--limit`/`--dry-run`/`--replace`/`--search` |
+| 6 Remote | remote and replicated (outbox) backends, tested against `antfly standalone` |
+
+Acceptance gate: `app-server/tests/suite/v2/antfly_thread_store.rs` runs a fresh
+`CODEX_HOME` through thread start, a turn against a mock model, listing, and
+deletion, and asserts no `*.sqlite` files and no rollout directories appear.
+
+Known limitations:
+
+- About 60 `StateRuntime` methods that only serve the local thread store run
+  against a migrated in-memory SQLite pool (`sqlite::memory:`) on the Antfly
+  backend instead of being individually reimplemented. No SQLite files are
+  created, but the engine is still linked and initialized.
+- Tests that open many embedded databases in one process occasionally hit
+  transient `ANTFLY_INTERNAL`/`WouldBlock` errors in Antfly's background
+  indexer; run `codex-state` and the Antfly suites with `--test-threads=1`.
+- Approval review defaults to `off`. Laya's zero-shot probabilities are only
+  moderately separated; collect shadow-mode decisions and outcomes (stored
+  under `approval:`) before enforcing, and consider fine-tuning on them.
+- The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
+  full import takes hours on a debug build. Imported forks and reverts are
+  flattened into self-contained threads.
+- The remote backend was tested against a local `antfly standalone`, not
+  Antfly Cloud's proxy.
+- Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from the
+  Antfly branch above (`zig build capi`); CLI binaries embed it as an rpath.
+  The workspace `Cargo.toml` points `antfly-embedded` at that Antfly
+  checkout by relative path.
 
 ## Goals
 
