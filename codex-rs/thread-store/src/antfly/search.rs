@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::ThreadHistoryMode;
 use serde_json::Value;
 
 use super::AntflyThreadStore;
@@ -15,11 +14,9 @@ use super::internal;
 use super::keys;
 use super::listing::ListCursor;
 use super::record::ThreadRecord;
-use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::SortDirection;
 use crate::StoredThreadSearchResult;
-use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadSearchPage;
 use crate::ThreadSortKey;
 use crate::ThreadStoreError;
@@ -200,39 +197,6 @@ pub(super) async fn search_threads(
             })
             .collect(),
         next_cursor,
-    })
-}
-
-pub(super) async fn search_thread_occurrences(
-    store: &AntflyThreadStore,
-    params: SearchThreadOccurrencesParams,
-) -> ThreadStoreResult<ThreadOccurrenceSearchPage> {
-    if params.search_term.trim().is_empty() {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: "thread/searchOccurrences requires search_term".to_owned(),
-        });
-    }
-    if params.page_size == 0 {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: "thread/searchOccurrences requires page_size greater than zero".to_owned(),
-        });
-    }
-    let record =
-        store
-            .load_record(params.thread_id)
-            .await?
-            .ok_or(ThreadStoreError::Unsupported {
-                operation: "thread/searchOccurrences",
-            })?;
-    // Occurrences address paginated turns and items; legacy threads have
-    // neither, matching the local store.
-    if record.history_mode() != ThreadHistoryMode::Paginated {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "thread/searchOccurrences",
-        });
-    }
-    Err(ThreadStoreError::Unsupported {
-        operation: "thread/searchOccurrences",
     })
 }
 
