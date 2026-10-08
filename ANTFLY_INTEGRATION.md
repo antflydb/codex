@@ -116,7 +116,13 @@ Known limitations:
 - The remote backend was tested against a local `antfly standalone`, not
   Antfly Cloud's proxy.
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from the
-  Antfly branch above (`zig build capi`); CLI binaries embed it as an rpath.
+  Antfly branch above (`zig build capi`); CLI binaries and `codex-core` test
+  binaries embed it as an rpath (the fs sandbox helper re-execs the binary
+  with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
+  `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
+- `agent::control::tests::ensure_v2_child_loaded_preserves_evicted_parent_authority`
+  overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
+  well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
   The workspace `Cargo.toml` points `antfly-embedded` at that Antfly
   checkout by relative path.
 

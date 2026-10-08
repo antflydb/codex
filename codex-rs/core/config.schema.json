@@ -4384,6 +4384,10 @@
               "description": "Embedded database file.",
               "type": "string"
             },
+            "search_remote": {
+              "description": "With both `path` and `url`, search the remote replica instead of the local copy.",
+              "type": "boolean"
+            },
             "semantic_search": {
               "type": "boolean"
             },
@@ -4398,7 +4402,7 @@
               "type": "string"
             },
             "url": {
-              "description": "Remote Antfly or Antfly Cloud base URL; selects the remote backend.",
+              "description": "Remote Antfly or Antfly Cloud base URL. Alone it selects the remote backend; with `path` the local database replicates to it.",
               "type": "string"
             }
           },
