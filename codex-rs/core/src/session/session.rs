@@ -1139,6 +1139,10 @@ impl Session {
                 thread_store.as_any().downcast_ref::<LocalThreadStore>()
             {
                 local_store.state_db().await
+            } else if let Some(antfly_store) =
+                thread_store.as_any().downcast_ref::<AntflyThreadStore>()
+            {
+                antfly_store.state_db().await
             } else {
                 None
             }

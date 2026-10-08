@@ -51,6 +51,12 @@ impl StateRuntime {
         successes: &[ExternalAgentConfigImportSuccessRecord],
         failures: &[ExternalAgentConfigImportFailureRecord],
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::external_agent_config_imports::record_external_agent_config_import_completed(
+                antfly, import_id, provider_id, successes, failures,
+            )
+            .await;
+        }
         sqlx::query(
             r#"
 INSERT INTO external_agent_config_imports (
@@ -82,6 +88,12 @@ ON CONFLICT(import_id) DO UPDATE SET
         &self,
         import_id: &str,
     ) -> anyhow::Result<Option<ExternalAgentConfigImportDetailsRecord>> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::external_agent_config_imports::external_agent_config_import_details_record(
+                antfly, import_id,
+            )
+            .await;
+        }
         let row = sqlx::query(
             r#"
 SELECT
@@ -109,6 +121,12 @@ WHERE import_id = ?
     pub async fn external_agent_config_import_history_records(
         &self,
     ) -> anyhow::Result<Vec<ExternalAgentConfigImportHistoryRecord>> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::external_agent_config_imports::external_agent_config_import_history_records(
+                antfly,
+            )
+            .await;
+        }
         let rows = sqlx::query(
             r#"
 SELECT

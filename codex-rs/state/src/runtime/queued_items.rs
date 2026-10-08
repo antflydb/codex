@@ -1,21 +1,36 @@
 use super::*;
 use crate::MAX_QUEUE_ITEMS;
 use crate::QueuedUserSubmissionRecord;
+use crate::runtime::antfly_backend::queue as antfly_queue;
 use sqlx::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// SQLite-backed persistence for durable, thread-scoped user messages.
+#[derive(Clone)]
+enum QueueBackend {
+    Sqlite(Arc<SqlitePool>),
+    Antfly(Arc<codex_antfly::Antfly>),
+}
+
+/// Persistence for durable, thread-scoped user messages. Backed by SQLite
+/// (the default Local store) or Antfly, selected at construction.
 #[derive(Clone)]
 pub struct SqliteQueueStore {
-    pool: Arc<SqlitePool>,
+    backend: QueueBackend,
     change_version_connection: Arc<Mutex<Option<SqliteConnection>>>,
 }
 
 impl SqliteQueueStore {
     pub(crate) fn new(pool: Arc<SqlitePool>) -> Self {
         Self {
-            pool,
+            backend: QueueBackend::Sqlite(pool),
+            change_version_connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn new_antfly(antfly: Arc<codex_antfly::Antfly>) -> Self {
+        Self {
+            backend: QueueBackend::Antfly(antfly),
             change_version_connection: Arc::new(Mutex::new(None)),
         }
     }
@@ -27,16 +42,22 @@ impl SqliteQueueStore {
         {
             tracing::warn!(%error, "failed to close queue change-version connection");
         }
-        self.pool.close().await;
+        if let QueueBackend::Sqlite(pool) = &self.backend {
+            pool.close().await;
+        }
     }
 
     /// Observe queue-database commits through one stable SQLite connection.
     pub async fn change_version(&self) -> anyhow::Result<i64> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => return antfly_queue::change_version(antfly).await,
+        };
         let mut connection = Arc::clone(&self.change_version_connection)
             .lock_owned()
             .await;
         if connection.is_none() {
-            *connection = Some(self.pool.acquire().await?.detach());
+            *connection = Some(pool.acquire().await?.detach());
         }
         let Some(connection) = connection.as_mut() else {
             unreachable!("queue change-version connection was initialized");
@@ -52,6 +73,12 @@ impl SqliteQueueStore {
         revision: i64,
         thread_ids: &[ThreadId],
     ) -> anyhow::Result<Vec<(ThreadId, i64)>> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::changes_since(antfly, revision, thread_ids).await;
+            }
+        };
         if thread_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -67,7 +94,7 @@ impl SqliteQueueStore {
         separated.push_unseparated(") ORDER BY revision");
         let rows = query
             .build_query_as::<(String, i64)>()
-            .fetch_all(self.pool.as_ref())
+            .fetch_all(pool.as_ref())
             .await?;
         rows.into_iter()
             .map(|(thread_id, revision)| Ok((ThreadId::try_from(thread_id)?, revision)))
@@ -79,6 +106,12 @@ impl SqliteQueueStore {
         thread_id: ThreadId,
         payload_json: &str,
     ) -> anyhow::Result<QueuedUserSubmissionRecord> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::enqueue(antfly, thread_id, payload_json).await;
+            }
+        };
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let row = sqlx::query(
             "INSERT INTO queued_items (
@@ -99,7 +132,7 @@ impl SqliteQueueStore {
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(i64::try_from(MAX_QUEUE_ITEMS)?)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one(pool.as_ref())
         .await?;
         QueuedUserSubmissionRecord::try_from_row(&row)
     }
@@ -110,6 +143,12 @@ impl SqliteQueueStore {
         offset: usize,
         limit: usize,
     ) -> anyhow::Result<Vec<QueuedUserSubmissionRecord>> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::list_page(antfly, thread_id, offset, limit).await;
+            }
+        };
         let rows = sqlx::query(
             "SELECT id, thread_id, payload_json
              FROM queued_items
@@ -119,7 +158,7 @@ impl SqliteQueueStore {
         .bind(thread_id.to_string())
         .bind(i64::try_from(limit)?)
         .bind(i64::try_from(offset)?)
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(pool.as_ref())
         .await?;
         rows.iter()
             .map(QueuedUserSubmissionRecord::try_from_row)
@@ -132,6 +171,12 @@ impl SqliteQueueStore {
         item_id: &str,
         payload_json: &str,
     ) -> anyhow::Result<Option<QueuedUserSubmissionRecord>> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::update(antfly, thread_id, item_id, payload_json).await;
+            }
+        };
         let row = sqlx::query(
             "UPDATE queued_items
              SET payload_json = ?, updated_at_ms = ?
@@ -142,7 +187,7 @@ impl SqliteQueueStore {
         .bind(datetime_to_epoch_millis(Utc::now()))
         .bind(thread_id.to_string())
         .bind(item_id)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(pool.as_ref())
         .await?;
         row.as_ref()
             .map(QueuedUserSubmissionRecord::try_from_row)
@@ -150,11 +195,17 @@ impl SqliteQueueStore {
     }
 
     pub async fn delete(&self, thread_id: ThreadId, item_id: &str) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::delete(antfly, thread_id, item_id).await;
+            }
+        };
         Ok(
             sqlx::query("DELETE FROM queued_items WHERE thread_id = ? AND id = ?")
                 .bind(thread_id.to_string())
                 .bind(item_id)
-                .execute(self.pool.as_ref())
+                .execute(pool.as_ref())
                 .await?
                 .rows_affected()
                 > 0,
@@ -162,7 +213,13 @@ impl SqliteQueueStore {
     }
 
     pub async fn reorder(&self, thread_id: ThreadId, ordered_ids: &[String]) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::reorder(antfly, thread_id, ordered_ids).await;
+            }
+        };
+        let mut transaction = pool.begin().await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, queue_order FROM queued_items
              WHERE thread_id = ? ORDER BY queue_order",
@@ -201,9 +258,15 @@ impl SqliteQueueStore {
     }
 
     pub(crate) async fn delete_thread_queue(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
+        let pool = match &self.backend {
+            QueueBackend::Sqlite(pool) => pool,
+            QueueBackend::Antfly(antfly) => {
+                return antfly_queue::delete_thread_queue(antfly, thread_id).await;
+            }
+        };
         Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute(pool.as_ref())
             .await?
             .rows_affected()
             > 0)

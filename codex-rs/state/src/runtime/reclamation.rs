@@ -71,6 +71,15 @@ impl SqliteReclamationWorker {
         Arc::new(Self { shutdown, finished })
     }
 
+    /// A worker with nothing to reclaim: no background task, no dedicated
+    /// SQLite connection opened by path. Used for the Antfly backend, which
+    /// has no on-disk database files to vacuum.
+    pub(crate) fn noop() -> Arc<Self> {
+        let (shutdown, _) = watch::channel(());
+        let (_finish, finished) = watch::channel(());
+        Arc::new(Self { shutdown, finished })
+    }
+
     pub(crate) async fn close(&self) {
         self.shutdown.send_replace(());
         // Every caller waits for task completion, even if another close is canceled.

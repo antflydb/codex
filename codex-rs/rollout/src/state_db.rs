@@ -43,6 +43,19 @@ const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// runtime, applies rollout metadata backfills as needed, and returns the
 /// initialized handle.
 pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+    if let Some(antfly_config) = config.antfly_config() {
+        return match init_antfly_state_db(antfly_config, config.model_provider_id().to_string())
+            .await
+        {
+            Ok(runtime) => Some(runtime),
+            Err(err) => {
+                emit_startup_warning(&format!(
+                    "failed to initialize Antfly-backed state runtime: {err:#}"
+                ));
+                None
+            }
+        };
+    }
     let config = RolloutConfig::from_view(config);
     match try_init_with_roots(config.codex_home, config.sqlite, config.model_provider_id).await {
         Ok(runtime) => Some(runtime),
@@ -58,8 +71,23 @@ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
 /// Prefer [`init`] unless the caller needs to surface the exact failure after
 /// tracing or UI setup has completed.
 pub async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDbHandle> {
+    if let Some(antfly_config) = config.antfly_config() {
+        return init_antfly_state_db(antfly_config, config.model_provider_id().to_string()).await;
+    }
     let config = RolloutConfig::from_view(config);
     try_init_with_roots(config.codex_home, config.sqlite, config.model_provider_id).await
+}
+
+/// Opens (or reuses) the process-wide Antfly handle and builds its
+/// `StateRuntime`. Unlike the SQLite path, there is no rollout-metadata
+/// backfill or rollout-migration gate: `AntflyThreadStore` owns thread
+/// metadata directly and never wrote rollout JSONL files to backfill from.
+async fn init_antfly_state_db(
+    antfly_config: &codex_antfly::AntflyConfig,
+    default_provider: String,
+) -> anyhow::Result<StateDbHandle> {
+    let antfly = codex_antfly::shared(antfly_config);
+    codex_state::StateRuntime::init_antfly(antfly, default_provider).await
 }
 
 async fn try_init_with_roots(
@@ -206,6 +234,21 @@ fn emit_startup_warning(message: &str) {
 /// Unlike [`init`], this helper does not run rollout backfill. It is for
 /// optional local reads from non-owning contexts such as remote app-server mode.
 pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+    if let Some(antfly_config) = config.antfly_config() {
+        return match init_antfly_state_db(antfly_config, config.model_provider_id().to_string())
+            .await
+        {
+            Ok(runtime) => Some(runtime),
+            Err(_) => {
+                codex_state::record_fallback(
+                    "get_state_db",
+                    "antfly_error",
+                    /*telemetry_override*/ None,
+                );
+                None
+            }
+        };
+    }
     let state_path = config.sqlite_config().state_db_path();
     if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
         codex_state::record_fallback(
