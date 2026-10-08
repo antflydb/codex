@@ -3,6 +3,7 @@
 //! Board identity and caller identity come from the host. Implementations own
 //! storage and notification fanout; tools and feature registration are separate.
 
+mod antfly;
 mod api;
 mod extension;
 mod host;
@@ -11,6 +12,7 @@ mod local;
 mod tools;
 mod types;
 
+pub use antfly::AntflyAgentMessageBoard;
 pub use api::AgentMessageBoard;
 pub use api::ChannelQuery;
 pub use api::CreateChannelRequest;

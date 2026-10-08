@@ -37,6 +37,7 @@ use crate::tasks::interrupted_turn_history_marker;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
+use codex_agent_message_board_extension::AntflyAgentMessageBoard;
 use codex_agent_message_board_extension::LocalAgentMessageBoard;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
@@ -514,7 +515,25 @@ pub fn thread_store_from_config(
             Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
         }
         ThreadStoreConfig::Antfly(antfly_config) => {
-            Arc::new(AntflyThreadStore::new(codex_antfly::shared(antfly_config)))
+            let antfly = codex_antfly::shared(antfly_config);
+            let cleanup_antfly = Arc::clone(&antfly);
+            Arc::new(
+                AntflyThreadStore::new(antfly).with_thread_data_cleanup(Arc::new(
+                    move |thread_ids: Vec<ThreadId>| {
+                        let antfly = Arc::clone(&cleanup_antfly);
+                        Box::pin(async move {
+                            let boards = thread_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+                            AntflyAgentMessageBoard::delete_boards(&antfly, &boards)
+                                .await
+                                .map_err(|err| ThreadStoreError::Internal {
+                                    message: format!(
+                                        "failed to delete agent message boards: {err}"
+                                    ),
+                                })
+                        })
+                    },
+                )),
+            )
         }
     }
 }

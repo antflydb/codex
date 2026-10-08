@@ -6,6 +6,7 @@
 use crate::CodexThread;
 use crate::ThreadManager;
 use crate::config::Config;
+use crate::config::ThreadStoreConfig;
 use crate::context::AgentMessageBoardNotification;
 use crate::context::ContextualUserFragment;
 use crate::tools::MULTI_AGENT_V2_NAMESPACE_DESCRIPTION;
@@ -14,6 +15,7 @@ use chrono::Utc;
 use codex_agent_message_board_client::AccessToken;
 use codex_agent_message_board_client::RemoteAgentMessageBoard;
 use codex_agent_message_board_extension::AgentMessageBoard;
+use codex_agent_message_board_extension::AntflyAgentMessageBoard;
 use codex_agent_message_board_extension::InMemoryMessageBoards;
 use codex_agent_message_board_extension::LocalAgentMessageBoard;
 use codex_agent_message_board_extension::MessageBoardHost;
@@ -59,11 +61,20 @@ pub fn install_agent_message_board(
         move |input: &ThreadStartInput<'_, Config>, tree, caller| {
             let config = input.config;
             let in_memory = config.multi_agent_v2.message_board_in_memory;
+            let antfly = match &config.experimental_thread_store {
+                ThreadStoreConfig::Antfly(antfly_config) => {
+                    Some(codex_antfly::shared(antfly_config))
+                }
+                ThreadStoreConfig::Local | ThreadStoreConfig::InMemory { .. } => None,
+            };
             // MAv2 supplies tree paths; ephemeral runtimes must not open local SQLite.
+            // The Antfly thread store is itself safe for ephemeral runtimes, like
+            // the in-memory and remote boards.
             if !config.features.enabled(Feature::AgentMessageBoard)
                 || !config.features.enabled(Feature::MultiAgentV2)
                 || (config.ephemeral
                     && !in_memory
+                    && antfly.is_none()
                     && config.multi_agent_v2.message_board_remote.is_none())
             {
                 return Box::pin(async { Ok(None) });
@@ -103,6 +114,8 @@ pub fn install_agent_message_board(
                     input.thread_store.get_or_init(|| board)
                 } else if in_memory {
                     Arc::new(in_memory_boards.open(tree, host).await)
+                } else if let Some(antfly) = antfly {
+                    Arc::new(AntflyAgentMessageBoard::open(antfly, tree, host))
                 } else {
                     Arc::new(LocalAgentMessageBoard::open(&sqlite, tree, host).await?)
                 };

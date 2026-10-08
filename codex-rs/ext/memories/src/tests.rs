@@ -64,6 +64,7 @@ fn tools_are_not_contributed_when_disabled() {
         enabled: false,
         dedicated_tools: true,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
+        antfly: None,
     });
 
     assert!(
@@ -82,6 +83,7 @@ fn tools_are_not_contributed_when_dedicated_tools_disabled() {
         enabled: true,
         dedicated_tools: false,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
+        antfly: None,
     });
 
     assert!(
@@ -100,6 +102,7 @@ fn tools_are_contributed_when_enabled_with_dedicated_tools() {
         enabled: true,
         dedicated_tools: true,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
+        antfly: None,
     });
 
     let tool_names = extension
@@ -130,6 +133,7 @@ fn install_registers_dedicated_tool_contributor() {
         enabled: true,
         dedicated_tools: true,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
+        antfly: None,
     });
 
     let tool_names = registry
@@ -191,6 +195,7 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
         enabled: true,
         dedicated_tools: false,
         codex_home: tempdir.path().abs(),
+        antfly: None,
     });
 
     let fragments = extension
