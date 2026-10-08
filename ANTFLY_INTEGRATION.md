@@ -70,11 +70,13 @@ implementation differs and why.
   Fixed in Antfly `8a8f338623` (#1022): the export trie now holds exactly the
   98 public `antfly_*` functions, and `codex_antfly` no longer needs its
   `___dso_handle` alias. Build `libantfly` from that commit or later.
-- Antfly `8a8f338623` rejects the prepared Laya checkpoint with
-  `UnsupportedModernBertConfig`: #1008 requires `position_embedding_type` to
-  be absent or `"sans_pos"`, and the checkpoint's `config.json` (from
-  `prepare_laya.py`) says `"absolute"`. Laya decisions, and the approval
-  reviewer, fail until that is fixed in Antfly.
+- #1008 broke Laya decisions twice over: it rejected the checkpoint's
+  `position_embedding_type: "absolute"` with `UnsupportedModernBertConfig`,
+  and it misnamed Laya-format head weights (`MissingWeight`, which also hit
+  OpenDecider-nano). Both are fixed on Antfly main (#1024, #1030,
+  `6ade0769b4`). Against that build, Laya and OpenDecider-nano both classify
+  `git log` as `none` and `rm -rf /` as `destructive`. Build `libantfly` from
+  that commit or later.
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes
