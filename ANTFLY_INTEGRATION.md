@@ -65,13 +65,16 @@ implementation differs and why.
 
 ### Antfly findings
 
-- `libantfly.dylib` (Zig-linked) exports `___dso_handle`, compiler-rt and libc
-  symbols (`memcpy`, `strlen`, `__stack_chk_guard`, libm), Objective-C
-  classes, and `termite_metal_*`, not just `antfly_*`. Rust binaries that also
-  link aws-lc fail with `___dso_handle does not have address`. `codex_antfly`
-  works around it by defining `___dso_handle` as the executable's Mach header
-  (`global_asm!`). The real fix belongs in Antfly's build: export only the C
-  API.
+- `libantfly.dylib` used to export `___dso_handle`, libc, compiler-rt, and
+  internal symbols, which broke linking with aws-lc (antflydb/antfly#1023).
+  Fixed in Antfly `8a8f338623` (#1022): the export trie now holds exactly the
+  98 public `antfly_*` functions, and `codex_antfly` no longer needs its
+  `___dso_handle` alias. Build `libantfly` from that commit or later.
+- Antfly `8a8f338623` rejects the prepared Laya checkpoint with
+  `UnsupportedModernBertConfig`: #1008 requires `position_embedding_type` to
+  be absent or `"sans_pos"`, and the checkpoint's `config.json` (from
+  `prepare_laya.py`) says `"absolute"`. Laya decisions, and the approval
+  reviewer, fail until that is fixed in Antfly.
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes

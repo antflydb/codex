@@ -38,14 +38,3 @@ pub use runtime::Antfly;
 pub use runtime::SEARCH_TEXT_FIELD;
 pub use runtime::shared;
 pub use runtime::strip_reserved;
-
-// libantfly exports `___dso_handle` (and other runtime symbols) from its
-// Zig-linked dylib. Objects that assume a local `__dso_handle` (aws-lc's
-// static initializers) then fail to link against the dylib's copy. Define the
-// executable's own handle so those references resolve locally, as the system
-// linker would.
-#[cfg(target_os = "macos")]
-std::arch::global_asm!(
-    ".globl ___dso_handle",
-    ".set ___dso_handle, __mh_execute_header",
-);
