@@ -1756,40 +1756,136 @@ async fn prepare_fork_and_revert_thread_legacy() -> TestResult {
     ));
     store.shutdown_thread(unfinished).await?;
 
-    // Paginated threads are out of scope for this store's fork/revert support.
-    let mut paginated_params = create_params(ThreadId::new());
-    paginated_params.history_mode = ThreadHistoryMode::Paginated;
-    let paginated_id = paginated_params.thread_id;
-    store.create_thread(paginated_params).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+fn paginated_turn(thread_id: ThreadId, turn_id: &str, question: &str, at: i64) -> Vec<RolloutItem> {
+    vec![
+        turn_started(turn_id, at),
+        item_completed(
+            thread_id,
+            turn_id,
+            user_message_item(&format!("{turn_id}-user"), question),
+            at,
+            at,
+        ),
+        item_completed(
+            thread_id,
+            turn_id,
+            agent_message_item(
+                &format!("{turn_id}-agent"),
+                "done",
+                Some(MessagePhase::FinalAnswer),
+            ),
+            at + 1,
+            at + 1,
+        ),
+        turn_complete(turn_id, at, at + 1),
+    ]
+}
+
+async fn turn_ids(
+    store: &AntflyThreadStore,
+    thread_id: ThreadId,
+) -> Result<Vec<String>, ThreadStoreError> {
+    Ok(store
+        .list_turns(ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 20,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await?
+        .turns
+        .into_iter()
+        .map(|turn| turn.turn_id)
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paginated_fork_and_revert() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let source = ThreadId::new();
+    store.create_thread(paginated_params(source)).await?;
+    let mut items = paginated_turn(source, "turn-1", "first", 1_000);
+    items.extend(paginated_turn(source, "turn-2", "second", 2_000));
     store
         .append_items(AppendThreadItemsParams {
-            thread_id: paginated_id,
-            items: vec![user_message("hi")],
+            thread_id: source,
+            items,
+        })
+        .await?;
+    store.shutdown_thread(source).await?;
+
+    // Fork through turn-1: the child inherits turn-1 but not turn-2.
+    let fork = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: source,
+            boundary: ForkBoundary::ThroughTurn("turn-1".to_string()),
+        })
+        .await?;
+    let base = fork.history_base.ok_or("fork has a history base")?;
+    assert_eq!(base.thread_id, source);
+    assert!(matches!(
+        fork.model_context.first(),
+        Some(RolloutItem::SessionMeta(_))
+    ));
+    let child = ThreadId::new();
+    store
+        .create_thread(CreateThreadParams {
+            forked_from_id: Some(source),
+            history_base: Some(base),
+            ..paginated_params(child)
         })
         .await?;
     store
-        .persist_thread(paginated_id, PersistContext::Standard)
+        .append_items(AppendThreadItemsParams {
+            thread_id: child,
+            items: paginated_turn(child, "turn-3", "third", 3_000),
+        })
         .await?;
-    assert!(matches!(
-        store
-            .prepare_fork(PrepareForkParams {
-                thread_id: paginated_id,
-                boundary: ForkBoundary::Latest,
-            })
-            .await,
-        Err(ThreadStoreError::Unsupported { .. })
-    ));
-    store.shutdown_thread(paginated_id).await?;
+    store.shutdown_thread(child).await?;
+    assert_eq!(turn_ids(&store, child).await?, vec!["turn-1", "turn-3"]);
+
+    // Reverting before turn-1 would cut history the fork inherits.
     assert!(matches!(
         store
             .revert_thread(RevertThreadParams {
-                thread_id: paginated_id,
-                before_turn_id: "x".to_string(),
+                thread_id: source,
+                before_turn_id: "turn-1".to_string(),
                 multi_agent_version: None,
             })
             .await,
-        Err(ThreadStoreError::Unsupported { .. })
+        Err(ThreadStoreError::Conflict { .. })
     ));
+    // Reverting before turn-2 keeps everything the fork sees.
+    store
+        .revert_thread(RevertThreadParams {
+            thread_id: source,
+            before_turn_id: "turn-2".to_string(),
+            multi_agent_version: None,
+        })
+        .await?;
+    assert_eq!(turn_ids(&store, source).await?, vec!["turn-1"]);
+    assert_eq!(turn_ids(&store, child).await?, vec!["turn-1", "turn-3"]);
+
+    // The source cannot be deleted while the fork references it.
+    assert!(matches!(
+        store
+            .delete_thread(DeleteThreadParams { thread_id: source })
+            .await,
+        Err(ThreadStoreError::InvalidRequest { .. })
+    ));
+    store
+        .delete_thread(DeleteThreadParams { thread_id: child })
+        .await?;
+    store
+        .delete_thread(DeleteThreadParams { thread_id: source })
+        .await?;
 
     settle(store, dir).await;
     Ok(())

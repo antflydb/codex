@@ -1,36 +1,46 @@
-//! Reference-backed forks and history reverts, supported for Legacy threads.
+//! Forks and history reverts.
 //!
-//! This store does not implement Paginated history yet, so both operations
-//! here only handle `ThreadHistoryMode::Legacy` sources; a Paginated source
-//! returns `Unsupported`, leaving room for paginated support to be added
-//! separately.
+//! Legacy threads: a turn boundary is located by scanning the persisted
+//! `TurnStarted`/`TurnComplete`/`TurnAborted` events; `prepare_fork`'s model
+//! context is the full history up to the boundary and `history_base` is
+//! `None`.
 //!
-//! A turn boundary is located by scanning the thread's persisted
-//! `TurnStarted`/`TurnComplete`/`TurnAborted` events, mirroring the local
-//! store's `ThroughTurn`/`BeforeTurn` semantics. For Legacy threads,
-//! `prepare_fork`'s model context is simply the full persisted history up to
-//! the boundary (not a lineage reference), so `history_base` is always
-//! `None` and the returned `PreparedFork` holds a trivial source
-//! reservation: the model context is already a self-contained copy by the
-//! time this call returns, so nothing further is read from the source.
+//! Paginated threads: boundaries come from the projected turns, searched
+//! across the lineage like the local store (`ThroughTurn` finds the visible,
+//! newest turn; `BeforeTurn` the oldest). The fork references its source
+//! through `history_base`, so the child reads inherited history from the
+//! source thread, and the model context is the latest-compaction scan cut at
+//! that position. A revert truncates the thread at the turn's first ordinal
+//! and rebuilds its projection; it is refused while a fork still inherits
+//! history past that point.
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use codex_antfly::ScanRequest;
 use codex_antfly::Write;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::ModelContextScan;
+use codex_rollout::ModelContextScanProgress;
 use codex_rollout::RolloutItem;
 
 use super::AntflyThreadStore;
 use super::from_value;
+use super::history::Segment;
+use super::history::resolve_lineage;
 use super::internal;
 use super::keys;
+use super::projection;
+use super::projection::TurnDoc;
 use crate::ForkBoundary;
 use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::RevertThreadParams;
+use crate::StoredTurnStatus;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -111,10 +121,8 @@ pub(super) async fn prepare_fork(
             .ok_or(ThreadStoreError::ThreadNotFound {
                 thread_id: params.thread_id,
             })?;
-    if !matches!(record.history_mode(), ThreadHistoryMode::Legacy) {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "prepare_fork",
-        });
+    if record.history_mode() == ThreadHistoryMode::Paginated {
+        return prepare_paginated_fork(store, params).await;
     }
     let items = store.load_items(params.thread_id).await?;
     let end = boundary_end_index(&items, &params.boundary)?;
@@ -139,10 +147,8 @@ pub(super) async fn revert_thread(
             .ok_or(ThreadStoreError::ThreadNotFound {
                 thread_id: params.thread_id,
             })?;
-    if !matches!(previous.history_mode(), ThreadHistoryMode::Legacy) {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "revert_thread",
-        });
+    if previous.history_mode() == ThreadHistoryMode::Paginated {
+        return revert_paginated(store, previous, params).await;
     }
 
     let documents = store
@@ -186,4 +192,252 @@ pub(super) async fn revert_thread(
         .collect();
     writes.extend(AntflyThreadStore::record_writes(Some(&previous), &record)?);
     store.antfly().write(writes).await.map_err(internal)
+}
+
+async fn turn_doc(
+    store: &AntflyThreadStore,
+    thread_id: ThreadId,
+    turn_id: &str,
+) -> ThreadStoreResult<Option<TurnDoc>> {
+    store
+        .antfly()
+        .get_as::<TurnDoc>(keys::turn_id_key(thread_id, turn_id))
+        .await
+        .map_err(internal)
+}
+
+/// The segment holding `turn_id` and its projected turn, searching newest
+/// first (the visible turn) or oldest first (the source turn).
+async fn find_turn(
+    store: &AntflyThreadStore,
+    segments: &[Segment],
+    turn_id: &str,
+    newest_first: bool,
+) -> ThreadStoreResult<(usize, TurnDoc)> {
+    let order: Vec<usize> = if newest_first {
+        (0..segments.len()).rev().collect()
+    } else {
+        (0..segments.len()).collect()
+    };
+    for index in order {
+        let segment = segments[index];
+        if let Some(turn) = turn_doc(store, segment.thread_id, turn_id).await?
+            && turn.rollout_ordinal >= segment.start_ordinal
+            && segment
+                .end_ordinal
+                .is_none_or(|end| turn.rollout_ordinal < end)
+        {
+            return Ok((index, turn));
+        }
+    }
+    Err(ThreadStoreError::InvalidRequest {
+        message: format!("turn not found: {turn_id}"),
+    })
+}
+
+/// `history_base` for a fork of the lineage at `boundary`.
+async fn history_base_at_boundary(
+    store: &AntflyThreadStore,
+    segments: &[Segment],
+    next_ordinal: u64,
+    boundary: &ForkBoundary,
+) -> ThreadStoreResult<HistoryPosition> {
+    let (segment_index, end) = match boundary {
+        ForkBoundary::Latest => (segments.len() - 1, next_ordinal),
+        ForkBoundary::ThroughTurn(turn_id) => {
+            let (index, turn) = find_turn(store, segments, turn_id, true).await?;
+            if turn.status == StoredTurnStatus::InProgress {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!("lastTurnId '{turn_id}' identifies an in-progress turn"),
+                });
+            }
+            let end = turn
+                .rollout_end_ordinal
+                .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                    message: format!("turn {turn_id} does not have persisted rollout positions"),
+                })?;
+            (index, end + 1)
+        }
+        ForkBoundary::BeforeTurn(turn_id) => {
+            let (index, turn) = find_turn(store, segments, turn_id, false).await?;
+            if turn.rollout_end_ordinal == Some(turn.rollout_ordinal) {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!("turn {turn_id} does not have a persisted start boundary"),
+                });
+            }
+            (index, turn.rollout_ordinal)
+        }
+    };
+    let segment = segments[segment_index];
+    if segment.end_ordinal.is_some_and(|limit| end > limit) {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "fork boundary exceeds inherited source history".to_owned(),
+        });
+    }
+    // A cut at the very start of a segment would reference an empty segment;
+    // collapse it to the previous segment's end instead.
+    if end <= segment.start_ordinal && segment_index > 0 {
+        let previous = segments[segment_index - 1];
+        return Ok(HistoryPosition {
+            thread_id: previous.thread_id,
+            end_ordinal_exclusive: segment.start_ordinal.saturating_sub(1),
+            end_byte_offset: 0,
+        });
+    }
+    Ok(HistoryPosition {
+        thread_id: segment.thread_id,
+        end_ordinal_exclusive: end,
+        end_byte_offset: 0,
+    })
+}
+
+/// The model context visible at `base`: the newest compaction at or before
+/// the cut plus everything after it, led by the source's `SessionMeta`.
+async fn model_context_at(
+    store: &AntflyThreadStore,
+    source: ThreadId,
+    segments: &[Segment],
+    base: &HistoryPosition,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let cut = segments
+        .iter()
+        .position(|segment| segment.thread_id == base.thread_id)
+        .unwrap_or(segments.len() - 1);
+    let mut scan = ModelContextScan::default();
+    let mut session_meta = None;
+    'segments: for (index, segment) in segments[..=cut].iter().enumerate().rev() {
+        let end = if index == cut {
+            Some(base.end_ordinal_exclusive)
+        } else {
+            segment.end_ordinal
+        };
+        let items = store.load_items_before(segment.thread_id, end).await?;
+        for item in items.into_iter().rev() {
+            if let RolloutItem::SessionMeta(_) = &item {
+                if session_meta.is_none() {
+                    session_meta = Some(item);
+                }
+                continue 'segments;
+            }
+            match scan.push(item) {
+                ModelContextScanProgress::Continue => {}
+                ModelContextScanProgress::Complete => break 'segments,
+            }
+        }
+    }
+    let mut items = scan.finish();
+    let session_meta = match session_meta {
+        Some(meta) => meta,
+        // The scan stopped before reaching a SessionMeta; use the source's.
+        None => store
+            .load_items_before(source, Some(1))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id: source })?,
+    };
+    items.insert(0, session_meta);
+    Ok(items)
+}
+
+async fn prepare_paginated_fork(
+    store: &AntflyThreadStore,
+    params: PrepareForkParams,
+) -> ThreadStoreResult<PreparedFork> {
+    let record =
+        store
+            .load_record(params.thread_id)
+            .await?
+            .ok_or(ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            })?;
+    let segments = resolve_lineage(store, params.thread_id).await?;
+    let base =
+        history_base_at_boundary(store, &segments, record.next_ordinal, &params.boundary).await?;
+    let model_context = model_context_at(store, params.thread_id, &segments, &base).await?;
+    // Deleting a thread a fork references is refused, so no reservation is
+    // needed to keep the base alive.
+    Ok(PreparedFork::new(
+        params.thread_id,
+        Some(base),
+        Arc::new(model_context),
+        (),
+    ))
+}
+
+async fn revert_paginated(
+    store: &AntflyThreadStore,
+    previous: super::record::ThreadRecord,
+    params: RevertThreadParams,
+) -> ThreadStoreResult<()> {
+    let thread_id = params.thread_id;
+    let segments = resolve_lineage(store, thread_id).await?;
+    let (index, turn) = find_turn(store, &segments, &params.before_turn_id, false).await?;
+    if segments[index].thread_id != thread_id {
+        // The turn lives in an inherited segment; truncating the source would
+        // change other threads' history.
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "turn {} is inherited from another thread and cannot be reverted here",
+                params.before_turn_id
+            ),
+        });
+    }
+    let cut = turn.rollout_ordinal;
+    if let Some((child, _)) = store
+        .fork_children(thread_id)
+        .await?
+        .into_iter()
+        .find(|(_, end)| *end > cut)
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: format!(
+                "thread {thread_id} cannot be reverted: fork {child} inherits history past turn {}",
+                params.before_turn_id
+            ),
+        });
+    }
+
+    let documents = store
+        .antfly()
+        .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
+        .await
+        .map_err(internal)?;
+    let mut kept = Vec::new();
+    let mut writes = store.projection_delete_writes(thread_id).await?;
+    for document in documents {
+        let Some((_, ordinal)) = keys::parse_item(&document.key) else {
+            continue;
+        };
+        if ordinal >= cut {
+            writes.push(Write::delete(document.key));
+        } else if let Some(item) = document.doc.get("item").cloned() {
+            kept.push((ordinal, from_value::<RolloutItem>(item)?));
+        }
+    }
+    let mut record = previous.clone();
+    record.next_ordinal = cut;
+    if params.multi_agent_version.is_some() {
+        record.created.multi_agent_version = params.multi_agent_version;
+    }
+    writes.extend(AntflyThreadStore::record_writes(Some(&previous), &record)?);
+    store.antfly().write(writes).await.map_err(internal)?;
+
+    // Rebuild the projection from the surviving items. Ordinals are
+    // contiguous from the first kept record.
+    if let Some((first, _)) = kept.first() {
+        let first = *first;
+        let items: Vec<RolloutItem> = kept.into_iter().map(|(_, item)| item).collect();
+        let rebuild = projection::build_writes(
+            store,
+            thread_id,
+            record.created.subagent_history_start_ordinal,
+            first,
+            &items,
+            Utc::now(),
+        )
+        .await?;
+        store.antfly().write(rebuild).await.map_err(internal)?;
+    }
+    Ok(())
 }

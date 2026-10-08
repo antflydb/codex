@@ -758,30 +758,13 @@ impl AntflyThreadStore {
         Ok(record)
     }
 
-    async fn delete_thread_impl(&self, params: DeleteThreadParams) -> ThreadStoreResult<()> {
-        let thread_id = params.thread_id;
-        if let Some(cleanup) = &self.cleanup {
-            cleanup(vec![thread_id]).await?;
-        }
-        let mut state = Arc::clone(&self.state).lock_owned().await;
-        let _guard = self.antfly.lock().await;
-        let record = self.load_record(thread_id).await?;
-        let items = self
-            .antfly
-            .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
-            .await
-            .map_err(internal)?;
-        if record.is_none() && items.is_empty() {
-            state.live.remove(&thread_id);
-            return Err(ThreadStoreError::ThreadNotFound { thread_id });
-        }
-        let mut writes: Vec<Write> = items
-            .into_iter()
-            .map(|document| Write::delete(document.key))
-            .collect();
-        writes.push(Write::delete(keys::thread(thread_id)));
-        // Clean up every paginated-history projection row for this thread
-        // (spec §2.25). Harmless no-op scans for Legacy threads.
+    /// Deletes for every paginated-history projection row of `thread_id`
+    /// (spec §2.25). Harmless no-op scans for Legacy threads.
+    pub(crate) async fn projection_delete_writes(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Vec<Write>> {
+        let mut writes = Vec::new();
         for prefix in [
             keys::turn_id_prefix(thread_id),
             keys::turn_start_prefix(thread_id),
@@ -802,6 +785,60 @@ impl AntflyThreadStore {
                     .map(|document| Write::delete(document.key)),
             );
         }
+        Ok(writes)
+    }
+
+    /// Threads whose history starts inside `thread_id`'s, with the exclusive
+    /// end ordinal they inherit.
+    pub(crate) async fn fork_children(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Vec<(ThreadId, u64)>> {
+        let records = self
+            .antfly
+            .scan_as::<ThreadRecord>(ScanRequest::prefix(keys::THREAD_PREFIX))
+            .await
+            .map_err(internal)?;
+        Ok(records
+            .into_iter()
+            .filter_map(|(_, record)| {
+                let base = record.created.history_base?;
+                (base.thread_id == thread_id && record.thread_id() != thread_id)
+                    .then_some((record.thread_id(), base.end_ordinal_exclusive))
+            })
+            .collect())
+    }
+
+    async fn delete_thread_impl(&self, params: DeleteThreadParams) -> ThreadStoreResult<()> {
+        let thread_id = params.thread_id;
+        if let Some(cleanup) = &self.cleanup {
+            cleanup(vec![thread_id]).await?;
+        }
+        let mut state = Arc::clone(&self.state).lock_owned().await;
+        let _guard = self.antfly.lock().await;
+        let record = self.load_record(thread_id).await?;
+        let items = self
+            .antfly
+            .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
+            .await
+            .map_err(internal)?;
+        if record.is_none() && items.is_empty() {
+            state.live.remove(&thread_id);
+            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        }
+        if !self.fork_children(thread_id).await?.is_empty() {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "cannot delete thread {thread_id}: forked history still references it"
+                ),
+            });
+        }
+        let mut writes: Vec<Write> = items
+            .into_iter()
+            .map(|document| Write::delete(document.key))
+            .collect();
+        writes.push(Write::delete(keys::thread(thread_id)));
+        writes.extend(self.projection_delete_writes(thread_id).await?);
         if let Some(record) = &record {
             for sort_key in SORT_KEYS {
                 writes.push(Write::delete(keys::index_entry(
