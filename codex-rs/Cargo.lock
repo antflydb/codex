@@ -2075,6 +2075,7 @@ dependencies = [
  "codex-thread-store",
  "codex-utils-absolute-path",
  "pretty_assertions",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
