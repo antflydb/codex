@@ -123,6 +123,27 @@
       },
       "type": "object"
     },
+    "AntflyApprovalsToml": {
+      "additionalProperties": false,
+      "description": "Local typed-decision review of approval requests.",
+      "properties": {
+        "allow_threshold": {
+          "description": "Minimum probability that an action is safe before it is allowed.",
+          "format": "double",
+          "type": "number"
+        },
+        "deny_threshold": {
+          "description": "Minimum probability that an action is destructive before it is denied.",
+          "format": "double",
+          "type": "number"
+        },
+        "mode": {
+          "description": "`off`, `shadow` (log decisions only), or `enforce`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "AppConfig": {
       "additionalProperties": false,
       "description": "Config values for a single app/connector.",
@@ -4324,6 +4345,60 @@
               "enum": [
                 "local"
               ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Persist all Codex state in Antfly instead of SQLite and rollout files.",
+          "properties": {
+            "api_key_env": {
+              "description": "Environment variable holding the remote bearer token.",
+              "type": "string"
+            },
+            "approvals": {
+              "$ref": "#/definitions/AntflyApprovalsToml"
+            },
+            "decide_model": {
+              "description": "Typed-decision model used to review approvals (default `laya`).",
+              "type": "string"
+            },
+            "embedder_dims": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "embedder_model": {
+              "description": "Embedding model for semantic search; `false` in `semantic_search` disables dense indexing.",
+              "type": "string"
+            },
+            "models_dir": {
+              "description": "Antfly inference models directory.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Embedded database file.",
+              "type": "string"
+            },
+            "semantic_search": {
+              "type": "boolean"
+            },
+            "table": {
+              "description": "Remote table holding Codex state (default `codex`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "antfly"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "description": "Remote Antfly or Antfly Cloud base URL; selects the remote backend.",
               "type": "string"
             }
           },
