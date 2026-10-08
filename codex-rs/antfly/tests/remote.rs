@@ -127,8 +127,6 @@ async fn replicated_writes_reach_remote() -> Result<(), Box<dyn std::error::Erro
         local.scan(ScanRequest::prefix("ob:")).await?.is_empty(),
         "outbox drained"
     );
-    drop(replicated);
-    drop(local);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    replicated.close().await?;
     Ok(())
 }

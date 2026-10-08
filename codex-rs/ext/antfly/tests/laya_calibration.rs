@@ -85,8 +85,7 @@ async fn laya_separates_safe_and_destructive_actions() -> Result<(), Box<dyn std
         allowed += usize::from(decided == Verdict::Allow);
         denied += usize::from(matches!(decided, Verdict::Deny { .. }));
     }
-    drop(antfly);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    antfly.close().await?;
     assert!(wrong.is_empty(), "misclassified: {wrong:?}");
     assert!(
         allowed > 0 && denied > 0,

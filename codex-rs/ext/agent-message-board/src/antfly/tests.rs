@@ -129,11 +129,13 @@ fn page(limit: u32) -> PageRequest {
     }
 }
 
+/// Closes the database (waiting for background work) before its directory
+/// is removed.
 async fn settle(antfly: Arc<Antfly>, dir: tempfile::TempDir) {
+    if let Err(err) = antfly.close().await {
+        panic!("close antfly: {err}");
+    }
     drop(antfly);
-    // The embedded backend closes on its own executor; let it finish before
-    // the directory it owns goes away.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     drop(dir);
 }
 

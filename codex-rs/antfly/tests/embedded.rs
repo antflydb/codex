@@ -8,11 +8,6 @@ use codex_antfly::keys;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-/// Lets the backend's background close finish before the temp dir goes.
-fn settle() {
-    std::thread::sleep(std::time::Duration::from_millis(300));
-}
-
 fn runtime() -> tokio::runtime::Runtime {
     match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -75,9 +70,9 @@ fn write_get_scan_delete() -> Result<(), Box<dyn std::error::Error>> {
         let docs = antfly.scan(ScanRequest::prefix("item:t1:")).await?;
         let ns: Vec<i64> = docs.iter().filter_map(|d| d.doc["n"].as_i64()).collect();
         assert_eq!(ns, vec![10, 2, 3, 4]);
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
-    settle();
     Ok(())
 }
 
@@ -99,9 +94,9 @@ fn descending_keys_list_newest_first() -> Result<(), Box<dyn std::error::Error>>
         let docs = antfly.scan(ScanRequest::prefix("recency:")).await?;
         let ts: Vec<i64> = docs.iter().filter_map(|d| d.doc["ts"].as_i64()).collect();
         assert_eq!(ts, vec![300, 200, 100]);
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
-    settle();
     Ok(())
 }
 
@@ -139,9 +134,9 @@ fn full_text_search_scoped_by_prefix() -> Result<(), Box<dyn std::error::Error>>
         }
         let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
         assert_eq!(keys, vec!["turn:a"]);
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
-    settle();
     Ok(())
 }
 
@@ -174,9 +169,9 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
             .as_f64()
             .unwrap_or(-1.0);
         assert!((0.0..=1.0).contains(&probability), "answer: {answer}");
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
-    settle();
     Ok(())
 }
 
@@ -217,8 +212,8 @@ fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error
         }
         let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
         assert_eq!(keys, vec!["turn:a"]);
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
-    settle();
     Ok(())
 }

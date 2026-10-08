@@ -150,10 +150,6 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    fn settle() {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-
     async fn test_antfly() -> (Arc<Antfly>, std::path::PathBuf) {
         let dir = crate::runtime::test_support::unique_temp_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -162,8 +158,10 @@ mod tests {
         (Arc::new(Antfly::new(config)), dir)
     }
 
-    async fn cleanup(dir: std::path::PathBuf) {
-        settle();
+    /// Closes the database (waiting for background work) before removing
+    /// its directory.
+    async fn cleanup(antfly: &Antfly, dir: std::path::PathBuf) {
+        antfly.close().await.expect("close antfly");
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -179,7 +177,7 @@ mod tests {
             .await
             .expect_err("oversized record should be rejected");
         assert!(err.to_string().contains("size limit"));
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -196,7 +194,7 @@ mod tests {
         assert_eq!(records[0].id, a.id);
         assert_eq!(records[1].id, b.id);
         assert_eq!(records[0].record, b"a".to_vec());
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -239,7 +237,7 @@ mod tests {
             .collect();
         assert!(newest_kept.contains(&"record-5".to_string()));
         assert!(!newest_kept.contains(&"record-0".to_string()));
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -267,6 +265,6 @@ mod tests {
             .collect();
         assert!(!bodies.contains(&"r0".to_string()));
         assert!(bodies.contains(&format!("r{}", MAX_GUARDIAN_REVIEW_RECORDS + 4)));
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 }

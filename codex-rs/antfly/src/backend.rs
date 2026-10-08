@@ -79,6 +79,12 @@ pub trait Backend: Send + Sync {
 
     /// Creates the table, indexes, and enrichments in `schema` when missing.
     fn ensure_schema(&self, schema: SchemaSpec) -> BackendFuture<'_, ()>;
+
+    /// Releases the backend's resources and resolves once they are released,
+    /// including background work. Later calls fail.
+    fn close(&self) -> BackendFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Dense semantic index over one text field, embedded by Antfly inference.

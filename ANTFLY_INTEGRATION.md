@@ -104,9 +104,13 @@ Known limitations:
   against a migrated in-memory SQLite pool (`sqlite::memory:`) on the Antfly
   backend instead of being individually reimplemented. No SQLite files are
   created, but the engine is still linked and initialized.
-- Tests that open many embedded databases in one process occasionally hit
-  transient `ANTFLY_INTERNAL`/`WouldBlock` errors in Antfly's background
-  indexer; run `codex-state` and the Antfly suites with `--test-threads=1`.
+- Many embedded databases open concurrently in one process can hit
+  antflydb/antfly#1015: a transient `WouldBlock` in full-text catch-up kills
+  the derived worker and every later write to that database fails with
+  `ANTFLY_INTERNAL` (`AsyncWorkerFailed`). Until it is fixed, run
+  `codex-state`, `codex-thread-store`, and the Antfly suites with
+  `--test-threads=1`. Tests close databases with `Antfly::close()` before
+  removing their directories, so teardown no longer races background work.
 - Approval review defaults to `off`. Laya's zero-shot probabilities are only
   moderately separated; collect shadow-mode decisions and outcomes (stored
   under `approval:`) before enforcing, and consider fine-tuning on them.

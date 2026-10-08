@@ -246,10 +246,13 @@ fn list_params() -> ListThreadsParams {
     }
 }
 
+/// Closes the database (waiting for background work) before its directory
+/// is removed.
 async fn settle(store: AntflyThreadStore, dir: tempfile::TempDir) {
+    if let Err(err) = store.antfly().close().await {
+        panic!("close antfly: {err}");
+    }
     drop(store);
-    // The backend closes on its executor; let it finish before the dir goes.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     drop(dir);
 }
 

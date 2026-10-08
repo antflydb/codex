@@ -292,6 +292,20 @@ impl Antfly {
         Ok(self.decider.get().map(Arc::clone).unwrap_or(decider))
     }
 
+    /// Closes the backend and the decision runtime, resolving once both have
+    /// released their resources (including background indexing), so their
+    /// files can be removed. Later calls fail.
+    pub async fn close(&self) -> AntflyResult<()> {
+        let decider = match self.decider.get() {
+            Some(decider) => decider.close().await,
+            None => Ok(()),
+        };
+        if let Some(backend) = self.backend.get() {
+            backend.close().await?;
+        }
+        decider
+    }
+
     /// Loads the decision model so the first approval is not slow.
     pub async fn warm_decider(&self) -> AntflyResult<()> {
         self.decider()?.warm().await

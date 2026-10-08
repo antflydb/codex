@@ -359,29 +359,25 @@ mod tests {
         ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id")
     }
 
-    /// Lets the embedded backend's background close finish before the
-    /// tempdir drops.
-    fn settle() {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-
-    async fn test_store() -> (GoalStore, std::path::PathBuf) {
+    async fn test_store() -> (GoalStore, Arc<Antfly>, std::path::PathBuf) {
         let dir = crate::runtime::test_support::unique_temp_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let mut config = codex_antfly::AntflyConfig::embedded(dir.join("codex.aflite"));
         config.embedder = None;
         let antfly = Arc::new(codex_antfly::Antfly::new(config));
-        (GoalStore::new_antfly(antfly), dir)
+        (GoalStore::new_antfly(Arc::clone(&antfly)), antfly, dir)
     }
 
-    async fn cleanup(dir: std::path::PathBuf) {
-        settle();
+    /// Closes the database (waiting for background work) before removing
+    /// its directory.
+    async fn cleanup(antfly: &Antfly, dir: std::path::PathBuf) {
+        antfly.close().await.expect("close antfly");
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replace_update_and_get_thread_goal() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         let goal = store
@@ -441,12 +437,12 @@ mod tests {
         assert_eq!(None, store.get_thread_goal(thread_id).await.unwrap());
         assert_eq!(None, store.delete_thread_goal(thread_id).await.unwrap());
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replace_thread_goal_applies_budget_limit_immediately() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         let replaced = store
@@ -462,12 +458,12 @@ mod tests {
         assert_eq!(ThreadGoalStatus::BudgetLimited, replaced.status);
         assert_eq!(Some(0), replaced.token_budget);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn insert_thread_goal_does_not_replace_existing_goal() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         let inserted = store
@@ -497,12 +493,12 @@ mod tests {
             store.get_thread_goal(thread_id).await.unwrap()
         );
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn insert_thread_goal_replaces_a_complete_goal() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         store
@@ -518,12 +514,12 @@ mod tests {
         assert_eq!("second", inserted.objective);
         assert_eq!(ThreadGoalStatus::Active, inserted.status);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn update_thread_goal_ignores_replaced_goal_version() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         let original = store
@@ -581,12 +577,12 @@ mod tests {
             .expect("fresh update should match the replacement goal");
         assert_eq!(ThreadGoalStatus::Complete, fresh_update.status);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pause_active_thread_goal_does_not_clobber_terminal_status() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         let goal = store
             .replace_thread_goal(
@@ -636,12 +632,12 @@ mod tests {
                 .expect("goal read should succeed")
         );
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn usage_limit_active_thread_goal_updates_active_or_budget_limited_goals() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         let goal = store
             .replace_thread_goal(
@@ -692,12 +688,12 @@ mod tests {
         };
         assert_eq!(expected, usage_limited);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn usage_accounting_updates_active_goals_and_accounts_budget_limited_in_flight_usage() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -742,12 +738,12 @@ mod tests {
         assert_eq!(25, goal.tokens_used);
         assert_eq!(15, goal.time_used_seconds);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn active_status_only_usage_accounting_does_not_update_budget_limited_goals() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -769,12 +765,12 @@ mod tests {
         assert_eq!(ThreadGoalStatus::BudgetLimited, goal.status);
         assert_eq!(0, goal.tokens_used);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn stopped_usage_accounting_promotes_paused_goal_over_budget() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -809,12 +805,12 @@ mod tests {
         assert_eq!(25, goal.tokens_used);
         assert_eq!(3, goal.time_used_seconds);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn usage_accounting_can_finalize_completed_goal_for_completing_turn() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -853,12 +849,12 @@ mod tests {
         assert_eq!(200, goal.tokens_used);
         assert_eq!(30, goal.time_used_seconds);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn budget_updates_immediately_stop_active_goals_already_over_budget() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -892,12 +888,12 @@ mod tests {
         assert_eq!(Some(40), lowered.token_budget);
         assert_eq!(50, lowered.tokens_used);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn activating_goal_already_over_budget_keeps_it_budget_limited() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -931,12 +927,12 @@ mod tests {
         assert_eq!(Some(40), reactivated.token_budget);
         assert_eq!(50, reactivated.tokens_used);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pausing_and_blocking_budget_limited_goal_preserves_terminal_status() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -990,12 +986,12 @@ mod tests {
         };
         assert_eq!(expected, blocked);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn continuation_deferral_roundtrips() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
 
         assert!(
@@ -1031,12 +1027,12 @@ mod tests {
                 .unwrap()
         );
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn usage_accounting_adds_concurrent_token_deltas() {
-        let (store, dir) = test_store().await;
+        let (store, antfly, dir) = test_store().await;
         let thread_id = thread_id();
         store
             .replace_thread_goal(
@@ -1064,6 +1060,6 @@ mod tests {
         assert_eq!(100, goal.tokens_used);
         assert_eq!(10, goal.time_used_seconds);
 
-        cleanup(dir).await;
+        cleanup(&antfly, dir).await;
     }
 }

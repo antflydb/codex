@@ -241,6 +241,20 @@ impl Backend for ReplicatedBackend {
             Ok(())
         })
     }
+
+    fn close(&self) -> BackendFuture<'_, ()> {
+        Box::pin(self.close_backends())
+    }
+}
+
+impl ReplicatedBackend {
+    /// Queued writes stay in the local outbox and ship after the next open.
+    async fn close_backends(&self) -> AntflyResult<()> {
+        self.notify.notify_one();
+        let local = self.shared.local.close().await;
+        self.shared.remote.close().await?;
+        local
+    }
 }
 
 impl Drop for ReplicatedBackend {

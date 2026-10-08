@@ -363,6 +363,19 @@ impl Backend for EmbeddedBackend {
             Ok(())
         })
     }
+
+    fn close(&self) -> BackendFuture<'_, ()> {
+        Box::pin(async move {
+            let Some(db) = self.db.as_ref().map(Arc::clone) else {
+                return Ok(());
+            };
+            // Waits for in-flight calls and background work, on a thread
+            // with libantfly's required stack.
+            self.executor
+                .run(move || db.close().map_err(embedded("close")))
+                .await
+        })
+    }
 }
 
 /// Typed decisions answered by the embedded inference runtime in this
@@ -390,6 +403,21 @@ impl LocalDecider {
         let models_dir = self.models_dir.clone();
         self.executor
             .run(move || inference_handle(&slot, models_dir.as_deref()).map(|_| ()))
+            .await
+    }
+
+    /// Closes the inference runtime if it was loaded.
+    pub async fn close(&self) -> AntflyResult<()> {
+        let inference = self.slot.lock().ok().and_then(|slot| slot.clone());
+        let Some(inference) = inference else {
+            return Ok(());
+        };
+        self.executor
+            .run(move || {
+                inference
+                    .close()
+                    .map_err(|err| AntflyError::Embedded(format!("close inference: {err}")))
+            })
             .await
     }
 
