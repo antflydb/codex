@@ -18,6 +18,9 @@ mod thread_sections;
 mod types;
 
 pub use antfly::AntflyThreadStore;
+pub use antfly::ImportOutcome;
+pub use antfly::ImportSection;
+pub use antfly::ImportThreadParams;
 pub use antfly::ThreadDataCleanup;
 pub use codex_state::AddThreadAttachmentOutcome;
 pub use codex_state::MAX_QUEUE_ITEMS;

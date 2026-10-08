@@ -21,6 +21,27 @@ struct Args {
     /// Report what would be imported without writing anything.
     #[arg(long)]
     dry_run: bool,
+    /// Destination database (default: <codex-home>/antfly.aflite).
+    #[arg(long)]
+    to: Option<PathBuf>,
+    /// Import into a remote Antfly instance instead (base URL).
+    #[arg(long)]
+    url: Option<String>,
+    /// Remote table (default: codex).
+    #[arg(long)]
+    table: Option<String>,
+    /// Environment variable holding the remote bearer token.
+    #[arg(long)]
+    api_key_env: Option<String>,
+    /// Skip dense indexing; full-text search still works.
+    #[arg(long)]
+    no_semantic: bool,
+    /// Overwrite threads that were already imported.
+    #[arg(long)]
+    replace: bool,
+    /// After importing, search the destination and print matching threads.
+    #[arg(long)]
+    search: Option<String>,
 }
 
 #[tokio::main]
@@ -80,5 +101,86 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    anyhow::bail!("writing to Antfly is not wired up yet; use --dry-run")
+    let config = codex_antfly::AntflyConfig::from_toml(codex_antfly::AntflyTomlSettings {
+        codex_home: codex_home.clone(),
+        path: if args.url.is_some() {
+            None
+        } else {
+            args.to.clone()
+        },
+        url: args.url.clone(),
+        table: args.table.clone(),
+        api_key_env: args.api_key_env.clone(),
+        semantic_search: args.no_semantic.then_some(false),
+        ..Default::default()
+    })?;
+    let store = codex_thread_store::AntflyThreadStore::new(codex_antfly::shared(&config));
+    let total = threads.len();
+    let (mut imported, mut present, mut failed) = (0usize, 0usize, 0usize);
+    for (index, thread) in threads.iter().enumerate() {
+        let result = async {
+            let thread = thread.materialize().await?;
+            let outcome = store
+                .import_thread(codex_thread_store::ImportThreadParams {
+                    created: thread.created,
+                    items: thread.items,
+                    patch: thread.patch,
+                    archived_at: thread.archived_at,
+                    section: thread
+                        .section
+                        .map(|section| codex_thread_store::ImportSection {
+                            id: section.id,
+                            name: section.name,
+                            position: section.position,
+                        }),
+                    legacy_rollout_path: Some(thread.legacy_rollout_path),
+                    replace: args.replace,
+                })
+                .await?;
+            anyhow::Ok(outcome)
+        }
+        .await;
+        match result {
+            Ok(codex_thread_store::ImportOutcome::Imported) => imported += 1,
+            Ok(codex_thread_store::ImportOutcome::AlreadyPresent) => present += 1,
+            Err(err) => {
+                failed += 1;
+                eprintln!("  failed {}: {err}", thread.thread_id());
+            }
+        }
+        if (index + 1) % 25 == 0 || index + 1 == total {
+            println!(
+                "  {}/{total} (imported {imported}, already present {present}, failed {failed})",
+                index + 1
+            );
+        }
+    }
+    println!("done: imported {imported}, already present {present}, failed {failed}");
+    if let Some(term) = &args.search {
+        use codex_thread_store::ThreadStore;
+        let page = store
+            .search_threads(codex_thread_store::SearchThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: codex_thread_store::ThreadSortKey::UpdatedAt,
+                sort_direction: codex_thread_store::SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                archived: false,
+                search_term: term.clone(),
+            })
+            .await?;
+        println!("search {term:?}: {} threads", page.items.len());
+        for result in page.items {
+            println!(
+                "  {} {}\n      {}",
+                result.thread.thread_id,
+                result.thread.preview.chars().take(70).collect::<String>(),
+                result.snippet
+            );
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} threads failed to import");
+    }
+    Ok(())
 }

@@ -12,6 +12,7 @@
 mod attachments;
 mod fork;
 mod history;
+mod import;
 mod keys;
 mod listing;
 mod occurrences;
@@ -104,6 +105,10 @@ use crate::UpdateThreadMetadataParams;
 use crate::UpdatedProject;
 use record::ThreadRecord;
 use record::visible_text;
+
+pub use import::ImportOutcome;
+pub use import::ImportSection;
+pub use import::ImportThreadParams;
 
 /// Host cleanup run before a thread's data is deleted (for example agent
 /// message boards). Failures abort the delete so it can be retried.
