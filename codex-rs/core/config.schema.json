@@ -4364,7 +4364,7 @@
               "$ref": "#/definitions/AntflyApprovalsToml"
             },
             "decide_model": {
-              "description": "Typed-decision model used to review approvals (default `laya`).",
+              "description": "Typed-decision model used to review approvals (default `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).",
               "type": "string"
             },
             "embedder_dims": {

@@ -52,6 +52,10 @@ impl Default for EmbedderConfig {
     }
 }
 
+/// Default typed-decision model for approval review: a prepared Laya
+/// checkpoint under `<models dir>/convaiinnovations/laya`.
+pub const DEFAULT_DECIDE_MODEL: &str = "convaiinnovations/laya";
+
 /// Complete Antfly configuration for one Codex process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntflyConfig {
@@ -148,7 +152,7 @@ impl AntflyConfig {
             backend: BackendConfig::Embedded { path: path.into() },
             models_dir: None,
             embedder: Some(EmbedderConfig::default()),
-            decide_model: "laya".to_string(),
+            decide_model: DEFAULT_DECIDE_MODEL.to_string(),
             approvals: ApprovalSettings::default(),
         }
     }
@@ -198,7 +202,7 @@ impl AntflyConfig {
             backend,
             models_dir: settings.models_dir.map(expand_home),
             embedder,
-            decide_model: settings.decide_model.unwrap_or_else(|| "laya".to_string()),
+            decide_model: settings.decide_model.unwrap_or_else(|| DEFAULT_DECIDE_MODEL.to_string()),
             approvals: ApprovalSettings {
                 mode,
                 allow_threshold_bp: basis_points(

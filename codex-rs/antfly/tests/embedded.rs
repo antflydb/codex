@@ -146,7 +146,7 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let models = std::path::Path::new(&home).join(".antfly/inference/models");
-    if !models.join("extractors/laya").exists() {
+    if !models.join("convaiinnovations/laya").exists() {
         eprintln!("skipping: no laya checkpoint under {models:?}");
         return Ok(());
     }
@@ -155,7 +155,7 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
         let antfly = open(&dir, false);
         let answer = antfly
             .decide(&json!({
-                "model": "laya",
+                "model": "convaiinnovations/laya",
                 "input": "command: rm -rf /",
                 "questions": [{
                     "name": "destructive",

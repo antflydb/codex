@@ -27,6 +27,7 @@ pub use config::AntflyTomlSettings;
 pub use config::ApprovalMode;
 pub use config::ApprovalSettings;
 pub use config::BackendConfig;
+pub use config::DEFAULT_DECIDE_MODEL;
 pub use config::EmbedderConfig;
 pub use embedded::EmbeddedBackend;
 pub use embedded::LocalDecider;

@@ -290,7 +290,7 @@ is registered before `codex_guardian_v2::install`
 
   ```json
   {
-    "model": "laya",
+    "model": "convaiinnovations/laya",
     "input": "…",
     "questions": [
       {"name": "effect", "type": "choice", "instructions": "What is the worst effect of running this action?",
@@ -325,7 +325,7 @@ path = "~/.codex/antfly.aflite"      # embedded
 # url = "https://<host>/cloud/v1/<instance_id>"   # remote
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
-decide_model = "laya"
+decide_model = "convaiinnovations/laya"
 
 [antfly.approvals]
 mode = "shadow"                      # shadow | enforce | off

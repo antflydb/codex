@@ -21,7 +21,7 @@ fn remote() -> Option<Antfly> {
         },
         models_dir: None,
         embedder: Some(EmbedderConfig::default()),
-        decide_model: "laya".to_string(),
+        decide_model: codex_antfly::DEFAULT_DECIDE_MODEL.to_string(),
         approvals: Default::default(),
     }))
 }

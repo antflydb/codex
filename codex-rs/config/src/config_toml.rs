@@ -597,7 +597,8 @@ pub struct AntflyStoreToml {
     /// With both `path` and `url`, search the remote replica instead of the
     /// local copy.
     pub search_remote: Option<bool>,
-    /// Typed-decision model used to review approvals (default `laya`).
+    /// Typed-decision model used to review approvals (default
+    /// `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).
     pub decide_model: Option<String>,
     pub approvals: Option<AntflyApprovalsToml>,
 }
