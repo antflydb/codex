@@ -124,7 +124,7 @@ Known limitations:
 - The remote backend was tested against a local `antfly standalone`, not
   Antfly Cloud's proxy.
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at or after `6ade0769b4` (`zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `ea4b19cb3d` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -132,7 +132,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `6ade0769b4`; bump `rev` together
+  `github.com/antflydb/antfly` pinned to `ea4b19cb3d`; bump `rev` together
   with the `libantfly` build.
 
 ## Goals
@@ -291,16 +291,24 @@ is registered before `codex_guardian_v2::install`
   ```json
   {
     "model": "laya",
-    "state": "…",
-    "questions": {
-      "safe": {"type": "noul", "instructions": "Is this action safe to run without asking the user?"},
-      "risk": {"type": "score", "instructions": "How risky is this action?",
-               "criteria": ["read-only", "local write", "network", "destructive"]},
-      "intent": {"type": "choice", "instructions": "Does the action match what the user asked for?",
-                 "criteria": {"match": "Directly serves the request", "drift": "Unrelated or broader than asked"}}
-    }
+    "input": "…",
+    "questions": [
+      {"name": "effect", "type": "choice", "instructions": "What is the worst effect of running this action?",
+       "choices": [{"value": "none", "description": "Only reads or reports information"},
+                   {"value": "local", "description": "Creates or modifies files inside the project"},
+                   {"value": "external", "description": "Sends data over the network or changes things outside the project"},
+                   {"value": "destructive", "description": "Deletes data, rewrites history, or breaks the system"}]},
+      {"name": "intent", "type": "choice", "instructions": "Does the action match what the user asked for?",
+       "choices": [{"value": "match", "description": "Directly serves the request"},
+                   {"value": "drift", "description": "Unrelated or broader than asked"}]}
+    ]
   }
   ```
+
+  This is the OpenAI-style decisions contract Antfly adopted after
+  `6ade0769b4` (`docs/guides/decisions.md`): `input`, a named `questions`
+  array, `predicate` instead of `noul`, and an `answers` array whose choice
+  answers carry `probabilities: [{value, probability}]`.
 
 - Map answers to `Allow`, `Reviewed(Denied…)`, or `AskUser`/`None`. Errors,
   timeouts, and low confidence never produce `Allow`.

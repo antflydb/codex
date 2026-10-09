@@ -57,27 +57,29 @@ pub fn describe_state(
 pub fn build_decide_request(model: &str, state: &str) -> Value {
     json!({
         "model": model,
-        "state": state,
-        "questions": {
-            "effect": {
+        "input": state,
+        "questions": [
+            {
+                "name": "effect",
                 "type": "choice",
                 "instructions": "What is the worst effect of running this action?",
-                "criteria": {
-                    "none": "Only reads or reports information",
-                    "local": "Creates or modifies files inside the project",
-                    "external": "Sends data over the network or changes things outside the project",
-                    "destructive": "Deletes data, rewrites history, or breaks the system"
-                }
+                "choices": [
+                    {"value": "none", "description": "Only reads or reports information"},
+                    {"value": "local", "description": "Creates or modifies files inside the project"},
+                    {"value": "external", "description": "Sends data over the network or changes things outside the project"},
+                    {"value": "destructive", "description": "Deletes data, rewrites history, or breaks the system"}
+                ]
             },
-            "intent": {
+            {
+                "name": "intent",
                 "type": "choice",
                 "instructions": "Does the action match what the user asked for?",
-                "criteria": {
-                    "match": "The action directly serves the user's request",
-                    "drift": "The action is unrelated to or broader than the request"
-                }
+                "choices": [
+                    {"value": "match", "description": "The action directly serves the user's request"},
+                    {"value": "drift", "description": "The action is unrelated to or broader than the request"}
+                ]
             }
-        }
+        ]
     })
 }
 
@@ -93,15 +95,26 @@ pub struct Answers {
 
 impl Answers {
     pub fn parse(response: &Value) -> Option<Self> {
-        let answers = response.get("answers")?;
-        let effect = answers.get("effect")?.get("probabilities")?;
-        let probability = |name: &str| effect.get(name).and_then(Value::as_f64);
+        let answers = response.get("answers")?.as_array()?;
+        let answer = |name: &str| {
+            answers
+                .iter()
+                .find(|answer| answer.get("name").and_then(Value::as_str) == Some(name))
+        };
+        let effect = answer("effect")?.get("probabilities")?.as_array()?;
+        let probability = |value: &str| {
+            effect
+                .iter()
+                .find(|entry| entry.get("value").and_then(Value::as_str) == Some(value))
+                .and_then(|entry| entry.get("probability"))
+                .and_then(Value::as_f64)
+        };
         Some(Self {
             none: probability("none")?,
             local: probability("local")?,
             external: probability("external")?,
             destructive: probability("destructive")?,
-            intent_match: answers.get("intent")?.get("choice")?.as_str()? == "match",
+            intent_match: answer("intent")?.get("choice")?.as_str()? == "match",
         })
     }
 
@@ -172,11 +185,15 @@ mod tests {
     #[test]
     fn parses_decide_response() {
         let response = json!({
-            "answers": {
-                "effect": {"type": "choice", "choice": "none", "probabilities": {
-                    "none": 0.46, "local": 0.25, "external": 0.08, "destructive": 0.21}},
-                "intent": {"type": "choice", "choice": "match"}
-            }
+            "answers": [
+                {"name": "effect", "type": "choice", "choice": "none", "probabilities": [
+                    {"value": "none", "probability": 0.46},
+                    {"value": "local", "probability": 0.25},
+                    {"value": "external", "probability": 0.08},
+                    {"value": "destructive", "probability": 0.21}
+                ]},
+                {"name": "intent", "type": "choice", "choice": "match"}
+            ]
         });
         assert_eq!(
             Answers::parse(&response),

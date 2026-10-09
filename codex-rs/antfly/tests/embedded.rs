@@ -156,18 +156,15 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
         let answer = antfly
             .decide(&json!({
                 "model": "laya",
-                "state": "command: rm -rf /",
-                "questions": {
-                    "destructive": {
-                        "type": "noul",
-                        "instructions": "The command permanently deletes data."
-                    }
-                }
+                "input": "command: rm -rf /",
+                "questions": [{
+                    "name": "destructive",
+                    "type": "predicate",
+                    "instructions": "The command permanently deletes data."
+                }]
             }))
             .await?;
-        let probability = answer["answers"]["destructive"]["noul"]
-            .as_f64()
-            .unwrap_or(-1.0);
+        let probability = answer["answers"][0]["probability"].as_f64().unwrap_or(-1.0);
         assert!((0.0..=1.0).contains(&probability), "answer: {answer}");
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
