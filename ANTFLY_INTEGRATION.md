@@ -91,7 +91,7 @@ All phases are implemented on `antfly/integration`.
 
 | Phase | State |
 | --- | --- |
-| 0 Antfly prerequisites | `Database::sql_json` with SQL diagnostics (antfly branch `feat/rust-embedded-sql-json`), Laya checkpoint prepared from a pinned revision, dense index + enrichment over `search_text` |
+| 0 Antfly prerequisites | Laya checkpoint prepared from a pinned revision, dense index + enrichment over `search_text`. The backend uses the embedded document, index and decision APIs already on Antfly main; `Database::sql_json` (antflydb/antfly#1032) turned out not to be needed |
 | 1 Thread store | `AntflyThreadStore`: lifecycle with lazy materialization, Legacy and Paginated history (projection of turns/items/realtime in the same write as items), `list_turns`/`list_items`/`list_timeline`, listing with local cursor formats, hybrid `search_threads`, literal `search_thread_occurrences`, sections (Pinned seeded), attachments, projects, fork/revert for both modes (forks reference their source through `history_base`; deleting or reverting history a fork inherits is refused) |
 | 2 Other seams | Antfly agent message board (with thread-deletion cleanup) and Antfly memories backend (hybrid search over notes, filesystem stays the source of truth) |
 | 3 StateRuntime on Antfly | `StateRuntime::init_antfly`; goals, memory jobs and leases, queue (same error shapes as SQLite), guardian feedback, remote control, external imports, spawn edges and the thread-metadata adapter on Antfly; logs are no-ops; startup builds it through `rollout::state_db` when the store is Antfly |
@@ -123,16 +123,17 @@ Known limitations:
   flattened into self-contained threads.
 - The remote backend was tested against a local `antfly standalone`, not
   Antfly Cloud's proxy.
-- Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from the
-  Antfly branch above (`zig build capi`); CLI binaries and `codex-core` test
+- Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
+  Antfly main at or after `6ade0769b4` (`zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
 - `agent::control::tests::ensure_v2_child_loaded_preserves_evicted_parent_authority`
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
-  The workspace `Cargo.toml` points `antfly-embedded` at that Antfly
-  checkout by relative path.
+- The workspace `Cargo.toml` takes `antfly-embedded` from
+  `github.com/antflydb/antfly` pinned to `6ade0769b4`; bump `rev` together
+  with the `libantfly` build.
 
 ## Goals
 
