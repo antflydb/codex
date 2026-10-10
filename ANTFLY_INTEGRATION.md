@@ -95,11 +95,12 @@ implementation differs and why.
   catalog DDL and `antfly_search` in embedded SQL (#1034, #1044 → #1037,
   #1053), independent writers on one file (#1042), boolean partial-index
   predicates and a ~30 s `antfly_db_close` stall stopping embedded inference
-  (#1054, #1055, both fixed by #1056), and EmbeddingGemma 2 pulls (#1043). Open:
-  antflydb/antfly#1057 lists the SQL gaps the stores work around (`CHECK
-  … IN`, `strpos`, `LIKE … ESCAPE`, correlated scalar subqueries, `54000` on
-  derived tables, a misreported NOT NULL error, and 2 MiB statement and
-  transaction limits that cap guardian records below SQLite's 8 MiB).
+  (#1054, #1055, both fixed by #1056), and EmbeddingGemma 2 pulls (#1043). The SQL gaps the first port worked around (`CHECK … IN`,
+  `strpos`, `LIKE … ESCAPE`, correlated scalar subqueries, `54000` on derived
+  tables, a misreported NOT NULL error, 2 MiB statement and transaction
+  limits; #1057) are fixed by #1060. Open: antflydb/antfly#1062, the
+  PostgreSQL listener rejects the `DateStyle`/`TimeZone` startup parameters
+  sqlx-postgres always sends, so the remote SQL path cannot connect yet.
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes
@@ -141,15 +142,15 @@ Known limitations:
 - The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
   full import takes hours on a debug build. Imported forks and reverts are
   flattened into self-contained threads.
-- The SQL-over-PostgreSQL-wire path of the remote backend compiles and has a
-  test (`antfly/tests/remote.rs`, set `ANTFLY_TEST_URL` and
-  `ANTFLY_TEST_SQL_URL`) but has not yet been run against a live
-  `antfly standalone`; Antfly Cloud's proxy does not expose the PostgreSQL
-  listener.
-- Guardian review records are capped by Antfly's 2 MiB statement limit
-  (antflydb/antfly#1057), well below SQLite's 8 MiB.
+- The remote backend's SQL path is blocked on antflydb/antfly#1062: against
+  `antfly standalone --auth true` with `pgwire` enabled (main `6339e1519c`),
+  sqlx-postgres fails at startup with `0A000 UnsupportedStartupOption`
+  because it always sends `DateStyle` and `TimeZone`. `antfly/tests/remote.rs`
+  covers it once fixed (`ANTFLY_TEST_URL`, `ANTFLY_TEST_SQL_URL`, and
+  `ANTFLY_TEST_API_KEY` = an API key's `encoded` value). Antfly Cloud's proxy
+  does not expose the PostgreSQL listener.
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `551b8b3895` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `6339e1519c` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -157,7 +158,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `551b8b3895` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `6339e1519c` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
