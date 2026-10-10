@@ -373,7 +373,7 @@ impl Sql {
     }
 
     /// Opens connections to a remote Antfly PostgreSQL wire listener, e.g.
-    /// `postgres://user:password@127.0.0.1:5432/antfly`.
+    /// `postgres://user:password@127.0.0.1:5432/default`.
     #[expect(
         clippy::disallowed_methods,
         reason = "the SQLite pool constructors are banned in favor of codex-state's shim; this pool is PostgreSQL's, not SQLite's"

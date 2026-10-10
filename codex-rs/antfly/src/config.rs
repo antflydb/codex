@@ -17,7 +17,7 @@ pub enum BackendConfig {
         /// Base URL, for example `https://host/cloud/v1/<instance_id>`.
         url: String,
         /// PostgreSQL connection URL for the instance's SQL listener, for
-        /// example `postgres://codex:secret@host:5432/antfly`.
+        /// example `postgres://codex:secret@host:5432/default`.
         sql_url: Option<String>,
         /// Environment variable that holds a bearer token, if any.
         api_key_env: Option<String>,

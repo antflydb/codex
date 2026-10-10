@@ -98,9 +98,9 @@ implementation differs and why.
   (#1054, #1055, both fixed by #1056), and EmbeddingGemma 2 pulls (#1043). The SQL gaps the first port worked around (`CHECK … IN`,
   `strpos`, `LIKE … ESCAPE`, correlated scalar subqueries, `54000` on derived
   tables, a misreported NOT NULL error, 2 MiB statement and transaction
-  limits; #1057) are fixed by #1060. Open: antflydb/antfly#1062, the
-  PostgreSQL listener rejects the `DateStyle`/`TimeZone` startup parameters
-  sqlx-postgres always sends, so the remote SQL path cannot connect yet.
+  limits; #1057) are fixed by #1060. The PostgreSQL listener now accepts
+  sqlx-postgres's startup parameters (#1062, fixed by #1065). Open: #1067,
+  standalone DDL over the PostgreSQL listener (see Known limitations).
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes
@@ -142,15 +142,18 @@ Known limitations:
 - The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
   full import takes hours on a debug build. Imported forks and reverts are
   flattened into self-contained threads.
-- The remote backend's SQL path is blocked on antflydb/antfly#1062: against
-  `antfly standalone --auth true` with `pgwire` enabled (main `6339e1519c`),
-  sqlx-postgres fails at startup with `0A000 UnsupportedStartupOption`
-  because it always sends `DateStyle` and `TimeZone`. `antfly/tests/remote.rs`
-  covers it once fixed (`ANTFLY_TEST_URL`, `ANTFLY_TEST_SQL_URL`, and
-  `ANTFLY_TEST_API_KEY` = an API key's `encoded` value). Antfly Cloud's proxy
+- The remote backend's SQL path connects (antflydb/antfly#1062 fixed in
+  `e70e7dc191`) but cannot create the schema on `antfly standalone` yet
+  (antflydb/antfly#1067): `CREATE INDEX` never leaves `53300`, and
+  foreign-key `CREATE TABLE` fails to reserve memory (`53200`) for tables as
+  wide as `codex_threads`. The migration runner already follows the server's
+  publication protocol (retry `53300`; after `55000` poll for the new table).
+  `antfly/tests/remote.rs` covers the path with `ANTFLY_TEST_URL`,
+  `ANTFLY_TEST_SQL_URL` (`postgres://admin:<pw>@host:port/default`), and
+  `ANTFLY_TEST_API_KEY` (an API key's `encoded` value). Antfly Cloud's proxy
   does not expose the PostgreSQL listener.
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `6339e1519c` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `e70e7dc191` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -158,7 +161,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `6339e1519c` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `e70e7dc191` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -350,7 +353,7 @@ type = "antfly"
 backend = "embedded"                 # or "remote"
 path = "~/.codex/antfly.aflite"      # embedded
 # url = "https://<host>/cloud/v1/<instance_id>"   # remote documents (HTTP)
-# sql_url = "postgres://codex:secret@<host>:5432/antfly"  # remote SQL tables
+# sql_url = "postgres://codex:secret@<host>:5432/default"  # remote SQL tables
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
 decide_model = "convaiinnovations/laya"

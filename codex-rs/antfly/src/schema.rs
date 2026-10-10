@@ -494,6 +494,67 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// SQLSTATE an Antfly server returns while a just-published catalog change
+/// (for example a new table) is not yet visible to the next DDL statement.
+const CATALOG_NOT_READY: &str = "53300";
+/// SQLSTATE for a DDL statement the server committed but has not finished
+/// publishing (for example a table with foreign keys). The receipt says to
+/// poll for the table and not to replay the statement.
+const DDL_COMMITTED_NOT_READY: &str = "55000";
+const CATALOG_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The table a `CREATE TABLE [IF NOT EXISTS] <name>` statement creates.
+fn created_table(statement: &str) -> Option<&str> {
+    let mut words = statement.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("CREATE") || !words.next()?.eq_ignore_ascii_case("TABLE")
+    {
+        return None;
+    }
+    let mut name = words.next()?;
+    if name.eq_ignore_ascii_case("IF") {
+        words.next()?;
+        words.next()?;
+        name = words.next()?;
+    }
+    name.split('(').next().filter(|name| !name.is_empty())
+}
+
+/// Runs one DDL statement and waits until the server has published it.
+/// Embedded databases publish synchronously and never wait.
+async fn execute_ddl(sql: &Sql, statement: &str) -> AntflyResult<u64> {
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(20);
+    let backoff = |delay: std::time::Duration| (delay * 2).min(std::time::Duration::from_secs(1));
+    loop {
+        match sql.execute(statement, vec![]).await {
+            Err(err)
+                if err.sqlstate() == Some(CATALOG_NOT_READY)
+                    && started.elapsed() < CATALOG_RETRY_LIMIT =>
+            {
+                tokio::time::sleep(delay).await;
+                delay = backoff(delay);
+            }
+            Err(err) if err.sqlstate() == Some(DDL_COMMITTED_NOT_READY) => {
+                let Some(table) = created_table(statement) else {
+                    return Err(err);
+                };
+                let probe = format!("SELECT 1 FROM {table} LIMIT 1");
+                loop {
+                    match sql.fetch_all(&probe, vec![]).await {
+                        Ok(_) => return Ok(0),
+                        Err(_) if started.elapsed() < CATALOG_RETRY_LIMIT => {
+                            tokio::time::sleep(delay).await;
+                            delay = backoff(delay);
+                        }
+                        Err(_) => return Err(err),
+                    }
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Applies every migration that `codex_schema_migrations` has not recorded.
 /// Safe to run concurrently from several processes: statements are
 /// idempotent and the version insert ignores conflicts.
@@ -510,20 +571,18 @@ pub async fn migrate(sql: &Sql, migrations: &[Migration]) -> AntflyResult<()> {
             continue;
         }
         for statement in migration.statements {
-            sql.execute(statement, vec![])
-                .await
-                .map_err(|err| match err {
-                    AntflyError::Sql { code, message } => AntflyError::Sql {
-                        code,
-                        message: format!(
-                            "migration {} ({}): {message}: {}",
-                            migration.version,
-                            migration.name,
-                            statement.split_whitespace().collect::<Vec<_>>().join(" ")
-                        ),
-                    },
-                    other => other,
-                })?;
+            execute_ddl(sql, statement).await.map_err(|err| match err {
+                AntflyError::Sql { code, message } => AntflyError::Sql {
+                    code,
+                    message: format!(
+                        "migration {} ({}): {message}: {}",
+                        migration.version,
+                        migration.name,
+                        statement.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ),
+                },
+                other => other,
+            })?;
         }
         sql.execute(
             "INSERT INTO codex_schema_migrations (version, name, applied_at_ms) \
@@ -533,4 +592,21 @@ pub async fn migrate(sql: &Sql, migrations: &[Migration]) -> AntflyResult<()> {
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::created_table;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn created_table_reads_the_new_table_name() {
+        assert_eq!(
+            created_table("CREATE TABLE IF NOT EXISTS codex_threads (\n id TEXT)"),
+            Some("codex_threads")
+        );
+        assert_eq!(created_table("create table t(id TEXT)"), Some("t"));
+        assert_eq!(created_table("CREATE TABLE t (id TEXT)"), Some("t"));
+        assert_eq!(created_table("CREATE INDEX IF NOT EXISTS i ON t (n)"), None);
+    }
 }

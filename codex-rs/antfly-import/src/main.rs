@@ -28,7 +28,7 @@ struct Args {
     #[arg(long)]
     url: Option<String>,
     /// PostgreSQL URL of the remote instance's SQL listener (required with
-    /// --url), e.g. postgres://codex:secret@host:5432/antfly.
+    /// --url), e.g. postgres://codex:secret@host:5432/default.
     #[arg(long)]
     sql_url: Option<String>,
     /// Environment variable holding the remote bearer token.
