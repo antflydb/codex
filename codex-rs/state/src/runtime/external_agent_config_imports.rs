@@ -52,9 +52,9 @@ impl StateRuntime {
         failures: &[ExternalAgentConfigImportFailureRecord],
     ) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::external_agent_config_imports::record_external_agent_config_import_completed(
+            return Box::pin(super::antfly_backend::external_agent_config_imports::record_external_agent_config_import_completed(
                 antfly, import_id, provider_id, successes, failures,
-            )
+            ))
             .await;
         }
         sqlx::query(
@@ -89,9 +89,9 @@ ON CONFLICT(import_id) DO UPDATE SET
         import_id: &str,
     ) -> anyhow::Result<Option<ExternalAgentConfigImportDetailsRecord>> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::external_agent_config_imports::external_agent_config_import_details_record(
+            return Box::pin(super::antfly_backend::external_agent_config_imports::external_agent_config_import_details_record(
                 antfly, import_id,
-            )
+            ))
             .await;
         }
         let row = sqlx::query(
@@ -122,9 +122,9 @@ WHERE import_id = ?
         &self,
     ) -> anyhow::Result<Vec<ExternalAgentConfigImportHistoryRecord>> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::external_agent_config_imports::external_agent_config_import_history_records(
+            return Box::pin(super::antfly_backend::external_agent_config_imports::external_agent_config_import_history_records(
                 antfly,
-            )
+            ))
             .await;
         }
         let rows = sqlx::query(

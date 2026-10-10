@@ -1,16 +1,11 @@
-//! Thread-owned attachments.
-//!
-//! Each attachment is stored three times, written atomically together: the
-//! canonical row keyed by `(thread, type, identity key)`, a per-thread
-//! listing entry keyed by `(thread, created_at, id)`, and an owner entry
-//! keyed by `(type, identity key, thread)` used by
-//! [`list_thread_attachment_threads`]. The owner entry does not cache a
-//! thread's archived state (it would go stale on archive/unarchive), so that
-//! listing re-reads each candidate thread's record.
+//! Thread-owned attachments (`codex_thread_attachments`). One row per
+//! identity, looked up canonically by `(thread_id, attachment_type,
+//! identity_key)` (its UNIQUE constraint), listed per thread by
+//! `codex_thread_attachments_thread`, and listed per identity across threads
+//! by `codex_thread_attachments_identity`.
 
-use chrono::Utc;
-use codex_antfly::ScanRequest;
-use codex_antfly::Write;
+use codex_antfly::sql::SqlRow;
+use codex_antfly::sql_params;
 use codex_protocol::ThreadId;
 use codex_state::MAX_THREAD_ATTACHMENT_IDENTITY_KEY_BYTES;
 use codex_state::MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE;
@@ -19,13 +14,9 @@ use codex_state::MAX_THREAD_ATTACHMENT_TYPE_BYTES;
 use codex_state::MAX_THREAD_ATTACHMENTS_PER_THREAD;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 
 use super::AntflyThreadStore;
-use super::from_value;
 use super::internal;
-use super::keys;
-use super::to_value;
 use crate::AddThreadAttachmentOutcome;
 use crate::AddThreadAttachmentParams;
 use crate::ListThreadAttachmentThreadsParams;
@@ -40,53 +31,25 @@ use crate::ThreadAttachmentPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-/// Records fetched per scan batch while filling an owner page.
-const SCAN_BATCH: usize = 200;
-
-/// Serializable mirror of [`ThreadAttachment`], which does not derive serde.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct AttachmentDoc {
-    id: String,
-    thread_id: ThreadId,
-    attachment_type: String,
-    identity_key: String,
-    payload: Value,
-    created_at: i64,
-}
-
-impl From<AttachmentDoc> for ThreadAttachment {
-    fn from(doc: AttachmentDoc) -> Self {
-        ThreadAttachment {
-            id: doc.id,
-            thread_id: doc.thread_id,
-            attachment_type: doc.attachment_type,
-            identity_key: doc.identity_key,
-            payload: doc.payload,
-            created_at: doc.created_at,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct OwnerCursor {
-    attachment_type: String,
-    identity_key: String,
-    archived: Option<bool>,
-    thread_id: ThreadId,
-}
-
-fn archive_filter_value(filter: ThreadAttachmentArchiveFilter) -> Option<bool> {
-    match filter {
-        ThreadAttachmentArchiveFilter::All => None,
-        ThreadAttachmentArchiveFilter::NonArchived => Some(false),
-        ThreadAttachmentArchiveFilter::Archived => Some(true),
-    }
-}
-
 fn invalid(message: impl Into<String>) -> ThreadStoreError {
     ThreadStoreError::InvalidRequest {
         message: message.into(),
     }
+}
+
+fn attachment_from_row(row: &SqlRow) -> ThreadStoreResult<ThreadAttachment> {
+    Ok(ThreadAttachment {
+        id: row.string("id").map_err(internal)?,
+        thread_id: ThreadId::from_string(&row.string("thread_id").map_err(internal)?).map_err(
+            |err| ThreadStoreError::Internal {
+                message: format!("invalid thread id: {err}"),
+            },
+        )?,
+        attachment_type: row.string("attachment_type").map_err(internal)?,
+        identity_key: row.string("identity_key").map_err(internal)?,
+        payload: row.json("payload").map_err(internal)?,
+        created_at: row.i64("created_at").map_err(internal)?,
+    })
 }
 
 fn validate_identity(attachment_type: &str, identity_key: &str) -> ThreadStoreResult<()> {
@@ -109,59 +72,6 @@ fn validate_identity(attachment_type: &str, identity_key: &str) -> ThreadStoreRe
     Ok(())
 }
 
-fn attachment_writes(doc: &AttachmentDoc) -> ThreadStoreResult<Vec<Write>> {
-    let value = to_value(doc)?;
-    Ok(vec![
-        Write::put(
-            keys::attachment(doc.thread_id, &doc.attachment_type, &doc.identity_key),
-            value.clone(),
-        ),
-        Write::put(
-            keys::attachment_list_entry(doc.thread_id, doc.created_at, &doc.id),
-            value.clone(),
-        ),
-        Write::put(
-            keys::attachment_owner_entry(&doc.attachment_type, &doc.identity_key, doc.thread_id),
-            value,
-        ),
-    ])
-}
-
-/// Delete writes for every attachment owned by `thread_id`, for the host to
-/// fold into its own atomic batch when deleting a thread.
-pub(super) async fn delete_writes_for_thread(
-    store: &AntflyThreadStore,
-    thread_id: ThreadId,
-) -> ThreadStoreResult<Vec<Write>> {
-    let docs: Vec<AttachmentDoc> = store
-        .antfly()
-        .scan_as::<AttachmentDoc>(ScanRequest::prefix(&keys::attachments_prefix(thread_id)))
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .map(|(_, doc)| doc)
-        .collect();
-    let mut writes = Vec::with_capacity(docs.len() * 3);
-    for doc in docs {
-        writes.push(Write::delete(keys::attachment(
-            doc.thread_id,
-            &doc.attachment_type,
-            &doc.identity_key,
-        )));
-        writes.push(Write::delete(keys::attachment_list_entry(
-            doc.thread_id,
-            doc.created_at,
-            &doc.id,
-        )));
-        writes.push(Write::delete(keys::attachment_owner_entry(
-            &doc.attachment_type,
-            &doc.identity_key,
-            doc.thread_id,
-        )));
-    }
-    Ok(writes)
-}
-
 pub(super) async fn add_thread_attachment(
     store: &AntflyThreadStore,
     params: AddThreadAttachmentParams,
@@ -174,8 +84,6 @@ pub(super) async fn add_thread_attachment(
             "attachment payload exceeds {MAX_THREAD_ATTACHMENT_PAYLOAD_BYTES} bytes"
         )));
     }
-
-    let _guard = store.antfly().lock().await;
     store
         .load_record(params.thread_id)
         .await?
@@ -183,49 +91,60 @@ pub(super) async fn add_thread_attachment(
             thread_id: params.thread_id,
         })?;
 
-    let canonical_key = keys::attachment(
-        params.thread_id,
-        &params.attachment_type,
-        &params.identity_key,
-    );
-    if let Some(doc) = store
-        .antfly()
-        .get(canonical_key.clone())
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let thread_id = params.thread_id.to_string();
+    if let Some(row) = sql
+        .fetch_optional(
+            "SELECT id, thread_id, attachment_type, identity_key, payload, created_at \
+             FROM codex_thread_attachments WHERE thread_id = $1 AND attachment_type = $2 AND identity_key = $3",
+            sql_params![thread_id.clone(), params.attachment_type.clone(), params.identity_key.clone()],
+        )
         .await
         .map_err(internal)?
     {
-        let existing: AttachmentDoc = from_value(doc)?;
-        return Ok(AddThreadAttachmentOutcome::Existing(existing.into()));
+        return Ok(AddThreadAttachmentOutcome::Existing(attachment_from_row(&row)?));
     }
 
-    let count = store
-        .antfly()
-        .scan(ScanRequest::prefix(&keys::attachments_prefix(
-            params.thread_id,
-        )))
+    let count = sql
+        .fetch_optional(
+            "SELECT COUNT(*) AS value FROM codex_thread_attachments WHERE thread_id = $1",
+            sql_params![thread_id.clone()],
+        )
         .await
         .map_err(internal)?
-        .len();
-    if count >= MAX_THREAD_ATTACHMENTS_PER_THREAD {
+        .map(|row| row.i64("value"))
+        .transpose()
+        .map_err(internal)?
+        .unwrap_or(0);
+    if count as usize >= MAX_THREAD_ATTACHMENTS_PER_THREAD {
         return Err(invalid(format!(
             "thread attachment identity count exceeds {MAX_THREAD_ATTACHMENTS_PER_THREAD}"
         )));
     }
 
-    let attachment = AttachmentDoc {
+    let attachment = ThreadAttachment {
         id: uuid::Uuid::now_v7().to_string(),
         thread_id: params.thread_id,
         attachment_type: params.attachment_type,
         identity_key: params.identity_key,
         payload: params.payload,
-        created_at: Utc::now().timestamp(),
+        created_at: chrono::Utc::now().timestamp(),
     };
-    store
-        .antfly()
-        .write(attachment_writes(&attachment)?)
-        .await
-        .map_err(internal)?;
-    Ok(AddThreadAttachmentOutcome::Created(attachment.into()))
+    sql.execute(
+        "INSERT INTO codex_thread_attachments (id, thread_id, attachment_type, identity_key, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+        sql_params![
+            attachment.id.clone(),
+            thread_id,
+            attachment.attachment_type.clone(),
+            attachment.identity_key.clone(),
+            attachment.payload.clone(),
+            attachment.created_at
+        ],
+    )
+    .await
+    .map_err(internal)?;
+    Ok(AddThreadAttachmentOutcome::Created(attachment))
 }
 
 pub(super) async fn remove_thread_attachment(
@@ -233,43 +152,129 @@ pub(super) async fn remove_thread_attachment(
     params: RemoveThreadAttachmentParams,
 ) -> ThreadStoreResult<RemoveThreadAttachmentOutcome> {
     validate_identity(&params.attachment_type, &params.identity_key)?;
-    let _guard = store.antfly().lock().await;
     store
         .load_record(params.thread_id)
         .await?
         .ok_or(ThreadStoreError::ThreadNotFound {
             thread_id: params.thread_id,
         })?;
-
-    let canonical_key = keys::attachment(
-        params.thread_id,
-        &params.attachment_type,
-        &params.identity_key,
-    );
-    let Some(doc) = store
-        .antfly()
-        .get(canonical_key.clone())
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let removed = sql
+        .fetch_optional(
+            "DELETE FROM codex_thread_attachments WHERE thread_id = $1 AND attachment_type = $2 AND identity_key = $3 \
+             RETURNING id, thread_id, attachment_type, identity_key, payload, created_at",
+            sql_params![params.thread_id.to_string(), params.attachment_type, params.identity_key],
+        )
         .await
-        .map_err(internal)?
-    else {
-        return Ok(RemoveThreadAttachmentOutcome::NotFound);
+        .map_err(internal)?;
+    match removed {
+        Some(row) => Ok(RemoveThreadAttachmentOutcome::Removed(attachment_from_row(
+            &row,
+        )?)),
+        None => Ok(RemoveThreadAttachmentOutcome::NotFound),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct OwnerCursor {
+    attachment_type: String,
+    identity_key: String,
+    archived: Option<bool>,
+    thread_id: ThreadId,
+}
+
+fn archive_filter_value(filter: ThreadAttachmentArchiveFilter) -> Option<bool> {
+    match filter {
+        ThreadAttachmentArchiveFilter::All => None,
+        ThreadAttachmentArchiveFilter::NonArchived => Some(false),
+        ThreadAttachmentArchiveFilter::Archived => Some(true),
+    }
+}
+
+pub(super) async fn list_thread_attachment_threads(
+    store: &AntflyThreadStore,
+    params: ListThreadAttachmentThreadsParams,
+) -> ThreadStoreResult<ThreadAttachmentOwnerPage> {
+    validate_identity(&params.attachment_type, &params.identity_key)?;
+    if !(1..=MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE).contains(&params.limit) {
+        return Err(invalid(format!(
+            "page limit must be between 1 and {MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE}"
+        )));
+    }
+    let wanted_archived = archive_filter_value(params.archive_filter);
+    let anchor = params
+        .cursor
+        .as_deref()
+        .map(|cursor| -> ThreadStoreResult<ThreadId> {
+            let parsed: OwnerCursor =
+                serde_json::from_str(cursor).map_err(|_| invalid("invalid pagination cursor"))?;
+            if parsed.attachment_type != params.attachment_type
+                || parsed.identity_key != params.identity_key
+                || parsed.archived != wanted_archived
+            {
+                return Err(invalid("invalid pagination cursor"));
+            }
+            Ok(parsed.thread_id)
+        })
+        .transpose()?;
+
+    let mut sql = String::from(
+        "SELECT a.thread_id AS thread_id, t.archived AS archived FROM codex_thread_attachments a \
+         JOIN codex_threads t ON t.id = a.thread_id \
+         WHERE a.attachment_type = $1 AND a.identity_key = $2",
+    );
+    let mut values = sql_params![params.attachment_type.clone(), params.identity_key.clone()];
+    if let Some(archived) = wanted_archived {
+        values.push(archived.into());
+        sql.push_str(&format!(" AND t.archived = ${}", values.len()));
+    }
+    if let Some(anchor) = anchor {
+        values.push(anchor.to_string().into());
+        sql.push_str(&format!(" AND a.thread_id > ${}", values.len()));
+    }
+    values.push(((params.limit + 1) as i64).into());
+    sql.push_str(&format!(
+        " ORDER BY a.thread_id ASC LIMIT ${}",
+        values.len()
+    ));
+
+    let sql_handle = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql_handle.fetch_all(&sql, values).await.map_err(internal)?;
+    let mut threads = rows
+        .iter()
+        .map(|row| -> ThreadStoreResult<ThreadAttachmentOwner> {
+            Ok(ThreadAttachmentOwner {
+                thread_id: ThreadId::from_string(&row.string("thread_id").map_err(internal)?)
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!("invalid thread id: {err}"),
+                    })?,
+                archived: row.bool("archived").map_err(internal)?,
+            })
+        })
+        .collect::<ThreadStoreResult<Vec<_>>>()?;
+    let next_cursor = if threads.len() > params.limit {
+        threads.truncate(params.limit);
+        threads
+            .last()
+            .map(|thread| {
+                serde_json::to_string(&OwnerCursor {
+                    attachment_type: params.attachment_type.clone(),
+                    identity_key: params.identity_key.clone(),
+                    archived: wanted_archived,
+                    thread_id: thread.thread_id,
+                })
+            })
+            .transpose()
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("serialize cursor: {err}"),
+            })?
+    } else {
+        None
     };
-    let attachment: AttachmentDoc = from_value(doc)?;
-    let writes = vec![
-        Write::delete(canonical_key),
-        Write::delete(keys::attachment_list_entry(
-            attachment.thread_id,
-            attachment.created_at,
-            &attachment.id,
-        )),
-        Write::delete(keys::attachment_owner_entry(
-            &attachment.attachment_type,
-            &attachment.identity_key,
-            attachment.thread_id,
-        )),
-    ];
-    store.antfly().write(writes).await.map_err(internal)?;
-    Ok(RemoveThreadAttachmentOutcome::Removed(attachment.into()))
+    Ok(ThreadAttachmentOwnerPage {
+        threads,
+        next_cursor,
+    })
 }
 
 fn parse_list_cursor(cursor: &str, thread_id: ThreadId) -> ThreadStoreResult<(i64, String)> {
@@ -309,131 +314,45 @@ pub(super) async fn list_thread_attachments(
         .as_deref()
         .map(|cursor| parse_list_cursor(cursor, params.thread_id))
         .transpose()?;
-    let prefix = keys::attachment_list_prefix(params.thread_id);
-    let from = match anchor {
-        Some((created_at, attachment_id)) => format!(
-            "{}\u{0}",
-            keys::attachment_list_entry(params.thread_id, created_at, &attachment_id)
-        ),
-        None => prefix.clone(),
-    };
-    let to = codex_antfly::keys::prefix_end(&prefix);
-    let mut attachments: Vec<AttachmentDoc> = store
-        .antfly()
-        .scan_as::<AttachmentDoc>(ScanRequest {
-            from,
-            to,
-            limit: Some(params.limit + 1),
-        })
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .map(|(_, doc)| doc)
-        .collect();
+    let mut sql = String::from(
+        "SELECT id, thread_id, attachment_type, identity_key, payload, created_at \
+         FROM codex_thread_attachments WHERE thread_id = $1",
+    );
+    let mut values = sql_params![params.thread_id.to_string()];
+    if let Some((created_at, attachment_id)) = anchor {
+        values.push(created_at.into());
+        values.push(attachment_id.into());
+        sql.push_str(&format!(
+            " AND (created_at, id) > (${}, ${})",
+            values.len() - 1,
+            values.len()
+        ));
+    }
+    values.push(((params.limit + 1) as i64).into());
+    sql.push_str(&format!(
+        " ORDER BY created_at ASC, id ASC LIMIT ${}",
+        values.len()
+    ));
+
+    let sql_handle = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql_handle.fetch_all(&sql, values).await.map_err(internal)?;
+    let mut attachments = rows
+        .iter()
+        .map(attachment_from_row)
+        .collect::<ThreadStoreResult<Vec<_>>>()?;
     let next_cursor = if attachments.len() > params.limit {
         attachments.truncate(params.limit);
-        attachments
-            .last()
-            .map(|doc| format!("{}|{}|{}", doc.thread_id, doc.created_at, doc.id))
+        attachments.last().map(|attachment| {
+            format!(
+                "{}|{}|{}",
+                attachment.thread_id, attachment.created_at, attachment.id
+            )
+        })
     } else {
         None
     };
     Ok(ThreadAttachmentPage {
-        attachments: attachments.into_iter().map(Into::into).collect(),
-        next_cursor,
-    })
-}
-
-pub(super) async fn list_thread_attachment_threads(
-    store: &AntflyThreadStore,
-    params: ListThreadAttachmentThreadsParams,
-) -> ThreadStoreResult<ThreadAttachmentOwnerPage> {
-    validate_identity(&params.attachment_type, &params.identity_key)?;
-    if !(1..=MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE).contains(&params.limit) {
-        return Err(invalid(format!(
-            "page limit must be between 1 and {MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE}"
-        )));
-    }
-    let wanted_archived = archive_filter_value(params.archive_filter);
-    let anchor = params
-        .cursor
-        .as_deref()
-        .map(|cursor| -> ThreadStoreResult<ThreadId> {
-            let parsed: OwnerCursor =
-                serde_json::from_str(cursor).map_err(|_| invalid("invalid pagination cursor"))?;
-            if parsed.attachment_type != params.attachment_type
-                || parsed.identity_key != params.identity_key
-                || parsed.archived != wanted_archived
-            {
-                return Err(invalid("invalid pagination cursor"));
-            }
-            Ok(parsed.thread_id)
-        })
-        .transpose()?;
-
-    let prefix = keys::attachment_owner_prefix(&params.attachment_type, &params.identity_key);
-    let mut from = match anchor {
-        Some(thread_id) => format!(
-            "{}\u{0}",
-            keys::attachment_owner_entry(&params.attachment_type, &params.identity_key, thread_id)
-        ),
-        None => prefix.clone(),
-    };
-    let to = codex_antfly::keys::prefix_end(&prefix);
-    let mut threads: Vec<ThreadAttachmentOwner> = Vec::new();
-    let mut has_more = false;
-    'scan: loop {
-        let batch: Vec<(String, AttachmentDoc)> = store
-            .antfly()
-            .scan_as::<AttachmentDoc>(ScanRequest {
-                from: from.clone(),
-                to: to.clone(),
-                limit: Some(SCAN_BATCH),
-            })
-            .await
-            .map_err(internal)?;
-        let exhausted = batch.len() < SCAN_BATCH;
-        for (key, doc) in batch {
-            from = format!("{key}\u{0}");
-            let Some(record) = store.load_record(doc.thread_id).await? else {
-                continue;
-            };
-            let archived = record.archived_at.is_some();
-            let include = match wanted_archived {
-                Some(wanted) => wanted == archived,
-                None => true,
-            };
-            if !include {
-                continue;
-            }
-            if threads.len() == params.limit {
-                has_more = true;
-                break 'scan;
-            }
-            threads.push(ThreadAttachmentOwner {
-                thread_id: doc.thread_id,
-                archived,
-            });
-        }
-        if exhausted {
-            break;
-        }
-    }
-    let next_cursor = if has_more {
-        threads.last().and_then(|owner| {
-            serde_json::to_string(&OwnerCursor {
-                attachment_type: params.attachment_type.clone(),
-                identity_key: params.identity_key.clone(),
-                archived: wanted_archived,
-                thread_id: owner.thread_id,
-            })
-            .ok()
-        })
-    } else {
-        None
-    };
-    Ok(ThreadAttachmentOwnerPage {
-        threads,
+        attachments,
         next_cursor,
     })
 }
@@ -443,35 +362,38 @@ pub(super) async fn copy_thread_attachments(
     source_thread_id: ThreadId,
     destination_thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
-    let _guard = store.antfly().lock().await;
     store
         .load_record(destination_thread_id)
         .await?
         .ok_or(ThreadStoreError::ThreadNotFound {
             thread_id: destination_thread_id,
         })?;
-    let source: Vec<AttachmentDoc> = store
-        .antfly()
-        .scan_as::<AttachmentDoc>(ScanRequest::prefix(&keys::attachment_list_prefix(
-            source_thread_id,
-        )))
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let source = sql
+        .fetch_all(
+            "SELECT attachment_type, identity_key, payload FROM codex_thread_attachments \
+             WHERE thread_id = $1 ORDER BY created_at, id",
+            sql_params![source_thread_id.to_string()],
+        )
         .await
-        .map_err(internal)?
-        .into_iter()
-        .map(|(_, doc)| doc)
-        .collect();
-    let created_at = Utc::now().timestamp();
-    let mut writes = Vec::with_capacity(source.len() * 3);
-    for doc in source {
-        let copy = AttachmentDoc {
-            id: uuid::Uuid::now_v7().to_string(),
-            thread_id: destination_thread_id,
-            attachment_type: doc.attachment_type,
-            identity_key: doc.identity_key,
-            payload: doc.payload,
-            created_at,
-        };
-        writes.extend(attachment_writes(&copy)?);
+        .map_err(internal)?;
+    let created_at = chrono::Utc::now().timestamp();
+    let mut tx = sql.begin().await.map_err(internal)?;
+    for row in &source {
+        tx.execute(
+            "INSERT INTO codex_thread_attachments (id, thread_id, attachment_type, identity_key, payload, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            sql_params![
+                uuid::Uuid::now_v7().to_string(),
+                destination_thread_id.to_string(),
+                row.string("attachment_type").map_err(internal)?,
+                row.string("identity_key").map_err(internal)?,
+                row.json("payload").map_err(internal)?,
+                created_at
+            ],
+        )
+        .await
+        .map_err(internal)?;
     }
-    store.antfly().write(writes).await.map_err(internal)
+    tx.commit().await.map_err(internal)
 }

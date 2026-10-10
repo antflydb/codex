@@ -11,26 +11,16 @@ use crate::error::AntflyError;
 pub enum BackendConfig {
     /// A local `.aflite` database opened in-process through `libantfly`.
     Embedded { path: PathBuf },
-    /// A remote Antfly or Antfly Cloud instance.
+    /// A remote Antfly instance: document tables over HTTP and relational
+    /// tables over its PostgreSQL wire listener.
     Remote {
         /// Base URL, for example `https://host/cloud/v1/<instance_id>`.
         url: String,
-        /// Table that holds all Codex state.
-        table: String,
+        /// PostgreSQL connection URL for the instance's SQL listener, for
+        /// example `postgres://codex:secret@host:5432/antfly`.
+        sql_url: Option<String>,
         /// Environment variable that holds a bearer token, if any.
         api_key_env: Option<String>,
-    },
-    /// A local `.aflite` database whose writes are replicated to a remote
-    /// instance through a durable outbox. Works offline; the remote catches
-    /// up when reachable.
-    Replicated {
-        path: PathBuf,
-        url: String,
-        table: String,
-        api_key_env: Option<String>,
-        /// Search the remote replica (which can include other machines'
-        /// threads) instead of the local copy.
-        search_remote: bool,
     },
 }
 
@@ -112,13 +102,12 @@ pub struct AntflyTomlSettings {
     pub codex_home: PathBuf,
     pub path: Option<PathBuf>,
     pub url: Option<String>,
-    pub table: Option<String>,
+    pub sql_url: Option<String>,
     pub api_key_env: Option<String>,
     pub models_dir: Option<PathBuf>,
     pub embedder_model: Option<String>,
     pub embedder_dims: Option<u32>,
     pub semantic_search: Option<bool>,
-    pub search_remote: Option<bool>,
     pub decide_model: Option<String>,
     pub approvals_mode: Option<String>,
     pub allow_threshold: Option<f64>,
@@ -160,18 +149,17 @@ impl AntflyConfig {
     /// Applies defaults to settings read from `config.toml`.
     pub fn from_toml(settings: AntflyTomlSettings) -> Result<Self, AntflyError> {
         let local_path = settings.path.map(expand_home);
-        let table = settings.table.unwrap_or_else(|| "codex".to_string());
         let backend = match (settings.url, local_path) {
-            (Some(url), Some(path)) => BackendConfig::Replicated {
-                path,
-                url,
-                table,
-                api_key_env: settings.api_key_env,
-                search_remote: settings.search_remote.unwrap_or(false),
-            },
+            (Some(_), Some(_)) => {
+                return Err(AntflyError::Config(
+                    "set either antfly.path (embedded) or antfly.url (remote), not both; \
+                     the replicated backend was removed with the move to SQL tables"
+                        .to_string(),
+                ));
+            }
             (Some(url), None) => BackendConfig::Remote {
                 url,
-                table,
+                sql_url: settings.sql_url,
                 api_key_env: settings.api_key_env,
             },
             (None, path) => BackendConfig::Embedded {
@@ -202,7 +190,9 @@ impl AntflyConfig {
             backend,
             models_dir: settings.models_dir.map(expand_home),
             embedder,
-            decide_model: settings.decide_model.unwrap_or_else(|| DEFAULT_DECIDE_MODEL.to_string()),
+            decide_model: settings
+                .decide_model
+                .unwrap_or_else(|| DEFAULT_DECIDE_MODEL.to_string()),
             approvals: ApprovalSettings {
                 mode,
                 allow_threshold_bp: basis_points(

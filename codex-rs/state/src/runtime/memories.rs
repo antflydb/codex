@@ -86,7 +86,7 @@ impl MemoryStore {
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::clear_memory_data(antfly, version).await;
+                return Box::pin(antfly_memories::clear_memory_data(antfly, version)).await;
             }
         };
         clear_memory_data_in_pool(pool.as_ref()).await
@@ -106,8 +106,10 @@ impl MemoryStore {
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::record_stage1_output_usage(antfly, version, thread_ids)
-                    .await;
+                return Box::pin(antfly_memories::record_stage1_output_usage(
+                    antfly, version, thread_ids,
+                ))
+                .await;
             }
         };
 
@@ -208,12 +210,12 @@ WHERE kind = ? AND job_key = ?
         let (_pool, state_pool) = match &self.backend {
             MemoryBackend::Sqlite { pool, state_pool } => (pool, state_pool),
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::claim_stage1_jobs_for_startup(
+                return Box::pin(antfly_memories::claim_stage1_jobs_for_startup(
                     antfly,
                     version,
                     current_thread_id,
                     params,
-                )
+                ))
                 .await;
             }
         };
@@ -364,7 +366,10 @@ FROM threads
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::delete_thread_memory(antfly, version, thread_id).await;
+                return Box::pin(antfly_memories::delete_thread_memory(
+                    antfly, version, thread_id,
+                ))
+                .await;
             }
         };
         let now = Utc::now().timestamp();
@@ -431,7 +436,10 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::list_stage1_outputs_for_global(antfly, version, n).await;
+                return Box::pin(antfly_memories::list_stage1_outputs_for_global(
+                    antfly, version, n,
+                ))
+                .await;
             }
         };
         if n == 0 {
@@ -484,12 +492,12 @@ ORDER BY so.source_updated_at DESC, so.thread_id DESC
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::prune_stage1_outputs_for_retention(
+                return Box::pin(antfly_memories::prune_stage1_outputs_for_retention(
                     antfly,
                     version,
                     max_unused_days,
                     limit,
-                )
+                ))
                 .await;
             }
         };
@@ -546,12 +554,12 @@ WHERE thread_id IN (
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::get_phase2_input_selection(
+                return Box::pin(antfly_memories::get_phase2_input_selection(
                     antfly,
                     version,
                     n,
                     max_unused_days,
-                )
+                ))
                 .await;
             }
         };
@@ -740,9 +748,9 @@ WHERE threads.id = ? AND threads.memory_mode = 'enabled'
         let (pool, state_pool) = match &self.backend {
             MemoryBackend::Sqlite { pool, state_pool } => (pool, state_pool),
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_thread_memory_mode_polluted(
+                return Box::pin(antfly_memories::mark_thread_memory_mode_polluted(
                     antfly, version, thread_id,
-                )
+                ))
                 .await;
             }
         };
@@ -805,7 +813,7 @@ WHERE id = ? AND memory_mode != 'polluted'
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::try_claim_stage1_job(
+                return Box::pin(antfly_memories::try_claim_stage1_job(
                     antfly,
                     version,
                     thread_id,
@@ -813,7 +821,7 @@ WHERE id = ? AND memory_mode != 'polluted'
                     source_updated_at,
                     lease_seconds,
                     max_running_jobs,
-                )
+                ))
                 .await;
             }
         };
@@ -1008,7 +1016,7 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_stage1_job_succeeded(
+                return Box::pin(antfly_memories::mark_stage1_job_succeeded(
                     antfly,
                     version,
                     thread_id,
@@ -1017,7 +1025,7 @@ WHERE kind = ? AND job_key = ?
                     raw_memory,
                     rollout_summary,
                     rollout_slug,
-                )
+                ))
                 .await;
             }
         };
@@ -1101,12 +1109,12 @@ WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_stage1_job_succeeded_no_output(
+                return Box::pin(antfly_memories::mark_stage1_job_succeeded_no_output(
                     antfly,
                     version,
                     thread_id,
                     ownership_token,
-                )
+                ))
                 .await;
             }
         };
@@ -1190,14 +1198,14 @@ WHERE thread_id = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_stage1_job_failed(
+                return Box::pin(antfly_memories::mark_stage1_job_failed(
                     antfly,
                     version,
                     thread_id,
                     ownership_token,
                     failure_reason,
                     retry_delay_seconds,
-                )
+                ))
                 .await;
             }
         };
@@ -1243,11 +1251,11 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::enqueue_global_consolidation(
+                return Box::pin(antfly_memories::enqueue_global_consolidation(
                     antfly,
                     version,
                     input_watermark,
-                )
+                ))
                 .await;
             }
         };
@@ -1275,12 +1283,12 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::try_claim_global_phase2_job(
+                return Box::pin(antfly_memories::try_claim_global_phase2_job(
                     antfly,
                     version,
                     worker_id,
                     lease_seconds,
-                )
+                ))
                 .await;
             }
         };
@@ -1424,12 +1432,12 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::heartbeat_global_phase2_job(
+                return Box::pin(antfly_memories::heartbeat_global_phase2_job(
                     antfly,
                     version,
                     ownership_token,
                     lease_seconds,
-                )
+                ))
                 .await;
             }
         };
@@ -1473,13 +1481,13 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_global_phase2_job_succeeded(
+                return Box::pin(antfly_memories::mark_global_phase2_job_succeeded(
                     antfly,
                     version,
                     ownership_token,
                     completed_watermark,
                     selected_outputs,
-                )
+                ))
                 .await;
             }
         };
@@ -1548,13 +1556,13 @@ WHERE thread_id = ? AND source_updated_at = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_global_phase2_job_failed(
+                return Box::pin(antfly_memories::mark_global_phase2_job_failed(
                     antfly,
                     version,
                     ownership_token,
                     failure_reason,
                     retry_delay_seconds,
-                )
+                ))
                 .await;
             }
         };
@@ -1602,13 +1610,13 @@ WHERE kind = ? AND job_key = ?
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::mark_global_phase2_job_failed_if_unowned(
+                return Box::pin(antfly_memories::mark_global_phase2_job_failed_if_unowned(
                     antfly,
                     version,
                     ownership_token,
                     failure_reason,
                     retry_delay_seconds,
-                )
+                ))
                 .await;
             }
         };

@@ -11,6 +11,15 @@ impl StateRuntime {
         &self,
         migration_id: &str,
     ) -> anyhow::Result<Option<crate::RolloutMigrationState>> {
+        if let Some(antfly) = &self.antfly {
+            return Box::pin(
+                super::antfly_backend::rollout_migration::get_rollout_migration_state(
+                    antfly,
+                    migration_id,
+                ),
+            )
+            .await;
+        }
         let row = sqlx::query(
             r#"
 SELECT last_checked_thread_created_at, last_checked_thread_id
@@ -33,6 +42,16 @@ WHERE migration_id = ?
         migration_id: &str,
         last_checked_thread: Option<&crate::RolloutMigrationCursor>,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return Box::pin(
+                super::antfly_backend::rollout_migration::advance_rollout_migration_state(
+                    antfly,
+                    migration_id,
+                    last_checked_thread,
+                ),
+            )
+            .await;
+        }
         let now = Utc::now().timestamp();
         let (thread_created_at, thread_id) = last_checked_thread.map_or((None, None), |cursor| {
             (
@@ -79,6 +98,15 @@ WHERE excluded.last_checked_thread_created_at IS NOT NULL
         &self,
         migration_id: &str,
     ) -> anyhow::Result<Vec<crate::RolloutMigrationSkippedRollout>> {
+        if let Some(antfly) = &self.antfly {
+            return Box::pin(
+                super::antfly_backend::rollout_migration::list_rollout_migration_skipped_rollouts(
+                    antfly,
+                    migration_id,
+                ),
+            )
+            .await;
+        }
         let rows = sqlx::query(
             r#"
 SELECT rollout_path, rollout_size_bytes, rollout_modified_at_ns, skip_reason
@@ -99,6 +127,16 @@ WHERE migration_id = ?
         migration_id: &str,
         skipped_rollout: &crate::RolloutMigrationSkippedRollout,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return Box::pin(
+                super::antfly_backend::rollout_migration::record_rollout_migration_skip(
+                    antfly,
+                    migration_id,
+                    skipped_rollout,
+                ),
+            )
+            .await;
+        }
         let now = Utc::now().timestamp();
         sqlx::query(
             r#"
@@ -134,6 +172,16 @@ ON CONFLICT(migration_id, rollout_path) DO UPDATE SET
         migration_id: &str,
         rollout_path: &str,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return Box::pin(
+                super::antfly_backend::rollout_migration::remove_rollout_migration_skip(
+                    antfly,
+                    migration_id,
+                    rollout_path,
+                ),
+            )
+            .await;
+        }
         sqlx::query(
             r#"
 DELETE FROM rollout_migration_skipped_rollouts

@@ -19,6 +19,11 @@ futures = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
+sqlx-postgres = { workspace = true }
+# antfly-embedded enables sqlx-core's `offline` (Executor::describe); every
+# linked SQLx driver must enable it too, including the SQLite one sqlx pulls in.
+sqlx-sqlite = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
 tracing = { workspace = true }

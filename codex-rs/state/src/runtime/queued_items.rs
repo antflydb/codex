@@ -51,7 +51,9 @@ impl SqliteQueueStore {
     pub async fn change_version(&self) -> anyhow::Result<i64> {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
-            QueueBackend::Antfly(antfly) => return antfly_queue::change_version(antfly).await,
+            QueueBackend::Antfly(antfly) => {
+                return Box::pin(antfly_queue::change_version(antfly)).await;
+            }
         };
         let mut connection = Arc::clone(&self.change_version_connection)
             .lock_owned()
@@ -76,7 +78,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::changes_since(antfly, revision, thread_ids).await;
+                return Box::pin(antfly_queue::changes_since(antfly, revision, thread_ids)).await;
             }
         };
         if thread_ids.is_empty() {
@@ -109,7 +111,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::enqueue(antfly, thread_id, payload_json).await;
+                return Box::pin(antfly_queue::enqueue(antfly, thread_id, payload_json)).await;
             }
         };
         let now_ms = datetime_to_epoch_millis(Utc::now());
@@ -146,7 +148,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::list_page(antfly, thread_id, offset, limit).await;
+                return Box::pin(antfly_queue::list_page(antfly, thread_id, offset, limit)).await;
             }
         };
         let rows = sqlx::query(
@@ -174,7 +176,13 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::update(antfly, thread_id, item_id, payload_json).await;
+                return Box::pin(antfly_queue::update(
+                    antfly,
+                    thread_id,
+                    item_id,
+                    payload_json,
+                ))
+                .await;
             }
         };
         let row = sqlx::query(
@@ -198,7 +206,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::delete(antfly, thread_id, item_id).await;
+                return Box::pin(antfly_queue::delete(antfly, thread_id, item_id)).await;
             }
         };
         Ok(
@@ -216,7 +224,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::reorder(antfly, thread_id, ordered_ids).await;
+                return Box::pin(antfly_queue::reorder(antfly, thread_id, ordered_ids)).await;
             }
         };
         let mut transaction = pool.begin().await?;
@@ -261,7 +269,7 @@ impl SqliteQueueStore {
         let pool = match &self.backend {
             QueueBackend::Sqlite(pool) => pool,
             QueueBackend::Antfly(antfly) => {
-                return antfly_queue::delete_thread_queue(antfly, thread_id).await;
+                return Box::pin(antfly_queue::delete_thread_queue(antfly, thread_id)).await;
             }
         };
         Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")

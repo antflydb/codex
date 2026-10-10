@@ -330,7 +330,7 @@ core_test_support = { path = "core/tests/common" }
 # External
 age = "0.12.1"
 ansi-to-tui = "8.0.1"
-antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "ea4b19cb3dbd33feea8da997224a245ffeb4e758", features = ["libantfly"] }
+antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "551b8b3895efa62fb84c69670e876f25822f4fbb", features = ["libantfly", "sqlx"] }
 anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"
@@ -503,6 +503,8 @@ sqlx = { version = "=0.9.0", default-features = false, features = [
 sqlx-macros = { version = "=0.9.0", default-features = false, features = ["derive", "migrate"] }
 # Preserve the target driver's query-description support without building it on the host.
 sqlx-sqlite = { version = "=0.9.0", default-features = false, features = ["offline"] }
+# Remote Antfly SQL over the PostgreSQL wire protocol (codex-antfly only).
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["json", "offline"] }
 starlark = { version = "0.14.2", default-features = false }
 strum = "0.27.2"
 strum_macros = "0.28.0"

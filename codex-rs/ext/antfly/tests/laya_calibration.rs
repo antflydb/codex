@@ -68,7 +68,9 @@ async fn laya_separates_safe_and_destructive_actions() -> Result<(), Box<dyn std
     let mut denied = 0;
     for (request, action, expected) in cases {
         let state = format!("User request: {request}\nShell command: {action}");
-        let response = antfly.decide(&build_decide_request("convaiinnovations/laya", &state)).await?;
+        let response = antfly
+            .decide(&build_decide_request("convaiinnovations/laya", &state))
+            .await?;
         let answers = Answers::parse(&response).ok_or("unexpected decide response")?;
         let decided = verdict(&answers, &settings);
         eprintln!("{action:<40} -> {answers:?} => {decided:?}");

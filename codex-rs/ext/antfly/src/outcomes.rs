@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use codex_antfly::Write;
+use codex_antfly::schema;
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
@@ -66,7 +67,8 @@ impl ToolLifecycleContributor for OutcomeRecorder {
                 );
             }
             if let Err(err) = antfly
-                .write(vec![Write::put(pending.key, pending.doc)])
+                .documents(schema::APPROVALS)
+                .write(vec![Write::put(pending.id, pending.doc)])
                 .await
             {
                 tracing::warn!("failed to record approval outcome: {err}");

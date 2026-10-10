@@ -11,7 +11,10 @@ impl MemoryStore {
         let pool = match &self.backend {
             MemoryBackend::Sqlite { pool, .. } => pool,
             MemoryBackend::Antfly { antfly, version } => {
-                return antfly_memories::max_consolidated_thread_count(antfly, version).await;
+                return Box::pin(antfly_memories::max_consolidated_thread_count(
+                    antfly, version,
+                ))
+                .await;
             }
         };
         let count: i64 = sqlx::query_scalar(

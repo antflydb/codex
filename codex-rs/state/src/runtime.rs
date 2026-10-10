@@ -132,29 +132,18 @@ impl StateRuntime {
 
     /// Initializes the state runtime backed by Antfly instead of SQLite.
     ///
-    /// No SQLite file is ever created: `pool` and `logs_pool` (used only by
-    /// methods that exclusively serve `LocalThreadStore`, which never calls
-    /// into a Antfly-backed `StateRuntime`) are single-connection, migrated,
-    /// in-memory SQLite databases (`sqlite::memory:`), not files. Goals,
-    /// memories, and the queue are backed directly by `antfly` via
-    /// `GoalStore::new_antfly`/`MemoryStore::new_antfly`/
-    /// `SqliteQueueStore::new_antfly`. `get_thread`, `get_thread_memory_mode`,
-    /// `set_thread_preview_if_empty`, spawn edges, guardian feedback, remote
-    /// control, and external-agent imports are also Antfly-backed (see the
-    /// `self.antfly.is_some()` guard at the top of each such method); logs
-    /// are a no-op sink (tracing still writes to files, just not to a DB).
+    /// Every store uses Antfly's SQL and document tables (`codex_antfly::schema`);
+    /// logs are a no-op sink (tracing still writes its files). No SQLite
+    /// database exists: `pool` and `logs_pool` point at a file that is never
+    /// created, so a code path that still reaches SQLite fails loudly.
     pub async fn init_antfly(
         antfly: Arc<codex_antfly::Antfly>,
         default_provider: String,
     ) -> anyhow::Result<Arc<Self>> {
-        let pool = Arc::new(crate::sqlite::open_memory_pool(&runtime_state_migrator()).await?);
-        let logs_pool = match crate::sqlite::open_memory_pool(&runtime_logs_migrator()).await {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                pool.close().await;
-                return Err(err);
-            }
-        };
+        // Every store is Antfly-backed and logs are a no-op sink, so there is
+        // no SQLite database; a stray query fails instead of being lost.
+        let pool = Arc::new(crate::sqlite::unavailable_pool());
+        let logs_pool = Arc::new(crate::sqlite::unavailable_pool());
         let sqlite = SqliteConfig::from_sqlite_home(antfly_placeholder_home(&antfly)?);
         Ok(Arc::new(Self {
             reclamation: reclamation::SqliteReclamationWorker::noop(),
@@ -421,8 +410,7 @@ fn antfly_placeholder_home(
     antfly: &codex_antfly::Antfly,
 ) -> anyhow::Result<codex_utils_absolute_path::AbsolutePathBuf> {
     let path = match &antfly.config().backend {
-        codex_antfly::BackendConfig::Embedded { path }
-        | codex_antfly::BackendConfig::Replicated { path, .. } => path
+        codex_antfly::BackendConfig::Embedded { path } => path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| path.clone()),

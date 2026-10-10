@@ -6,12 +6,12 @@
 
 use std::collections::HashMap;
 
+use codex_antfly::schema;
 use codex_protocol::ThreadId;
 use serde_json::Value;
 
 use super::AntflyThreadStore;
 use super::internal;
-use super::keys;
 use super::listing::ListCursor;
 use super::record::ThreadRecord;
 use crate::SearchThreadsParams;
@@ -114,7 +114,8 @@ pub(super) async fn search_threads(
         .transpose()?;
     let hits = store
         .antfly()
-        .search_text(keys::ITEM_PREFIX, term, FULL_TEXT_LIMIT, SEMANTIC_LIMIT)
+        .documents(schema::HISTORY_ITEMS)
+        .search_text(term, None, FULL_TEXT_LIMIT, SEMANTIC_LIMIT)
         .await
         .map_err(internal)?;
 
@@ -122,16 +123,21 @@ pub(super) async fn search_threads(
     let mut snippets: HashMap<ThreadId, String> = HashMap::new();
     let mut order: Vec<ThreadId> = Vec::new();
     for hit in hits {
-        let Some((thread_id, _)) = keys::parse_item(&hit.key) else {
+        let Some(doc) = &hit.doc else {
+            continue;
+        };
+        let Some(thread_id) = doc
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .and_then(|id| ThreadId::from_string(id).ok())
+        else {
             continue;
         };
         if snippets.contains_key(&thread_id) {
             continue;
         }
-        let text = hit
-            .doc
-            .as_ref()
-            .and_then(|doc| doc.get(codex_antfly::SEARCH_TEXT_FIELD))
+        let text = doc
+            .get(codex_antfly::SEARCH_TEXT_FIELD)
             .and_then(Value::as_str)
             .unwrap_or_default();
         let snippet = excerpt(text, term);

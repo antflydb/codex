@@ -62,23 +62,24 @@ pub struct SearchHit {
     pub doc: Option<Value>,
 }
 
-/// Storage operations shared by the embedded and remote backends.
+/// Document storage shared by the embedded and remote backends. Every call
+/// names its table (see [`crate::schema`]).
 ///
 /// `write` is atomic: either every mutation in the call is applied or none
 /// is. Callers that read, modify, and write must serialize those sequences
-/// themselves (see [`crate::Antfly::lock`]).
+/// themselves (see [`crate::Antfly::lock`]) or use SQL tables instead.
 pub trait Backend: Send + Sync {
-    fn write(&self, writes: Vec<Write>) -> BackendFuture<'_, ()>;
+    fn write(&self, table: String, writes: Vec<Write>) -> BackendFuture<'_, ()>;
 
-    fn get(&self, key: String) -> BackendFuture<'_, Option<Value>>;
+    fn get(&self, table: String, key: String) -> BackendFuture<'_, Option<Value>>;
 
-    fn scan(&self, request: ScanRequest) -> BackendFuture<'_, Vec<Document>>;
+    fn scan(&self, table: String, request: ScanRequest) -> BackendFuture<'_, Vec<Document>>;
 
     /// Executes an Antfly `QueryRequest` and returns the merged hits.
-    fn search(&self, request: Value) -> BackendFuture<'_, Vec<SearchHit>>;
+    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>>;
 
-    /// Creates the table, indexes, and enrichments in `schema` when missing.
-    fn ensure_schema(&self, schema: SchemaSpec) -> BackendFuture<'_, ()>;
+    /// Creates the table, its indexes, and its enrichments when missing.
+    fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()>;
 
     /// Releases the backend's resources and resolves once they are released,
     /// including background work. Later calls fail.
@@ -96,10 +97,13 @@ pub struct DenseIndex {
     pub dims: u32,
 }
 
-/// Backend-neutral description of the indexes Codex needs. Full-text search
-/// over every field is always available.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SchemaSpec {
+/// A document table and the indexes Codex needs on it. Full-text search over
+/// every field is always available.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableSpec {
+    pub name: String,
+    /// `document_schemas` for a new table.
+    pub schema: Value,
     pub dense: Option<DenseIndex>,
 }
 

@@ -19,6 +19,34 @@ pub enum AntflyError {
     /// The backend does not support the requested operation.
     #[error("antfly backend does not support {0}")]
     Unsupported(&'static str),
+    /// A SQL statement failed; `code` is the SQLSTATE when the database
+    /// reported one.
+    #[error("antfly SQL failed ({}): {message}", code.as_deref().unwrap_or("no sqlstate"))]
+    Sql {
+        code: Option<String>,
+        message: String,
+    },
+}
+
+impl AntflyError {
+    /// SQLSTATE of a failed SQL statement.
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            AntflyError::Sql { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// A concurrent transaction committed first (40001); retry the whole
+    /// transaction.
+    pub fn is_conflict(&self) -> bool {
+        self.sqlstate() == Some("40001")
+    }
+
+    /// A UNIQUE or PRIMARY KEY constraint rejected the write (23505).
+    pub fn is_unique_violation(&self) -> bool {
+        self.sqlstate() == Some("23505")
+    }
 }
 
 pub type AntflyResult<T> = Result<T, AntflyError>;

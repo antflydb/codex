@@ -17,8 +17,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use codex_antfly::ScanRequest;
 use codex_antfly::Write;
+use codex_antfly::schema;
+use codex_antfly::sql_params;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
@@ -153,12 +154,15 @@ pub(super) async fn revert_thread(
 
     let documents = store
         .antfly()
-        .scan(ScanRequest::prefix(&keys::items_prefix(params.thread_id)))
+        .documents(schema::HISTORY_ITEMS)
+        .scan(codex_antfly::ScanRequest::prefix(
+            &keys::history_item_prefix(params.thread_id),
+        ))
         .await
         .map_err(internal)?;
     let mut entries = Vec::with_capacity(documents.len());
     for document in documents {
-        let Some((_, ordinal)) = keys::parse_item(&document.key) else {
+        let Some((_, ordinal)) = keys::parse_history_item_id(&document.key) else {
             continue;
         };
         let item = document
@@ -179,19 +183,26 @@ pub(super) async fn revert_thread(
     })?;
     let boundary_ordinal = entries[boundary].1;
 
-    let mut record = previous.clone();
+    let mut record = previous;
     record.next_ordinal = boundary_ordinal;
     if params.multi_agent_version.is_some() {
         record.created.multi_agent_version = params.multi_agent_version;
     }
 
-    let mut writes: Vec<Write> = entries
+    let deletes: Vec<Write> = entries
         .into_iter()
         .filter(|(_, ordinal, _)| *ordinal >= boundary_ordinal)
         .map(|(key, _, _)| Write::delete(key))
         .collect();
-    writes.extend(AntflyThreadStore::record_writes(Some(&previous), &record)?);
-    store.antfly().write(writes).await.map_err(internal)
+    if !deletes.is_empty() {
+        store
+            .antfly()
+            .documents(schema::HISTORY_ITEMS)
+            .write(deletes)
+            .await
+            .map_err(internal)?;
+    }
+    store.save_record(&record).await
 }
 
 async fn turn_doc(
@@ -199,11 +210,15 @@ async fn turn_doc(
     thread_id: ThreadId,
     turn_id: &str,
 ) -> ThreadStoreResult<Option<TurnDoc>> {
-    store
-        .antfly()
-        .get_as::<TurnDoc>(keys::turn_id_key(thread_id, turn_id))
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let row = sql
+        .fetch_optional(
+            "SELECT * FROM codex_thread_turns WHERE thread_id = $1 AND turn_id = $2",
+            sql_params![thread_id.to_string(), turn_id],
+        )
         .await
-        .map_err(internal)
+        .map_err(internal)?;
+    row.map(|row| TurnDoc::from_row(&row)).transpose()
 }
 
 /// The segment holding `turn_id` and its projected turn, searching newest
@@ -400,35 +415,47 @@ async fn revert_paginated(
 
     let documents = store
         .antfly()
-        .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
+        .documents(schema::HISTORY_ITEMS)
+        .scan(codex_antfly::ScanRequest::prefix(
+            &keys::history_item_prefix(thread_id),
+        ))
         .await
         .map_err(internal)?;
     let mut kept = Vec::new();
-    let mut writes = store.projection_delete_writes(thread_id).await?;
+    let mut deletes = Vec::new();
     for document in documents {
-        let Some((_, ordinal)) = keys::parse_item(&document.key) else {
+        let Some((_, ordinal)) = keys::parse_history_item_id(&document.key) else {
             continue;
         };
         if ordinal >= cut {
-            writes.push(Write::delete(document.key));
+            deletes.push(Write::delete(document.key));
         } else if let Some(item) = document.doc.get("item").cloned() {
             kept.push((ordinal, from_value::<RolloutItem>(item)?));
         }
     }
-    let mut record = previous.clone();
+    if !deletes.is_empty() {
+        store
+            .antfly()
+            .documents(schema::HISTORY_ITEMS)
+            .write(deletes)
+            .await
+            .map_err(internal)?;
+    }
+    store.projection_delete(thread_id).await?;
+
+    let mut record = previous;
     record.next_ordinal = cut;
     if params.multi_agent_version.is_some() {
         record.created.multi_agent_version = params.multi_agent_version;
     }
-    writes.extend(AntflyThreadStore::record_writes(Some(&previous), &record)?);
-    store.antfly().write(writes).await.map_err(internal)?;
+    store.save_record(&record).await?;
 
     // Rebuild the projection from the surviving items. Ordinals are
     // contiguous from the first kept record.
     if let Some((first, _)) = kept.first() {
         let first = *first;
         let items: Vec<RolloutItem> = kept.into_iter().map(|(_, item)| item).collect();
-        let rebuild = projection::build_writes(
+        projection::apply_batch(
             store,
             thread_id,
             record.created.subagent_history_start_ordinal,
@@ -437,7 +464,6 @@ async fn revert_paginated(
             Utc::now(),
         )
         .await?;
-        store.antfly().write(rebuild).await.map_err(internal)?;
     }
     Ok(())
 }

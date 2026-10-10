@@ -583,8 +583,9 @@ pub struct AntflyStoreToml {
     /// Remote Antfly or Antfly Cloud base URL. Alone it selects the remote
     /// backend; with `path` the local database replicates to it.
     pub url: Option<String>,
-    /// Remote table holding Codex state (default `codex`).
-    pub table: Option<String>,
+    /// PostgreSQL connection URL for the remote instance's SQL listener,
+    /// which holds Codex's relational tables.
+    pub sql_url: Option<String>,
     /// Environment variable holding the remote bearer token.
     pub api_key_env: Option<String>,
     /// Antfly inference models directory.
@@ -594,9 +595,6 @@ pub struct AntflyStoreToml {
     pub embedder_model: Option<String>,
     pub embedder_dims: Option<u32>,
     pub semantic_search: Option<bool>,
-    /// With both `path` and `url`, search the remote replica instead of the
-    /// local copy.
-    pub search_remote: Option<bool>,
     /// Typed-decision model used to review approvals (default
     /// `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).
     pub decide_model: Option<String>,

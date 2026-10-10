@@ -9,6 +9,7 @@ use sqlx::Sqlite;
 use uuid::Uuid;
 
 use super::StateRuntime;
+use super::antfly_backend::projects as antfly_projects;
 use crate::CreatedProject;
 use crate::Project;
 use crate::ProjectRoot;
@@ -27,6 +28,9 @@ impl StateRuntime {
         thread_id: &str,
         project_id: Option<&str>,
     ) -> anyhow::Result<Option<Option<String>>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::set_thread_project(antfly, thread_id, project_id).await;
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(project_id) = project_id {
             let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE id = ?")
@@ -65,6 +69,10 @@ impl StateRuntime {
         sort_key: ProjectSortKey,
         sort_direction: SortDirection,
     ) -> anyhow::Result<ProjectsPage> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::list_projects(antfly, cursor, limit, sort_key, sort_direction)
+                .await;
+        }
         let mut query = project_list_query(cursor, limit, sort_key, sort_direction)?;
         let rows = query.build().fetch_all(self.pool.as_ref()).await?;
         let mut projects: Vec<Project> = Vec::new();
@@ -90,6 +98,9 @@ impl StateRuntime {
     }
 
     pub async fn get_project(&self, id: &str) -> anyhow::Result<Option<Project>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::get_project(antfly, id).await;
+        }
         let mut tx = self.pool.begin().await?;
         let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
             .push(" WHERE id = ")
@@ -109,6 +120,9 @@ impl StateRuntime {
         &self,
         idempotency_key: &str,
     ) -> anyhow::Result<Option<Project>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::get_project_by_idempotency_key(antfly, idempotency_key).await;
+        }
         let mut tx = self.pool.begin().await?;
         let project_id = sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM project_idempotency_keys WHERE key = ?",
@@ -143,6 +157,18 @@ impl StateRuntime {
         thread_ids: &[String],
         idempotency_key: &str,
     ) -> anyhow::Result<CreatedProject> {
+        if let Some(antfly) = &self.antfly {
+            let (project, created) = antfly_projects::create_project(
+                antfly,
+                name,
+                roots,
+                metadata,
+                thread_ids,
+                idempotency_key,
+            )
+            .await?;
+            return Ok(CreatedProject { project, created });
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing_project_id = sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM project_idempotency_keys WHERE key = ?",
@@ -234,6 +260,9 @@ impl StateRuntime {
         roots: Option<Vec<ProjectRoot>>,
         metadata: Option<BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<(Project, bool)>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::update_project(antfly, id, name, roots, metadata).await;
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
             .push(" WHERE id = ")
@@ -291,6 +320,9 @@ impl StateRuntime {
         project_id: &str,
         before_project_id: Option<&str>,
     ) -> anyhow::Result<Option<bool>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::move_project(antfly, project_id, before_project_id).await;
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut project_ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM projects ORDER BY position ASC, id ASC",
@@ -340,6 +372,9 @@ impl StateRuntime {
         &self,
         id: &str,
     ) -> anyhow::Result<Option<(Vec<String>, Vec<String>)>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_projects::delete_project(antfly, id).await;
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE id = ?")
             .bind(id)
