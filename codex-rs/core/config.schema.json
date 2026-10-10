@@ -4391,10 +4391,6 @@
               "description": "PostgreSQL connection URL for the remote instance's SQL listener, which holds Codex's relational tables.",
               "type": "string"
             },
-            "table": {
-              "description": "Remote table holding Codex state (default `codex`).",
-              "type": "string"
-            },
             "type": {
               "enum": [
                 "antfly"

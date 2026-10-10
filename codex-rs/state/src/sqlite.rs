@@ -474,20 +474,20 @@ impl SqliteConfig {
 /// through a dangling or absent file. `max_connections(1)` is load-bearing:
 /// a second connection to `sqlite::memory:` would see an independent, empty
 /// database, so every caller must share this exact connection.
-pub(crate) async fn open_memory_pool(migrator: &Migrator) -> anyhow::Result<SqlitePool> {
+/// A pool for `StateRuntime` fields that have no SQLite database behind
+/// them (the Antfly backend). It connects lazily to a file that is never
+/// created, so any query fails loudly instead of reaching an in-memory
+/// database whose writes would be lost.
+pub(crate) fn unavailable_pool() -> SqlitePool {
     let options = SqliteConnectOptions::new()
-        .filename(":memory:")
-        .create_if_missing(true)
+        .filename("/nonexistent/codex-antfly-has-no-sqlite-database")
+        .create_if_missing(false)
+        .read_only(true)
         .log_statements(LevelFilter::Off);
-    let pool = SqlitePoolOptions::new()
+    SqlitePoolOptions::new()
         .max_connections(1)
-        .min_connections(1)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .connect_with(options)
-        .await?;
-    migrator.run(&pool).await?;
-    Ok(pool)
+        .min_connections(0)
+        .connect_lazy_with(options)
 }
 
 #[cfg(test)]

@@ -10,7 +10,6 @@ use tokio::sync::OnceCell;
 use crate::backend::Backend;
 use crate::backend::DenseIndex;
 use crate::backend::Document;
-use crate::backend::LEGACY_TABLE;
 use crate::backend::ScanRequest;
 use crate::backend::SearchHit;
 use crate::backend::TableSpec;
@@ -37,7 +36,6 @@ pub struct Antfly {
     /// open errors surface on the first operation instead.
     backend: OnceCell<Arc<dyn Backend>>,
     decider: OnceCell<Arc<LocalDecider>>,
-    schema: OnceCell<()>,
     /// Relational tables, migrated and with document tables created on
     /// first use.
     sql: OnceCell<Sql>,
@@ -87,15 +85,8 @@ fn open_backend(config: &BackendConfig) -> AntflyResult<Arc<dyn Backend>> {
     Ok(match config {
         BackendConfig::Embedded { path } => Arc::new(EmbeddedBackend::open(path)?),
         BackendConfig::Remote {
-            url,
-            table,
-            api_key_env,
-            ..
-        } => Arc::new(RemoteBackend::new(
-            url,
-            table,
-            api_key(api_key_env.as_ref())?,
-        )?),
+            url, api_key_env, ..
+        } => Arc::new(RemoteBackend::new(url, api_key(api_key_env.as_ref())?)?),
     })
 }
 
@@ -106,7 +97,6 @@ impl Antfly {
             config,
             backend: OnceCell::new(),
             decider: OnceCell::new(),
-            schema: OnceCell::new(),
             sql: OnceCell::new(),
             lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -145,156 +135,6 @@ impl Antfly {
     /// Holds the process-wide read-modify-write lock.
     pub async fn lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.lock).lock_owned().await
-    }
-
-    async fn ready(&self) -> AntflyResult<()> {
-        self.schema
-            .get_or_try_init(|| async {
-                let dense = self.config.embedder.as_ref().map(|embedder| DenseIndex {
-                    name: DENSE_INDEX_NAME.to_string(),
-                    field: SEARCH_TEXT_FIELD.to_string(),
-                    model: embedder.model.clone(),
-                    dims: embedder.dims,
-                });
-                self.backend()
-                    .await?
-                    .ensure_table(TableSpec {
-                        name: LEGACY_TABLE.to_string(),
-                        schema: Value::Null,
-                        dense,
-                    })
-                    .await
-            })
-            .await
-            .map(|_| ())
-    }
-
-    pub async fn write(&self, writes: Vec<Write>) -> AntflyResult<()> {
-        self.ready().await?;
-        self.backend()
-            .await?
-            .write(LEGACY_TABLE.to_string(), writes)
-            .await
-    }
-
-    pub async fn get(&self, key: impl Into<String>) -> AntflyResult<Option<Value>> {
-        self.backend()
-            .await?
-            .get(LEGACY_TABLE.to_string(), key.into())
-            .await
-    }
-
-    pub async fn get_as<T: serde::de::DeserializeOwned>(
-        &self,
-        key: impl Into<String>,
-    ) -> AntflyResult<Option<T>> {
-        match self.get(key).await? {
-            Some(doc) => Ok(Some(serde_json::from_value(strip_reserved(doc))?)),
-            None => Ok(None),
-        }
-    }
-
-    pub async fn scan(&self, request: ScanRequest) -> AntflyResult<Vec<Document>> {
-        self.backend()
-            .await?
-            .scan(LEGACY_TABLE.to_string(), request)
-            .await
-    }
-
-    /// Scans `prefix` and decodes each document as `T`.
-    pub async fn scan_as<T: serde::de::DeserializeOwned>(
-        &self,
-        request: ScanRequest,
-    ) -> AntflyResult<Vec<(String, T)>> {
-        let documents = self.scan(request).await?;
-        documents
-            .into_iter()
-            .map(|document| {
-                Ok((
-                    document.key,
-                    serde_json::from_value(strip_reserved(document.doc))?,
-                ))
-            })
-            .collect()
-    }
-
-    /// Full-text matches for `text` among documents under `prefix`.
-    pub async fn search_full_text(
-        &self,
-        prefix: &str,
-        text: &str,
-        limit: usize,
-    ) -> AntflyResult<Vec<SearchHit>> {
-        self.ready().await?;
-        self.backend()
-            .await?
-            .search(
-                LEGACY_TABLE.to_string(),
-                serde_json::json!({
-                    "full_text_search": {"match": {"field": SEARCH_TEXT_FIELD, "text": text}},
-                    "filter_prefix": prefix,
-                    "limit": limit,
-                }),
-            )
-            .await
-    }
-
-    /// Nearest neighbors of `text` among documents under `prefix`, or nothing
-    /// when no embedder is configured.
-    pub async fn search_semantic(
-        &self,
-        prefix: &str,
-        text: &str,
-        limit: usize,
-    ) -> AntflyResult<Vec<SearchHit>> {
-        if self.config.embedder.is_none() {
-            return Ok(Vec::new());
-        }
-        self.ready().await?;
-        self.backend()
-            .await?
-            .search(
-                LEGACY_TABLE.to_string(),
-                serde_json::json!({
-                    "semantic_search": text,
-                    "indexes": [DENSE_INDEX_NAME],
-                    "filter_prefix": prefix,
-                    "limit": limit,
-                }),
-            )
-            .await
-    }
-
-    /// Full-text matches followed by semantic neighbors not already matched.
-    /// Semantic failures degrade to full text only.
-    pub async fn search_text(
-        &self,
-        prefix: &str,
-        text: &str,
-        full_text_limit: usize,
-        semantic_limit: usize,
-    ) -> AntflyResult<Vec<SearchHit>> {
-        let mut hits = self.search_full_text(prefix, text, full_text_limit).await?;
-        if semantic_limit == 0 {
-            return Ok(hits);
-        }
-        match self.search_semantic(prefix, text, semantic_limit).await {
-            Ok(semantic) => {
-                let seen: std::collections::HashSet<String> =
-                    hits.iter().map(|hit| hit.key.clone()).collect();
-                hits.extend(semantic.into_iter().filter(|hit| !seen.contains(&hit.key)));
-            }
-            Err(err) => tracing::warn!("antfly semantic search failed, using full text: {err}"),
-        }
-        Ok(hits)
-    }
-
-    pub async fn search(&self, request: Value) -> AntflyResult<Vec<SearchHit>> {
-        self.ready().await?;
-        self.backend()
-            .await?
-            .search(LEGACY_TABLE.to_string(), request)
-            .await
     }
 
     fn dense_index(&self) -> Option<DenseIndex> {

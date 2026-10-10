@@ -27,9 +27,10 @@ struct Args {
     /// Import into a remote Antfly instance instead (base URL).
     #[arg(long)]
     url: Option<String>,
-    /// Remote table (default: codex).
+    /// PostgreSQL URL of the remote instance's SQL listener (required with
+    /// --url), e.g. postgres://codex:secret@host:5432/antfly.
     #[arg(long)]
-    table: Option<String>,
+    sql_url: Option<String>,
     /// Environment variable holding the remote bearer token.
     #[arg(long)]
     api_key_env: Option<String>,
@@ -109,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
             args.to.clone()
         },
         url: args.url.clone(),
-        table: args.table.clone(),
+        sql_url: args.sql_url.clone(),
         api_key_env: args.api_key_env.clone(),
         semantic_search: args.no_semantic.then_some(false),
         ..Default::default()

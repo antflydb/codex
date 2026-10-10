@@ -586,8 +586,6 @@ pub struct AntflyStoreToml {
     /// PostgreSQL connection URL for the remote instance's SQL listener,
     /// which holds Codex's relational tables.
     pub sql_url: Option<String>,
-    /// Remote table holding Codex state (default `codex`).
-    pub table: Option<String>,
     /// Environment variable holding the remote bearer token.
     pub api_key_env: Option<String>,
     /// Antfly inference models directory.

@@ -31,6 +31,7 @@ fn sql_round_trips_types_transactions_and_errors() -> Result<(), Box<dyn std::er
         config.embedder = None;
         let antfly = Antfly::open(config)?;
         antfly
+            .documents(codex_antfly::schema::HISTORY_ITEMS)
             .write(vec![Write::put("doc:1", json!({"text": "hello"}))])
             .await?;
         let sql = Sql::connect_embedded(&path, true).await?;
@@ -98,7 +99,13 @@ fn sql_round_trips_types_transactions_and_errors() -> Result<(), Box<dyn std::er
         assert!(duplicate.is_unique_violation(), "{duplicate}");
 
         // The document API still works next to the SQL pool.
-        assert_eq!(antfly.get("doc:1").await?, Some(json!({"text": "hello"})));
+        assert_eq!(
+            antfly
+                .documents(codex_antfly::schema::HISTORY_ITEMS)
+                .get("doc:1")
+                .await?,
+            Some(json!({"text": "hello"}))
+        );
         sql.close().await;
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())

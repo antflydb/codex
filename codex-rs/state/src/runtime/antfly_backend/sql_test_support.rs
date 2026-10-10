@@ -1,7 +1,6 @@
 //! Test harness for the SQL-backed Antfly stores: a `StateRuntime` opened
 //! with `init_antfly` on a fresh embedded database in a temp directory.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_antfly::Antfly;
@@ -13,14 +12,14 @@ use crate::StateRuntime;
 pub(crate) struct AntflyRuntime {
     pub(crate) runtime: Arc<StateRuntime>,
     pub(crate) antfly: Arc<Antfly>,
-    dir: PathBuf,
+    /// Removes the database directory on drop, even when a test panics.
+    _dir: tempfile::TempDir,
 }
 
 impl AntflyRuntime {
     pub(crate) async fn open() -> Self {
-        let dir = crate::runtime::test_support::unique_temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let mut config = codex_antfly::AntflyConfig::embedded(dir.join("codex.aflite"));
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
         config.embedder = None;
         let antfly = Arc::new(Antfly::new(config));
         let runtime = StateRuntime::init_antfly(Arc::clone(&antfly), "test-provider".to_string())
@@ -29,7 +28,7 @@ impl AntflyRuntime {
         Self {
             runtime,
             antfly,
-            dir,
+            _dir: dir,
         }
     }
 
@@ -52,10 +51,10 @@ impl AntflyRuntime {
             .expect("insert thread row");
     }
 
-    /// Closes the runtime and the database before removing its directory.
+    /// Closes the runtime and the database; dropping `self` removes the
+    /// directory.
     pub(crate) async fn close(self) {
         self.runtime.close().await;
         self.antfly.close().await.expect("close antfly");
-        let _ = tokio::fs::remove_dir_all(self.dir).await;
     }
 }

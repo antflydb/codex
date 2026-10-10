@@ -5,6 +5,7 @@ use codex_antfly::AntflyConfig;
 use codex_antfly::ScanRequest;
 use codex_antfly::Write;
 use codex_antfly::keys;
+use codex_antfly::schema;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -35,6 +36,7 @@ fn write_get_scan_delete() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     runtime().block_on(async {
         let antfly = open(&dir, false);
+        let docs = antfly.documents(schema::HISTORY_ITEMS);
         let writes = (0..5)
             .map(|i| {
                 Write::put(
@@ -44,31 +46,30 @@ fn write_get_scan_delete() -> Result<(), Box<dyn std::error::Error>> {
             })
             .chain([Write::put("item:t2:00000000000000000000", json!({"n": 99}))])
             .collect();
-        antfly.write(writes).await?;
+        docs.write(writes).await?;
 
         assert_eq!(
-            antfly.get("item:t1:00000000000000000003").await?,
+            docs.get("item:t1:00000000000000000003").await?,
             Some(json!({"n": 3}))
         );
-        assert_eq!(antfly.get("missing").await?, None);
+        assert_eq!(docs.get("missing").await?, None);
 
-        let docs = antfly.scan(ScanRequest::prefix("item:t1:")).await?;
-        let ns: Vec<i64> = docs.iter().filter_map(|d| d.doc["n"].as_i64()).collect();
+        let found = docs.scan(ScanRequest::prefix("item:t1:")).await?;
+        let ns: Vec<i64> = found.iter().filter_map(|d| d.doc["n"].as_i64()).collect();
         assert_eq!(ns, vec![0, 1, 2, 3, 4]);
 
-        let limited = antfly
+        let limited = docs
             .scan(ScanRequest::prefix("item:t1:").with_limit(2))
             .await?;
         assert_eq!(limited.len(), 2);
 
-        antfly
-            .write(vec![
-                Write::delete("item:t1:00000000000000000000"),
-                Write::put("item:t1:00000000000000000001", json!({"n": 10})),
-            ])
-            .await?;
-        let docs = antfly.scan(ScanRequest::prefix("item:t1:")).await?;
-        let ns: Vec<i64> = docs.iter().filter_map(|d| d.doc["n"].as_i64()).collect();
+        docs.write(vec![
+            Write::delete("item:t1:00000000000000000000"),
+            Write::put("item:t1:00000000000000000001", json!({"n": 10})),
+        ])
+        .await?;
+        let found = docs.scan(ScanRequest::prefix("item:t1:")).await?;
+        let ns: Vec<i64> = found.iter().filter_map(|d| d.doc["n"].as_i64()).collect();
         assert_eq!(ns, vec![10, 2, 3, 4]);
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
@@ -81,6 +82,7 @@ fn descending_keys_list_newest_first() -> Result<(), Box<dyn std::error::Error>>
     let dir = tempfile::tempdir()?;
     runtime().block_on(async {
         let antfly = open(&dir, false);
+        let docs = antfly.documents(schema::HISTORY_ITEMS);
         let writes = [100i64, 300, 200]
             .iter()
             .map(|ts| {
@@ -90,9 +92,9 @@ fn descending_keys_list_newest_first() -> Result<(), Box<dyn std::error::Error>>
                 )
             })
             .collect();
-        antfly.write(writes).await?;
-        let docs = antfly.scan(ScanRequest::prefix("recency:")).await?;
-        let ts: Vec<i64> = docs.iter().filter_map(|d| d.doc["ts"].as_i64()).collect();
+        docs.write(writes).await?;
+        let found = docs.scan(ScanRequest::prefix("recency:")).await?;
+        let ts: Vec<i64> = found.iter().filter_map(|d| d.doc["ts"].as_i64()).collect();
         assert_eq!(ts, vec![300, 200, 100]);
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
@@ -101,31 +103,32 @@ fn descending_keys_list_newest_first() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn full_text_search_scoped_by_prefix() -> Result<(), Box<dyn std::error::Error>> {
+fn full_text_search_filtered_by_declared_field() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     runtime().block_on(async {
         let antfly = open(&dir, false);
-        antfly
-            .write(vec![
-                Write::put(
-                    "turn:a",
-                    json!({"search_text": "fix the flaky raft snapshot test"}),
-                ),
-                Write::put(
-                    "turn:b",
-                    json!({"search_text": "write release notes for the cli"}),
-                ),
-                Write::put(
-                    "other:c",
-                    json!({"search_text": "raft snapshot outside the prefix"}),
-                ),
-            ])
-            .await?;
+        let docs = antfly.documents(schema::HISTORY_ITEMS);
+        docs.write(vec![
+            Write::put(
+                "a",
+                json!({"thread_id": "t1", "search_text": "fix the flaky raft snapshot test"}),
+            ),
+            Write::put(
+                "b",
+                json!({"thread_id": "t1", "search_text": "write release notes for the cli"}),
+            ),
+            Write::put(
+                "c",
+                json!({"thread_id": "t2", "search_text": "raft snapshot in another thread"}),
+            ),
+        ])
+        .await?;
+        let filter = json!({"term": {"thread_id": "t1"}});
         let mut hits = Vec::new();
         // Indexing is asynchronous; poll briefly.
         for _ in 0..50 {
-            hits = antfly
-                .search_full_text("turn:", "raft snapshot", 10)
+            hits = docs
+                .search_text("raft snapshot", Some(filter.clone()), 10, 0)
                 .await?;
             if !hits.is_empty() {
                 break;
@@ -133,7 +136,7 @@ fn full_text_search_scoped_by_prefix() -> Result<(), Box<dyn std::error::Error>>
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
-        assert_eq!(keys, vec!["turn:a"]);
+        assert_eq!(keys, vec!["a"]);
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
@@ -185,22 +188,23 @@ fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error
     let dir = tempfile::tempdir()?;
     runtime().block_on(async {
         let antfly = open(&dir, true);
-        antfly
-            .write(vec![
-                Write::put(
-                    "turn:a",
-                    json!({"search_text": "fix the flaky raft snapshot test"}),
-                ),
-                Write::put(
-                    "turn:b",
-                    json!({"search_text": "write release notes for the cli"}),
-                ),
-            ])
-            .await?;
+        let docs = antfly.documents(schema::HISTORY_ITEMS);
+        docs.write(vec![
+            Write::put(
+                "a",
+                json!({"search_text": "fix the flaky raft snapshot test"}),
+            ),
+            Write::put(
+                "b",
+                json!({"search_text": "write release notes for the cli"}),
+            ),
+        ])
+        .await?;
         let mut hits = Vec::new();
         for _ in 0..100 {
-            hits = antfly
-                .search_semantic("turn:", "consensus log compaction", 1)
+            // No lexical overlap: only the semantic leg can match.
+            hits = docs
+                .search_text("consensus log compaction", None, 10, 1)
                 .await?;
             if !hits.is_empty() {
                 break;
@@ -208,7 +212,7 @@ fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
-        assert_eq!(keys, vec!["turn:a"]);
+        assert_eq!(keys, vec!["a"]);
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

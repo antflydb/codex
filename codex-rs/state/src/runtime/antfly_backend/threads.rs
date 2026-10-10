@@ -1351,13 +1351,11 @@ mod tests {
     use crate::StateRuntime;
     use crate::ThreadRelationFilter;
     use crate::runtime::test_support::test_thread_metadata;
-    use crate::runtime::test_support::unique_temp_dir;
     use pretty_assertions::assert_eq;
 
-    async fn test_runtime() -> (std::sync::Arc<StateRuntime>, Arc<Antfly>, PathBuf) {
-        let dir = unique_temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let mut config = codex_antfly::AntflyConfig::embedded(dir.join("codex.aflite"));
+    async fn test_runtime() -> (std::sync::Arc<StateRuntime>, Arc<Antfly>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
         config.embedder = None;
         let antfly = Arc::new(Antfly::new(config));
         let runtime = StateRuntime::init_antfly(Arc::clone(&antfly), "test-provider".to_string())
@@ -1366,9 +1364,9 @@ mod tests {
         (runtime, antfly, dir)
     }
 
-    async fn cleanup(antfly: &Antfly, dir: PathBuf) {
+    async fn cleanup(antfly: &Antfly, dir: tempfile::TempDir) {
         antfly.close().await.expect("close antfly");
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        drop(dir);
     }
 
     fn thread_id(seed: u8) -> ThreadId {
@@ -1380,7 +1378,7 @@ mod tests {
     async fn upsert_and_get_thread_round_trips() {
         let (runtime, antfly, dir) = test_runtime().await;
         let id = thread_id(1);
-        let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+        let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
         runtime
             .upsert_thread(&metadata)
             .await
@@ -1419,7 +1417,7 @@ mod tests {
         let mut ids = Vec::new();
         for seed in 0..5u8 {
             let id = thread_id(seed);
-            let mut metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+            let mut metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
             metadata.updated_at += chrono::Duration::seconds(seed as i64);
             metadata.recency_at = metadata.updated_at;
             metadata.created_at = metadata.updated_at;
@@ -1487,7 +1485,7 @@ mod tests {
         let child = thread_id(11);
         let grandchild = thread_id(12);
         for id in [parent, child, grandchild] {
-            let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+            let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
             runtime
                 .upsert_thread(&metadata)
                 .await
@@ -1567,7 +1565,7 @@ mod tests {
         let a = thread_id(20);
         let b = thread_id(21);
         for id in [a, b] {
-            let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+            let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
             runtime
                 .upsert_thread(&metadata)
                 .await
@@ -1632,7 +1630,7 @@ mod tests {
     async fn projects_crud_round_trips() {
         let (runtime, antfly, dir) = test_runtime().await;
         let id = thread_id(30);
-        let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+        let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
         runtime
             .upsert_thread(&metadata)
             .await
@@ -1706,7 +1704,7 @@ mod tests {
     async fn attachments_add_list_remove() {
         let (runtime, antfly, dir) = test_runtime().await;
         let id = thread_id(40);
-        let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+        let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
         runtime
             .upsert_thread(&metadata)
             .await
@@ -1744,7 +1742,7 @@ mod tests {
     async fn git_info_and_paginated_promotion_round_trip() {
         let (runtime, antfly, dir) = test_runtime().await;
         let id = thread_id(60);
-        let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+        let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
         runtime
             .upsert_thread(&metadata)
             .await
@@ -1793,7 +1791,7 @@ mod tests {
     async fn delete_threads_strict_removes_everything() {
         let (runtime, antfly, dir) = test_runtime().await;
         let id = thread_id(50);
-        let metadata = test_thread_metadata(dir.as_path(), id, PathBuf::from("/work/repo"));
+        let metadata = test_thread_metadata(dir.path(), id, PathBuf::from("/work/repo"));
         runtime
             .upsert_thread(&metadata)
             .await

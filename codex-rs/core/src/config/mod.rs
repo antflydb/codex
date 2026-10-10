@@ -2548,7 +2548,6 @@ fn thread_store_config(
                 path: antfly.path,
                 url: antfly.url,
                 sql_url: antfly.sql_url,
-                table: antfly.table,
                 api_key_env: antfly.api_key_env,
                 models_dir: antfly.models_dir,
                 embedder_model: antfly.embedder_model,

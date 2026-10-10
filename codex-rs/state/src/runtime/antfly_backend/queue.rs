@@ -409,10 +409,9 @@ mod tests {
     use crate::SqliteQueueStore;
     use pretty_assertions::assert_eq;
 
-    async fn test_store() -> (SqliteQueueStore, Arc<Antfly>, std::path::PathBuf) {
-        let dir = crate::runtime::test_support::unique_temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let mut config = codex_antfly::AntflyConfig::embedded(dir.join("codex.aflite"));
+    async fn test_store() -> (SqliteQueueStore, Arc<Antfly>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
         config.embedder = None;
         let antfly = Arc::new(codex_antfly::Antfly::new(config));
         (
@@ -422,9 +421,9 @@ mod tests {
         )
     }
 
-    async fn cleanup(antfly: &Antfly, dir: std::path::PathBuf) {
+    async fn cleanup(antfly: &Antfly, dir: tempfile::TempDir) {
         antfly.close().await.expect("close antfly");
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        drop(dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

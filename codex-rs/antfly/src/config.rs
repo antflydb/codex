@@ -19,8 +19,6 @@ pub enum BackendConfig {
         /// PostgreSQL connection URL for the instance's SQL listener, for
         /// example `postgres://codex:secret@host:5432/antfly`.
         sql_url: Option<String>,
-        /// Table that held all Codex documents before per-store tables.
-        table: String,
         /// Environment variable that holds a bearer token, if any.
         api_key_env: Option<String>,
     },
@@ -105,7 +103,6 @@ pub struct AntflyTomlSettings {
     pub path: Option<PathBuf>,
     pub url: Option<String>,
     pub sql_url: Option<String>,
-    pub table: Option<String>,
     pub api_key_env: Option<String>,
     pub models_dir: Option<PathBuf>,
     pub embedder_model: Option<String>,
@@ -152,7 +149,6 @@ impl AntflyConfig {
     /// Applies defaults to settings read from `config.toml`.
     pub fn from_toml(settings: AntflyTomlSettings) -> Result<Self, AntflyError> {
         let local_path = settings.path.map(expand_home);
-        let table = settings.table.unwrap_or_else(|| "codex".to_string());
         let backend = match (settings.url, local_path) {
             (Some(_), Some(_)) => {
                 return Err(AntflyError::Config(
@@ -164,7 +160,6 @@ impl AntflyConfig {
             (Some(url), None) => BackendConfig::Remote {
                 url,
                 sql_url: settings.sql_url,
-                table,
                 api_key_env: settings.api_key_env,
             },
             (None, path) => BackendConfig::Embedded {

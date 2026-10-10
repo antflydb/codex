@@ -62,11 +62,6 @@ pub struct SearchHit {
     pub doc: Option<Value>,
 }
 
-/// Names the backend's original shared table. Stores that have not moved to
-/// their own tables still read and write it (the embedded root table, or the
-/// configured remote table).
-pub const LEGACY_TABLE: &str = "";
-
 /// Document storage shared by the embedded and remote backends. Every call
 /// names its table (see [`crate::schema`]).
 ///
@@ -106,9 +101,8 @@ pub struct DenseIndex {
 /// every field is always available.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSpec {
-    /// Table name, or [`LEGACY_TABLE`].
     pub name: String,
-    /// `document_schemas` for a new table; ignored for [`LEGACY_TABLE`].
+    /// `document_schemas` for a new table.
     pub schema: Value,
     pub dense: Option<DenseIndex>,
 }

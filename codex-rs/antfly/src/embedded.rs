@@ -21,7 +21,6 @@ use tokio::sync::oneshot;
 use crate::backend::Backend;
 use crate::backend::BackendFuture;
 use crate::backend::Document;
-use crate::backend::LEGACY_TABLE;
 use crate::backend::ScanRequest;
 use crate::backend::SearchHit;
 use crate::backend::TableSpec;
@@ -148,17 +147,13 @@ impl EmbeddedBackend {
         self.executor.run(move || f(&db)).await
     }
 
-    /// Runs `f` against `table`'s handle (the root table for
-    /// [`LEGACY_TABLE`]) on an executor thread.
+    /// Runs `f` against `table`'s handle on an executor thread.
     async fn call_in<T, F>(&self, table: String, f: F) -> AntflyResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&Database) -> AntflyResult<T> + Send + 'static,
     {
         self.call(move |db| {
-            if table == LEGACY_TABLE {
-                return f(db);
-            }
             let handle = db
                 .open_table(&table)
                 .map_err(|err| AntflyError::Embedded(format!("open table {table}: {err}")))?;
@@ -329,29 +324,26 @@ impl Backend for EmbeddedBackend {
     fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             let table = spec.name.clone();
-            if table != LEGACY_TABLE {
-                let marker = format!("table:{table}");
-                let known = self
-                    .known_indexes
-                    .lock()
-                    .map(|known| known.contains(&marker))
-                    .unwrap_or(false);
-                if !known {
-                    let schema = serde_json::to_vec(&spec.schema)?;
-                    let name = table.clone();
-                    self.call(move |db| {
-                        let tables =
-                            names(&db.list_tables_json().map_err(embedded("list tables"))?);
-                        if !tables.contains(&name) {
-                            db.create_table_json(&name, &schema)
-                                .map_err(embedded("create table"))?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                    if let Ok(mut known) = self.known_indexes.lock() {
-                        known.insert(marker);
+            let marker = format!("table:{table}");
+            let known = self
+                .known_indexes
+                .lock()
+                .map(|known| known.contains(&marker))
+                .unwrap_or(false);
+            if !known {
+                let schema = serde_json::to_vec(&spec.schema)?;
+                let name = table.clone();
+                self.call(move |db| {
+                    let tables = names(&db.list_tables_json().map_err(embedded("list tables"))?);
+                    if !tables.contains(&name) {
+                        db.create_table_json(&name, &schema)
+                            .map_err(embedded("create table"))?;
                     }
+                    Ok(())
+                })
+                .await?;
+                if let Ok(mut known) = self.known_indexes.lock() {
+                    known.insert(marker);
                 }
             }
             let Some(dense) = spec.dense else {

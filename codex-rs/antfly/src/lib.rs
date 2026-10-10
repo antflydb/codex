@@ -19,7 +19,6 @@ pub use backend::Backend;
 pub use backend::BackendFuture;
 pub use backend::DenseIndex;
 pub use backend::Document;
-pub use backend::LEGACY_TABLE;
 pub use backend::ScanRequest;
 pub use backend::SearchHit;
 pub use backend::TableSpec;
