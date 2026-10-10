@@ -379,9 +379,15 @@ impl Sql {
         reason = "the SQLite pool constructors are banned in favor of codex-state's shim; this pool is PostgreSQL's, not SQLite's"
     )]
     pub async fn connect_remote(url: &str) -> AntflyResult<Self> {
+        // Antfly's listener rejects startup settings it does not implement;
+        // do not send the optional `extra_float_digits` (antflydb/antfly#1062).
+        let options = url
+            .parse::<sqlx_postgres::PgConnectOptions>()
+            .map_err(sql_error)?
+            .extra_float_digits(None);
         let pool = PgPoolOptions::new()
             .max_connections(4)
-            .connect(url)
+            .connect_with(options)
             .await
             .map_err(sql_error)?;
         Ok(Self {

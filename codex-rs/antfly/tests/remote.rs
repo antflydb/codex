@@ -1,6 +1,7 @@
 //! Exercises the remote backend against a running Antfly server. Set
 //! `ANTFLY_TEST_URL` (for example `http://127.0.0.1:8080`) to run, and
-//! `ANTFLY_TEST_SQL_URL` (its PostgreSQL listener) for SQL tables.
+//! `ANTFLY_TEST_SQL_URL` (its PostgreSQL listener) for SQL tables, and
+//! `ANTFLY_TEST_API_KEY` when the server requires authentication.
 
 use codex_antfly::Antfly;
 use codex_antfly::AntflyConfig;
@@ -18,7 +19,10 @@ fn remote() -> Option<Antfly> {
         backend: BackendConfig::Remote {
             url,
             sql_url: std::env::var("ANTFLY_TEST_SQL_URL").ok(),
-            api_key_env: None,
+            // Bearer token (an API key's `encoded` value) for servers
+            // started with `--auth true`.
+            api_key_env: std::env::var_os("ANTFLY_TEST_API_KEY")
+                .map(|_| "ANTFLY_TEST_API_KEY".to_string()),
         },
         models_dir: None,
         embedder: Some(EmbedderConfig::default()),

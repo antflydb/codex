@@ -8,12 +8,6 @@
 //! Antfly SQL has no BLOB type, so `record` holds the base64 of the opaque
 //! bytes and `record_bytes` their raw length, which the global byte budget
 //! sums exactly as SQLite summed `length(record)` over the BLOB.
-//!
-//! Known gap: Antfly rejects a single TEXT value between 1,000,000 and
-//! 1,400,000 characters and a transaction writing between 1.5 and 2 MiB
-//! (SQLSTATE 54000, "The statement exceeds the supported work, result, or
-//! mutation limit."), so records above roughly 750 KiB (1 MB of base64)
-//! fail here although SQLite accepts up to `MAX_GUARDIAN_REVIEW_BYTES`.
 
 use std::sync::Arc;
 
@@ -21,7 +15,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_antfly::Antfly;
 use codex_antfly::sql::SqlRow;
-use codex_antfly::sql::SqlTx;
 use codex_antfly::sql_params;
 use codex_protocol::ThreadId;
 
@@ -37,17 +30,6 @@ fn record_from_row(row: &SqlRow) -> anyhow::Result<GuardianReviewRecord> {
         thread_id: ThreadId::from_string(&row.string("thread_id").map_err(internal)?)?,
         record: STANDARD.decode(super::text_column(row, "record").map_err(internal)?)?,
     })
-}
-
-async fn delete_ids(tx: &mut SqlTx, ids: &[String]) -> codex_antfly::AntflyResult<()> {
-    for id in ids {
-        tx.execute(
-            "DELETE FROM codex_guardian_review_feedback WHERE id = $1",
-            sql_params![id.as_str()],
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 pub(crate) async fn record_guardian_review_failure(
@@ -72,45 +54,27 @@ pub(crate) async fn record_guardian_review_failure(
             ],
         )
         .await?;
-        // Antfly rejects the SQLite statements' `ORDER BY ... OFFSET` and
-        // windowed derived table inside `DELETE ... WHERE id IN (subquery)`
-        // (SQLSTATE 54000, "exceeds the supported work, result, or mutation
-        // limit", even on an empty table), so select the evicted ids here
-        // and delete them by id. The table is capped, so both reads are small.
-        let per_thread_evicted = tx
-            .fetch_all(
-                "SELECT id FROM codex_guardian_review_feedback WHERE thread_id = $1 \
-                 ORDER BY id DESC OFFSET $2",
-                sql_params![
-                    record.thread_id.to_string(),
-                    MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD as i64
-                ],
-            )
-            .await?
-            .iter()
-            .map(|row| row.string("id"))
-            .collect::<codex_antfly::AntflyResult<Vec<_>>>()?;
-        delete_ids(&mut tx, &per_thread_evicted).await?;
-
-        // Global budget: newest first, evict past the row count or once the
-        // running sum of `record_bytes + 1` exceeds the byte budget.
-        let rows = tx
-            .fetch_all(
-                "SELECT id, record_bytes FROM codex_guardian_review_feedback ORDER BY id DESC",
-                vec![],
-            )
-            .await?;
-        let mut cumulative_bytes = 0_i64;
-        let mut globally_evicted = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            cumulative_bytes += row.i64("record_bytes")? + 1;
-            if index + 1 > MAX_GUARDIAN_REVIEW_RECORDS
-                || cumulative_bytes > MAX_GUARDIAN_REVIEW_BYTES as i64
-            {
-                globally_evicted.push(row.string("id")?);
-            }
-        }
-        delete_ids(&mut tx, &globally_evicted).await?;
+        tx.execute(
+            "DELETE FROM codex_guardian_review_feedback WHERE id IN \
+             (SELECT id FROM codex_guardian_review_feedback WHERE thread_id = $1 \
+              ORDER BY id DESC OFFSET $2)",
+            sql_params![
+                record.thread_id.to_string(),
+                MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD as i64
+            ],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM codex_guardian_review_feedback WHERE id IN \
+             (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS n, \
+              SUM(record_bytes + 1) OVER (ORDER BY id DESC) AS bytes \
+              FROM codex_guardian_review_feedback) AS ranked WHERE n > $1 OR bytes > $2)",
+            sql_params![
+                MAX_GUARDIAN_REVIEW_RECORDS as i64,
+                MAX_GUARDIAN_REVIEW_BYTES as i64
+            ],
+        )
+        .await?;
         Ok::<_, codex_antfly::AntflyError>(())
     }
     .await;
@@ -186,56 +150,20 @@ mod tests {
                 .map(|index| index.to_string().into_bytes())
                 .collect::<Vec<_>>(),
         );
-        // The SQLite test fills the byte budget with MAX_GUARDIAN_REVIEW_BYTES/3
-        // records, which exceed Antfly's per-value limit (see the module
-        // docs); twelve 700 KB records on separate threads cross the 8 MiB
-        // budget instead, evicting only the oldest.
-        let payload = vec![b' '; 700_000];
-        let mut big = Vec::new();
-        for _ in 0..12 {
-            let id = ThreadId::new();
-            harness.insert_thread(id).await;
+        let payload = vec![b' '; MAX_GUARDIAN_REVIEW_BYTES / 3];
+        for _ in 0..4 {
             state
                 .record_guardian_review_failure(&GuardianReviewRecord::new(id, payload.clone()))
                 .await?;
-            big.push(id);
         }
         assert_eq!(
             state
                 .list_guardian_review_records()
                 .await?
                 .into_iter()
-                .map(|record| (record.thread_id, record.record.len()))
+                .map(|record| (record.thread_id, record.record))
                 .collect::<Vec<_>>(),
-            big[1..]
-                .iter()
-                .map(|id| (*id, payload.len()))
-                .collect::<Vec<_>>(),
-        );
-        harness.close().await;
-        Ok(())
-    }
-
-    /// Documents the Antfly value-size gap: SQLite accepts this record.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn records_over_the_antfly_value_limit_are_rejected() -> anyhow::Result<()> {
-        let harness = AntflyRuntime::open().await;
-        let id = ThreadId::new();
-        harness.insert_thread(id).await;
-        let record = GuardianReviewRecord::new(id, vec![b' '; MAX_GUARDIAN_REVIEW_BYTES / 3]);
-        assert!(
-            harness
-                .runtime
-                .record_guardian_review_failure(&record)
-                .await
-                .is_err()
-        );
-        assert!(
-            harness
-                .runtime
-                .list_guardian_review_records()
-                .await?
-                .is_empty()
+            vec![(id, payload.clone()), (id, payload)],
         );
         harness.close().await;
         Ok(())
