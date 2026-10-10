@@ -21,21 +21,35 @@ implementation differs and why.
   `codex-thread-store` (`src/antfly/`) so it can reuse that crate's private
   helpers. The approval reviewer is `codex-rs/ext/antfly`
   (`codex_antfly_extension`).
-- **Storage model.** One Antfly table holds everything, as ordered key/value
-  documents rather than relational tables: a Lite handle is a single table
-  and embedded SQL is single-table autocommit. Secondary orderings are keys
-  (`keys::descending(ms)` for newest-first listings, ordinals for history).
-  Each `Antfly::write` is one atomic `batch_json`; read-modify-write
-  sequences hold the process-wide `Antfly::lock()`. Listing index entries
-  carry a snapshot of the thread record so a page needs no extra reads.
-- **Backends.** `Embedded` (in-process `libantfly` on 8 MiB-stack executor
-  threads), `Remote` (plain JSON over reqwest 0.12 to `/db/v1/tables/{t}/batch`,
-  `/documents`, `/query`, `/indexes/{name}`; the generated `antfly-sdk` would
-  pull in reqwest 0.13), and `Replicated`: a local `.aflite` whose writes are
-  queued in an `ob:` outbox in the same atomic batch and drained to the remote
-  in order with backoff, so Codex works offline and the remote catches up.
-  Config: `path` only → embedded; `url` only → remote; both → replicated
-  (`search_remote = true` searches the replica).
+- **Storage model.** Each kind of state has its own Antfly table
+  (`codex-rs/antfly/src/schema.rs`), in one embedded file or on one server:
+  - *Relational tables* (`codex_threads`, sections, projects, attachments,
+    spawn edges, the paginated-history projection, goals, the queue, memory
+    stage outputs and jobs, guardian feedback, remote control, imports,
+    backfill, rollout migration, the agent message board) are SQLite's schema
+    ported column for column and accessed through `codex_antfly::sql` with
+    PostgreSQL-style SQL. `codex_threads` is the single source of thread
+    metadata for both `AntflyThreadStore` and `StateRuntime`. SQLite's
+    triggers, `AUTOINCREMENT` revisions, and BLOBs are maintained by the
+    stores; compare-and-set uses `UPDATE … RETURNING` in READ COMMITTED
+    transactions retried on SQLSTATE 40001.
+  - *Document tables* hold the text Codex searches: `codex_history_items`
+    (raw rollout items, `{thread}:{ordinal}`), `codex_approvals`, and
+    `codex_memory_notes`, each with declared filter fields and full-text plus
+    (with an embedder) dense indexes over `search_text`.
+  - Migrations are idempotent statement lists recorded in
+    `codex_schema_migrations`; Antfly DDL is not transactional.
+  - On the Antfly backend `StateRuntime` has no SQLite database: its pool
+    fields point at a file that is never created, so a missed path fails
+    loudly. Logs are a no-op sink.
+- **Backends.** `Embedded` runs `libantfly` in-process: document calls on
+  8 MiB-stack executor threads, SQL through the Antfly SQLx driver on its own
+  connections to the same file (libantfly queues writers across handles).
+  `Remote` uses HTTP for document tables (`/db/v1/tables/{t}/batch`,
+  `/documents`, `/query`, `/indexes/{name}`) and the server's PostgreSQL wire
+  listener (`sql_url`, through `sqlx-postgres`) for relational tables, with
+  the same SQL. Config: `path` → embedded; `url` + `sql_url` → remote. The
+  replicated (outbox) backend was removed with the move to SQL tables.
 - **Search.** `search_threads` unions full-text matches with the top semantic
   neighbors (dense index over the `search_text` field, embedded by Antfly
   inference with `BAAI/bge-small-en-v1.5` by default), then sorts and pages by
@@ -61,7 +75,7 @@ implementation differs and why.
   contained, and P(destructive) < 0.20; deny when P(destructive) ≥ 0.80;
   otherwise defer to Guardian and the user. `approvals.mode` defaults to
   `off`; run `shadow` first. Decisions and observed tool outcomes are stored
-  under `approval:` for calibration and as precedents.
+  in `codex_approvals` for calibration and as precedents.
 
 ### Antfly findings
 
@@ -77,6 +91,15 @@ implementation differs and why.
   `6ade0769b4`). Against that build, Laya and OpenDecider-nano both classify
   `git log` as `none` and `rm -rf /` as `destructive`. Build `libantfly` from
   that commit or later.
+- Found while moving to tables, fixed on Antfly main: multi-table catalog,
+  catalog DDL and `antfly_search` in embedded SQL (#1034, #1044 → #1037,
+  #1053), independent writers on one file (#1042), boolean partial-index
+  predicates and a ~30 s `antfly_db_close` stall stopping embedded inference
+  (#1054, #1055, both fixed by #1056), and EmbeddingGemma 2 pulls (#1043). Open:
+  antflydb/antfly#1057 lists the SQL gaps the stores work around (`CHECK
+  … IN`, `strpos`, `LIKE … ESCAPE`, correlated scalar subqueries, `54000` on
+  derived tables, a misreported NOT NULL error, and 2 MiB statement and
+  transaction limits that cap guardian records below SQLite's 8 MiB).
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes
@@ -87,17 +110,18 @@ implementation differs and why.
 
 ### Status
 
-All phases are implemented on `antfly/integration`.
+All phases are implemented on `antfly/tables` (tables) on top of
+`antfly/integration` (the original key-value layout).
 
 | Phase | State |
 | --- | --- |
 | 0 Antfly prerequisites | Laya checkpoint prepared from a pinned revision, dense index + enrichment over `search_text`. The backend uses the embedded document, index and decision APIs already on Antfly main; `Database::sql_json` (antflydb/antfly#1032) turned out not to be needed |
-| 1 Thread store | `AntflyThreadStore`: lifecycle with lazy materialization, Legacy and Paginated history (projection of turns/items/realtime in the same write as items), `list_turns`/`list_items`/`list_timeline`, listing with local cursor formats, hybrid `search_threads`, literal `search_thread_occurrences`, sections (Pinned seeded), attachments, projects, fork/revert for both modes (forks reference their source through `history_base`; deleting or reverting history a fork inherits is refused) |
-| 2 Other seams | Antfly agent message board (with thread-deletion cleanup) and Antfly memories backend (hybrid search over notes, filesystem stays the source of truth) |
-| 3 StateRuntime on Antfly | `StateRuntime::init_antfly`; goals, memory jobs and leases, queue (same error shapes as SQLite), guardian feedback, remote control, external imports, spawn edges and the thread-metadata adapter on Antfly; logs are no-ops; startup builds it through `rollout::state_db` when the store is Antfly |
+| 1 Thread store | `AntflyThreadStore` over `codex_threads` and the relational thread tables plus `codex_history_items`: lifecycle with lazy materialization, Legacy and Paginated history (turns/items/realtime projected in the same transaction as items), `list_turns`/`list_items`/`list_timeline`, SQL keyset listing with local cursor formats, hybrid `search_threads`, literal `search_thread_occurrences`, sections (Pinned seeded), attachments, projects, fork/revert for both modes |
+| 2 Other seams | Agent message board on relational tables; memories backend on `codex_memory_notes` (hybrid search, filesystem stays the source of truth) |
+| 3 StateRuntime on Antfly | `StateRuntime::init_antfly`: every method (≈100, including the thread, project, section, attachment, backfill and rollout-migration methods that previously ran on an in-memory SQLite pool) uses the Antfly tables; no SQLite database exists |
 | 4 Laya approvals | reviewer, latest-request capture, outcome recorder, calibrated verdicts (see above) |
 | 5 Migration | `codex-antfly-import`: plans from rollout headers plus read-only SQLite metadata, flattens fork/revert lineages, streams one thread at a time, chunked writes, `--since`/`--limit`/`--dry-run`/`--replace`/`--search` |
-| 6 Remote | remote and replicated (outbox) backends, tested against `antfly standalone` |
+| 6 Remote | HTTP document tables plus SQL over the PostgreSQL wire (`sql_url`); the replicated backend was removed |
 
 Acceptance gate: `app-server/tests/suite/v2/antfly_thread_store.rs` runs a fresh
 `CODEX_HOME` through thread start, a turn against a mock model, listing, and
@@ -105,10 +129,6 @@ deletion, and asserts no `*.sqlite` files and no rollout directories appear.
 
 Known limitations:
 
-- About 60 `StateRuntime` methods that only serve the local thread store run
-  against a migrated in-memory SQLite pool (`sqlite::memory:`) on the Antfly
-  backend instead of being individually reimplemented. No SQLite files are
-  created, but the engine is still linked and initialized.
 - antflydb/antfly#1015 (a transient `WouldBlock` in full-text catch-up
   killing the derived worker, after which every write failed with
   `ANTFLY_INTERNAL`) no longer reproduces on Antfly `84dfbf5a95`: 0 errors
@@ -117,14 +137,19 @@ Known limitations:
   databases with `Antfly::close()` before removing their directories.
 - Approval review defaults to `off`. Laya's zero-shot probabilities are only
   moderately separated; collect shadow-mode decisions and outcomes (stored
-  under `approval:`) before enforcing, and consider fine-tuning on them.
+  in `codex_approvals`) before enforcing, and consider fine-tuning on them.
 - The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
   full import takes hours on a debug build. Imported forks and reverts are
   flattened into self-contained threads.
-- The remote backend was tested against a local `antfly standalone`, not
-  Antfly Cloud's proxy.
+- The SQL-over-PostgreSQL-wire path of the remote backend compiles and has a
+  test (`antfly/tests/remote.rs`, set `ANTFLY_TEST_URL` and
+  `ANTFLY_TEST_SQL_URL`) but has not yet been run against a live
+  `antfly standalone`; Antfly Cloud's proxy does not expose the PostgreSQL
+  listener.
+- Guardian review records are capped by Antfly's 2 MiB statement limit
+  (antflydb/antfly#1057), well below SQLite's 8 MiB.
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `ea4b19cb3d` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `551b8b3895` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -132,7 +157,8 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `ea4b19cb3d`; bump `rev` together
+  `github.com/antflydb/antfly` pinned to `551b8b3895` (with the `sqlx`
+  feature); bump `rev` together
   with the `libantfly` build.
 
 ## Goals
@@ -322,7 +348,8 @@ is registered before `codex_guardian_v2::install`
 type = "antfly"
 backend = "embedded"                 # or "remote"
 path = "~/.codex/antfly.aflite"      # embedded
-# url = "https://<host>/cloud/v1/<instance_id>"   # remote
+# url = "https://<host>/cloud/v1/<instance_id>"   # remote documents (HTTP)
+# sql_url = "postgres://codex:secret@<host>:5432/antfly"  # remote SQL tables
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
 decide_model = "convaiinnovations/laya"
