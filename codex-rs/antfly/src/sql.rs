@@ -206,7 +206,7 @@ impl SqlRow {
 fn sql_error(error: sqlx::Error) -> AntflyError {
     match error {
         sqlx::Error::Database(database) => AntflyError::Sql {
-            code: database.code().map(|code| code.into_owned()),
+            code: database.code().map(std::borrow::Cow::into_owned),
             message: database.message().to_string(),
         },
         sqlx::Error::RowNotFound => AntflyError::Sql {
@@ -352,6 +352,10 @@ pub struct Sql {
 impl Sql {
     /// Opens connections on an embedded `.aflite` file. libantfly queues
     /// writers fairly, so this can share the file with a `Database` handle.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the SQLite pool constructors are banned in favor of codex-state's shim; this pool is Antfly's, not SQLite's"
+    )]
     pub async fn connect_embedded(
         path: impl Into<std::path::PathBuf>,
         no_sync: bool,
@@ -369,6 +373,10 @@ impl Sql {
 
     /// Opens connections to a remote Antfly PostgreSQL wire listener, e.g.
     /// `postgres://user:password@127.0.0.1:5432/antfly`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the SQLite pool constructors are banned in favor of codex-state's shim; this pool is PostgreSQL's, not SQLite's"
+    )]
     pub async fn connect_remote(url: &str) -> AntflyResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(4)

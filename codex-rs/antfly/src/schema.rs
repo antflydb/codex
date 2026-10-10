@@ -10,9 +10,8 @@
 //!
 //! Antfly SQL has no triggers, sequences, or BLOB type, so the SQLite schema's
 //! timestamp triggers, `AUTOINCREMENT` revisions, and BLOB records are
-//! maintained by the stores, partial indexes compare booleans explicitly
-//! (`archived = false`; see antflydb/antfly#1054), and CHECK constraints spell
-//! out `IN` lists with `OR`, which Antfly CHECK expressions do not yet accept.
+//! maintained by the stores, and CHECK constraints spell out `IN` lists with
+//! `OR`, which Antfly CHECK expressions do not yet accept.
 
 use crate::error::AntflyError;
 use crate::error::AntflyResult;
