@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -9,9 +9,10 @@ use serde_json::json;
 use crate::backend::Backend;
 use crate::backend::BackendFuture;
 use crate::backend::Document;
+use crate::backend::LEGACY_TABLE;
 use crate::backend::ScanRequest;
-use crate::backend::SchemaSpec;
 use crate::backend::SearchHit;
+use crate::backend::TableSpec;
 use crate::backend::Write;
 use crate::backend::parse_search_hits;
 use crate::error::AntflyError;
@@ -19,15 +20,16 @@ use crate::error::AntflyResult;
 
 /// A remote Antfly server or Antfly Cloud instance.
 ///
-/// All Codex state lives in one table. `write` uses the table batch endpoint,
-/// which applies a request's inserts and deletes together for a single-range
-/// table.
+/// Document tables are addressed by name; [`LEGACY_TABLE`] maps to the
+/// configured table. `write` uses the table batch endpoint, which applies a
+/// request's inserts and deletes together for a single-range table.
 pub struct RemoteBackend {
     client: reqwest::Client,
     base_url: String,
     table: String,
     api_key: Option<String>,
-    table_ready: AtomicBool,
+    /// Tables known to exist.
+    ready_tables: Mutex<HashSet<String>>,
 }
 
 impl RemoteBackend {
@@ -40,15 +42,20 @@ impl RemoteBackend {
             base_url: base_url.trim_end_matches('/').to_string(),
             table: table.to_string(),
             api_key,
-            table_ready: AtomicBool::new(false),
+            ready_tables: Mutex::new(HashSet::new()),
         })
     }
 
-    fn table_url(&self, suffix: &str) -> String {
+    fn table_url(&self, table: &str, suffix: &str) -> String {
+        let table = if table == LEGACY_TABLE {
+            self.table.as_str()
+        } else {
+            table
+        };
         format!(
             "{}/db/v1/tables/{}{suffix}",
             self.base_url,
-            encode_path_segment(&self.table)
+            encode_path_segment(table)
         )
     }
 
@@ -76,18 +83,28 @@ impl RemoteBackend {
         Err(AntflyError::Remote(format!("{status}: {body}")))
     }
 
-    async fn ensure_table(&self) -> AntflyResult<()> {
-        if self.table_ready.load(Ordering::Acquire) {
+    async fn ensure_table_exists(&self, table: &str, schema: &Value) -> AntflyResult<()> {
+        if self
+            .ready_tables
+            .lock()
+            .map(|ready| ready.contains(table))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         let response = self
-            .send(self.request(reqwest::Method::GET, self.table_url("")))
+            .send(self.request(reqwest::Method::GET, self.table_url(table, "")))
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
+            let body = if table == LEGACY_TABLE {
+                json!({})
+            } else {
+                json!({ "schema": schema })
+            };
             let created = self
                 .send(
-                    self.request(reqwest::Method::POST, self.table_url(""))
-                        .json(&json!({})),
+                    self.request(reqwest::Method::POST, self.table_url(table, ""))
+                        .json(&body),
                 )
                 .await?;
             // A concurrent creator may win; that is fine.
@@ -97,7 +114,18 @@ impl RemoteBackend {
         } else {
             Self::checked(response).await?;
         }
-        self.table_ready.store(true, Ordering::Release);
+        if let Ok(mut ready) = self.ready_tables.lock() {
+            ready.insert(table.to_string());
+        }
+        Ok(())
+    }
+
+    /// The legacy table is created on first use; named tables are created by
+    /// [`Backend::ensure_table`] before use.
+    async fn ensure_legacy(&self, table: &str) -> AntflyResult<()> {
+        if table == LEGACY_TABLE {
+            self.ensure_table_exists(table, &Value::Null).await?;
+        }
         Ok(())
     }
 }
@@ -116,12 +144,12 @@ fn encode_path_segment(segment: &str) -> String {
 }
 
 impl Backend for RemoteBackend {
-    fn write(&self, writes: Vec<Write>) -> BackendFuture<'_, ()> {
+    fn write(&self, table: String, writes: Vec<Write>) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             if writes.is_empty() {
                 return Ok(());
             }
-            self.ensure_table().await?;
+            self.ensure_legacy(&table).await?;
             // Later writes to the same key win, matching embedded batches.
             let mut inserts = BTreeMap::new();
             let mut deletes = BTreeMap::new();
@@ -144,7 +172,7 @@ impl Backend for RemoteBackend {
             });
             let response = self
                 .send(
-                    self.request(reqwest::Method::POST, self.table_url("/batch"))
+                    self.request(reqwest::Method::POST, self.table_url(&table, "/batch"))
                         .json(&body),
                 )
                 .await?;
@@ -153,10 +181,10 @@ impl Backend for RemoteBackend {
         })
     }
 
-    fn get(&self, key: String) -> BackendFuture<'_, Option<Value>> {
+    fn get(&self, table: String, key: String) -> BackendFuture<'_, Option<Value>> {
         Box::pin(async move {
-            self.ensure_table().await?;
-            let url = self.table_url(&format!("/documents/{}", encode_path_segment(&key)));
+            self.ensure_legacy(&table).await?;
+            let url = self.table_url(&table, &format!("/documents/{}", encode_path_segment(&key)));
             let response = self.send(self.request(reqwest::Method::GET, url)).await?;
             if response.status() == StatusCode::NOT_FOUND {
                 return Ok(None);
@@ -170,9 +198,9 @@ impl Backend for RemoteBackend {
         })
     }
 
-    fn scan(&self, request: ScanRequest) -> BackendFuture<'_, Vec<Document>> {
+    fn scan(&self, table: String, request: ScanRequest) -> BackendFuture<'_, Vec<Document>> {
         Box::pin(async move {
-            self.ensure_table().await?;
+            self.ensure_legacy(&table).await?;
             let body = json!({
                 "from": request.from,
                 "to": request.to,
@@ -182,7 +210,7 @@ impl Backend for RemoteBackend {
             });
             let response = self
                 .send(
-                    self.request(reqwest::Method::POST, self.table_url("/documents"))
+                    self.request(reqwest::Method::POST, self.table_url(&table, "/documents"))
                         .json(&body),
                 )
                 .await?;
@@ -207,12 +235,12 @@ impl Backend for RemoteBackend {
         })
     }
 
-    fn search(&self, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
+    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
         Box::pin(async move {
-            self.ensure_table().await?;
+            self.ensure_legacy(&table).await?;
             let response = self
                 .send(
-                    self.request(reqwest::Method::POST, self.table_url("/query"))
+                    self.request(reqwest::Method::POST, self.table_url(&table, "/query"))
                         .json(&request),
                 )
                 .await?;
@@ -225,13 +253,17 @@ impl Backend for RemoteBackend {
         })
     }
 
-    fn ensure_schema(&self, schema: SchemaSpec) -> BackendFuture<'_, ()> {
+    fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()> {
         Box::pin(async move {
-            self.ensure_table().await?;
-            let Some(dense) = schema.dense else {
+            let table = spec.name.clone();
+            self.ensure_table_exists(&table, &spec.schema).await?;
+            let Some(dense) = spec.dense else {
                 return Ok(());
             };
-            let url = self.table_url(&format!("/indexes/{}", encode_path_segment(&dense.name)));
+            let url = self.table_url(
+                &table,
+                &format!("/indexes/{}", encode_path_segment(&dense.name)),
+            );
             let existing = self
                 .send(self.request(reqwest::Method::GET, url.clone()))
                 .await?;

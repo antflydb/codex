@@ -271,17 +271,25 @@ dependencies = [
 [[package]]
 name = "antfly-embedded"
 version = "0.1.0"
-source = "git+https://github.com/antflydb/antfly?rev=ea4b19cb3dbd33feea8da997224a245ffeb4e758#ea4b19cb3dbd33feea8da997224a245ffeb4e758"
+source = "git+https://github.com/antflydb/antfly?rev=f599f36da5334e526bc819d6be2828314ddbd8a9#f599f36da5334e526bc819d6be2828314ddbd8a9"
 dependencies = [
  "antfly-embedded-sys",
+ "async-stream",
+ "either",
+ "futures-core",
+ "futures-util",
+ "log",
  "serde",
  "serde_json",
+ "sqlx-core",
+ "tokio",
+ "url",
 ]
 
 [[package]]
 name = "antfly-embedded-sys"
 version = "0.1.0"
-source = "git+https://github.com/antflydb/antfly?rev=ea4b19cb3dbd33feea8da997224a245ffeb4e758#ea4b19cb3dbd33feea8da997224a245ffeb4e758"
+source = "git+https://github.com/antflydb/antfly?rev=f599f36da5334e526bc819d6be2828314ddbd8a9#f599f36da5334e526bc819d6be2828314ddbd8a9"
 dependencies = [
  "pkg-config",
 ]
@@ -2042,6 +2050,9 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sqlx",
+ "sqlx-postgres",
+ "sqlx-sqlite",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

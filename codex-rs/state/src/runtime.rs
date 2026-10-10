@@ -421,8 +421,7 @@ fn antfly_placeholder_home(
     antfly: &codex_antfly::Antfly,
 ) -> anyhow::Result<codex_utils_absolute_path::AbsolutePathBuf> {
     let path = match &antfly.config().backend {
-        codex_antfly::BackendConfig::Embedded { path }
-        | codex_antfly::BackendConfig::Replicated { path, .. } => path
+        codex_antfly::BackendConfig::Embedded { path } => path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| path.clone()),

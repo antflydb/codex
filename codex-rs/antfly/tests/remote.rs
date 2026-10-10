@@ -1,5 +1,6 @@
 //! Exercises the remote backend against a running Antfly server. Set
-//! `ANTFLY_TEST_URL` (for example `http://127.0.0.1:8080`) to run.
+//! `ANTFLY_TEST_URL` (for example `http://127.0.0.1:8080`) to run, and
+//! `ANTFLY_TEST_SQL_URL` (its PostgreSQL listener) for SQL tables.
 
 use codex_antfly::Antfly;
 use codex_antfly::AntflyConfig;
@@ -16,6 +17,7 @@ fn remote() -> Option<Antfly> {
     Some(Antfly::new(AntflyConfig {
         backend: BackendConfig::Remote {
             url,
+            sql_url: std::env::var("ANTFLY_TEST_SQL_URL").ok(),
             table,
             api_key_env: None,
         },
@@ -72,61 +74,5 @@ async fn remote_round_trip() -> Result<(), Box<dyn std::error::Error>> {
 
     antfly.write(vec![Write::delete("item:t1:2")]).await?;
     assert_eq!(antfly.get("item:t1:2").await?, None);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replicated_writes_reach_remote() -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::Arc;
-
-    use codex_antfly::Backend;
-    use codex_antfly::EmbeddedBackend;
-    use codex_antfly::RemoteBackend;
-    use codex_antfly::ReplicatedBackend;
-
-    let Ok(url) = std::env::var("ANTFLY_TEST_URL") else {
-        eprintln!("skipping: ANTFLY_TEST_URL is not set");
-        return Ok(());
-    };
-    let dir = tempfile::tempdir()?;
-    let table = format!("codex_replica_{}", std::process::id());
-    let local: Arc<dyn Backend> = Arc::new(EmbeddedBackend::open(&dir.path().join("l.aflite"))?);
-    let remote_backend: Arc<dyn Backend> = Arc::new(RemoteBackend::new(&url, &table, None)?);
-    // An unreachable remote: writes still succeed locally and queue up.
-    let offline: Arc<dyn Backend> =
-        Arc::new(RemoteBackend::new("http://127.0.0.1:9", &table, None)?);
-    let replicated = ReplicatedBackend::new(Arc::clone(&local), offline, false);
-    replicated
-        .write(vec![Write::put("doc:1", json!({"n": 1}))])
-        .await?;
-    assert_eq!(
-        replicated.get("doc:1".to_string()).await?,
-        Some(json!({"n": 1}))
-    );
-    assert!(
-        replicated.flush().await.is_err(),
-        "offline remote must not drain"
-    );
-    drop(replicated);
-
-    // Reconnect to the real remote; the queued write and a new one drain in order.
-    let replicated = ReplicatedBackend::new(Arc::clone(&local), Arc::clone(&remote_backend), false);
-    replicated
-        .write(vec![
-            Write::put("doc:2", json!({"n": 2})),
-            Write::delete("doc:1"),
-        ])
-        .await?;
-    replicated.flush().await?;
-    assert_eq!(remote_backend.get("doc:1".to_string()).await?, None);
-    assert_eq!(
-        remote_backend.get("doc:2".to_string()).await?,
-        Some(json!({"n": 2}))
-    );
-    assert!(
-        local.scan(ScanRequest::prefix("ob:")).await?.is_empty(),
-        "outbox drained"
-    );
-    replicated.close().await?;
     Ok(())
 }

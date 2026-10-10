@@ -21,9 +21,10 @@ use tokio::sync::oneshot;
 use crate::backend::Backend;
 use crate::backend::BackendFuture;
 use crate::backend::Document;
+use crate::backend::LEGACY_TABLE;
 use crate::backend::ScanRequest;
-use crate::backend::SchemaSpec;
 use crate::backend::SearchHit;
+use crate::backend::TableSpec;
 use crate::backend::Write;
 use crate::backend::parse_search_hits;
 use crate::error::AntflyError;
@@ -146,6 +147,25 @@ impl EmbeddedBackend {
             .ok_or(AntflyError::ExecutorUnavailable)?;
         self.executor.run(move || f(&db)).await
     }
+
+    /// Runs `f` against `table`'s handle (the root table for
+    /// [`LEGACY_TABLE`]) on an executor thread.
+    async fn call_in<T, F>(&self, table: String, f: F) -> AntflyResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Database) -> AntflyResult<T> + Send + 'static,
+    {
+        self.call(move |db| {
+            if table == LEGACY_TABLE {
+                return f(db);
+            }
+            let handle = db
+                .open_table(&table)
+                .map_err(|err| AntflyError::Embedded(format!("open table {table}: {err}")))?;
+            f(&handle)
+        })
+        .await
+    }
 }
 
 /// Returns the cached inference handle, opening it on first use. Must run on
@@ -215,7 +235,7 @@ fn names(listing: &[u8]) -> HashSet<String> {
 }
 
 impl Backend for EmbeddedBackend {
-    fn write(&self, writes: Vec<Write>) -> BackendFuture<'_, ()> {
+    fn write(&self, table: String, writes: Vec<Write>) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             if writes.is_empty() {
                 return Ok(());
@@ -240,7 +260,7 @@ impl Backend for EmbeddedBackend {
                 "deletes": deletes,
                 "sync_level": "write",
             }))?;
-            self.call(move |db| {
+            self.call_in(table, move |db| {
                 db.batch_json(&request)
                     .map(|_| ())
                     .map_err(embedded("batch"))
@@ -249,9 +269,9 @@ impl Backend for EmbeddedBackend {
         })
     }
 
-    fn get(&self, key: String) -> BackendFuture<'_, Option<Value>> {
+    fn get(&self, table: String, key: String) -> BackendFuture<'_, Option<Value>> {
         Box::pin(async move {
-            self.call(move |db| match db.lookup_json(key.as_bytes()) {
+            self.call_in(table, move |db| match db.lookup_json(key.as_bytes()) {
                 Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
                 Err(antfly_embedded::Error::NotFound) => Ok(None),
                 Err(err) => Err(AntflyError::Embedded(format!("lookup: {err}"))),
@@ -260,7 +280,7 @@ impl Backend for EmbeddedBackend {
         })
     }
 
-    fn scan(&self, request: ScanRequest) -> BackendFuture<'_, Vec<Document>> {
+    fn scan(&self, table: String, request: ScanRequest) -> BackendFuture<'_, Vec<Document>> {
         Box::pin(async move {
             let body = json!({
                 "from_key_b64": BASE64.encode(request.from.as_bytes()),
@@ -272,7 +292,9 @@ impl Backend for EmbeddedBackend {
             });
             let bytes = serde_json::to_vec(&body)?;
             let raw = self
-                .call(move |db| db.scan_json(&bytes).map_err(embedded("scan")))
+                .call_in(table, move |db| {
+                    db.scan_json(&bytes).map_err(embedded("scan"))
+                })
                 .await?;
             let result: ScanResult = serde_json::from_slice(&raw)?;
             let mut documents = Vec::with_capacity(result.documents.len());
@@ -291,23 +313,51 @@ impl Backend for EmbeddedBackend {
         })
     }
 
-    fn search(&self, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
+    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
         Box::pin(async move {
             let bytes = serde_json::to_vec(&request)?;
             let raw = self
-                .call(move |db| db.search_json(&bytes).map_err(embedded("search")))
+                .call_in(table, move |db| {
+                    db.search_json(&bytes).map_err(embedded("search"))
+                })
                 .await?;
             let body: Value = serde_json::from_slice(&raw)?;
             Ok(parse_search_hits(&body))
         })
     }
 
-    fn ensure_schema(&self, schema: SchemaSpec) -> BackendFuture<'_, ()> {
+    fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()> {
         Box::pin(async move {
-            let Some(dense) = schema.dense else {
+            let table = spec.name.clone();
+            if table != LEGACY_TABLE {
+                let marker = format!("table:{table}");
+                let known = self
+                    .known_indexes
+                    .lock()
+                    .map(|known| known.contains(&marker))
+                    .unwrap_or(false);
+                if !known {
+                    let schema = serde_json::to_vec(&spec.schema)?;
+                    let name = table.clone();
+                    self.call(move |db| {
+                        let tables =
+                            names(&db.list_tables_json().map_err(embedded("list tables"))?);
+                        if !tables.contains(&name) {
+                            db.create_table_json(&name, &schema)
+                                .map_err(embedded("create table"))?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    if let Ok(mut known) = self.known_indexes.lock() {
+                        known.insert(marker);
+                    }
+                }
+            }
+            let Some(dense) = spec.dense else {
                 return Ok(());
             };
-            let marker = format!("dense:{}", dense.name);
+            let marker = format!("dense:{table}:{}", dense.name);
             if self
                 .known_indexes
                 .lock()
@@ -340,7 +390,7 @@ impl Backend for EmbeddedBackend {
                 "producer_json": json!({"type": "embedder", "config": embedder}).to_string(),
             });
             let index_name = dense.name.clone();
-            self.call(move |db| {
+            self.call_in(table, move |db| {
                 let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
                 if !indexes.contains(&index_name) {
                     db.add_index_json(serde_json::to_vec(&index)?)
