@@ -142,6 +142,11 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         // created_at/updated_at/recency_at keep the SQLite seconds columns;
         // the *_ms columns are written explicitly (SQLite derived them with
         // triggers).
+        // forked_from_id .. next_ordinal are thread-store bookkeeping SQLite
+        // never needed: the immediate fork source, the inherited rollout
+        // prefix a fork reads through, the first ordinal of a subagent's own
+        // projected history, the multi-agent runtime version preserved
+        // across a revert, and the next ordinal a persisted item receives.
         "CREATE TABLE IF NOT EXISTS codex_threads (
             id TEXT PRIMARY KEY,
             rollout_path TEXT NOT NULL,
@@ -185,7 +190,13 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             daybreak_enabled BOOLEAN,
             creator_user_id TEXT,
             creator_account_id TEXT,
-            extra JSONB
+            extra JSONB,
+            forked_from_id TEXT,
+            history_base_thread_id TEXT,
+            history_base_end_ordinal BIGINT,
+            subagent_history_start_ordinal BIGINT,
+            multi_agent_version TEXT,
+            next_ordinal BIGINT NOT NULL DEFAULT 0
         )",
         "CREATE INDEX IF NOT EXISTS codex_threads_created ON codex_threads (archived, created_at_ms DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS codex_threads_updated ON codex_threads (archived, updated_at_ms DESC, id DESC)",
@@ -227,6 +238,8 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         "CREATE INDEX IF NOT EXISTS codex_thread_attachments_thread ON codex_thread_attachments (thread_id, created_at, id)",
         "CREATE INDEX IF NOT EXISTS codex_thread_attachments_identity ON codex_thread_attachments (attachment_type, identity_key, thread_id)",
         // Paginated history projection (the SQLite thread history database).
+        // latest_unphased_agent_item_id backfills final_agent_item_id when a
+        // turn ends without a final_answer-phase agent message.
         "CREATE TABLE IF NOT EXISTS codex_thread_turns (
             thread_id TEXT NOT NULL,
             turn_id TEXT NOT NULL,
@@ -240,6 +253,7 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             duration_ms BIGINT,
             first_user_item_id TEXT,
             final_agent_item_id TEXT,
+            latest_unphased_agent_item_id TEXT,
             PRIMARY KEY (thread_id, turn_id),
             UNIQUE (thread_id, rollout_ordinal)
         )",

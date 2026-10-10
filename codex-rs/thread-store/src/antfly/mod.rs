@@ -1,9 +1,14 @@
 //! [`ThreadStore`] backed by Antfly: no SQLite databases and no rollout files.
 //!
-//! Each thread is one record plus its persisted rollout items, keyed so that
-//! ordered scans return items in rollout order and listings newest first (see
+//! Every thread's metadata is one row in `codex_threads`; its persisted
+//! rollout items are one document per item in `codex_history_items`, keyed
+//! so an ordered prefix scan returns a thread's items in rollout order (see
 //! [`keys`]). Item documents carry the visible message text in the shared
 //! search field, so `search_threads` is hybrid full-text and semantic search.
+//! Sections, projects, attachments, spawn edges, and the paginated-history
+//! projection are their own SQL tables (see `codex_antfly::schema`), shared
+//! with `StateRuntime`'s Antfly backend: one source of truth for thread
+//! state.
 //!
 //! Live writer state (lazy materialization, pending metadata) is held in
 //! memory like the local store; nothing is written for a thread until it is
@@ -30,8 +35,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use codex_antfly::Antfly;
 use codex_antfly::AntflyError;
-use codex_antfly::ScanRequest;
 use codex_antfly::Write;
+use codex_antfly::schema;
+use codex_antfly::sql_params;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
@@ -42,7 +48,6 @@ use codex_rollout::RolloutItem;
 use codex_rollout::into_persisted_rollout_items;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::AddThreadAttachmentOutcome;
 use crate::AddThreadAttachmentParams;
@@ -93,7 +98,6 @@ use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
 use crate::ThreadSearchPage;
-use crate::ThreadSortKey;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
@@ -114,12 +118,6 @@ pub use import::ImportThreadParams;
 /// message boards). Failures abort the delete so it can be retried.
 pub type ThreadDataCleanup =
     Arc<dyn Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync>;
-
-const SORT_KEYS: [ThreadSortKey; 3] = [
-    ThreadSortKey::CreatedAt,
-    ThreadSortKey::UpdatedAt,
-    ThreadSortKey::RecencyAt,
-];
 
 /// A thread with a live writer in this process.
 struct LiveThread {
@@ -254,15 +252,15 @@ impl AntflyThreadStore {
         &self,
         thread_id: ThreadId,
     ) -> ThreadStoreResult<Option<ThreadRecord>> {
-        match self
-            .antfly
-            .get(keys::thread(thread_id))
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        let row = sql
+            .fetch_optional(
+                &format!("{} WHERE t.id = $1", record::SELECT_THREAD),
+                sql_params![thread_id.to_string()],
+            )
             .await
-            .map_err(internal)?
-        {
-            Some(doc) => Ok(Some(from_value(codex_antfly::strip_reserved(doc))?)),
-            None => Ok(None),
-        }
+            .map_err(internal)?;
+        row.map(|row| ThreadRecord::from_row(&row)).transpose()
     }
 
     async fn require_record(
@@ -292,14 +290,15 @@ impl AntflyThreadStore {
         thread_id: ThreadId,
         end_ordinal_exclusive: Option<u64>,
     ) -> ThreadStoreResult<Vec<RolloutItem>> {
-        let prefix = keys::items_prefix(thread_id);
+        let prefix = keys::history_item_prefix(thread_id);
         let to = match end_ordinal_exclusive {
-            Some(ordinal) => keys::item(thread_id, ordinal),
+            Some(ordinal) => keys::history_item_id(thread_id, ordinal),
             None => codex_antfly::keys::prefix_end(&prefix),
         };
         let documents = self
             .antfly
-            .scan(ScanRequest {
+            .documents(schema::HISTORY_ITEMS)
+            .scan(codex_antfly::ScanRequest {
                 from: prefix,
                 to,
                 limit: None,
@@ -319,63 +318,23 @@ impl AntflyThreadStore {
             .collect()
     }
 
-    /// Writes for `record`, replacing the listing entries of `previous`.
-    fn record_writes(
-        previous: Option<&ThreadRecord>,
-        record: &ThreadRecord,
-    ) -> ThreadStoreResult<Vec<Write>> {
-        let thread_id = record.thread_id();
-        let doc = to_value(record)?;
-        let mut writes = vec![Write::put(keys::thread(thread_id), doc.clone())];
-        for sort_key in SORT_KEYS {
-            let key = keys::index_entry(
-                record.archived_at.is_some(),
-                sort_key,
-                record.sort_millis(sort_key),
-                thread_id,
-            );
-            if let Some(previous) = previous {
-                let old = keys::index_entry(
-                    previous.archived_at.is_some(),
-                    sort_key,
-                    previous.sort_millis(sort_key),
-                    thread_id,
-                );
-                if old != key {
-                    writes.push(Write::delete(old));
-                }
-            }
-            writes.push(Write::put(key, doc.clone()));
-        }
-        let old_section = previous.and_then(|previous| {
-            Some(keys::section_entry(
-                previous.section.as_deref()?,
-                previous.section_position.unwrap_or(i64::MAX),
-                thread_id,
-            ))
-        });
-        let new_section = record.section.as_deref().map(|section| {
-            keys::section_entry(
-                section,
-                record.section_position.unwrap_or(i64::MAX),
-                thread_id,
+    /// Replaces the whole `codex_threads` row for `record`. The row has no
+    /// secondary indexes of its own (listing reads the table directly), so
+    /// this is the only write a metadata change needs.
+    async fn save_record(&self, record: &ThreadRecord) -> ThreadStoreResult<()> {
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        let (statement, params) = record::upsert_statement(record.upsert_params()?);
+        sql.execute(&statement, params).await.map_err(internal)?;
+        if let Some(parent) = record.created.parent_thread_id {
+            sql.execute(
+                "INSERT INTO codex_thread_spawn_edges (child_thread_id, parent_thread_id, status) \
+                 VALUES ($1, $2, 'open') ON CONFLICT (child_thread_id) DO NOTHING",
+                sql_params![record.thread_id().to_string(), parent.to_string()],
             )
-        });
-        if let Some(old) = old_section
-            && Some(&old) != new_section.as_ref()
-        {
-            writes.push(Write::delete(old));
+            .await
+            .map_err(internal)?;
         }
-        if let Some(new) = new_section {
-            writes.push(Write::put(new, doc));
-        }
-        if let Some(path) = &record.legacy_rollout_path {
-            writes.push(Write::put(
-                keys::rollout_path(path),
-                json!({"thread_id": thread_id.to_string()}),
-            ));
-        }
-        Ok(writes)
+        Ok(())
     }
 
     fn item_write(
@@ -383,7 +342,7 @@ impl AntflyThreadStore {
         ordinal: u64,
         item: &RolloutItem,
     ) -> ThreadStoreResult<Write> {
-        let mut doc = json!({
+        let mut doc = serde_json::json!({
             "thread_id": thread_id.to_string(),
             "ordinal": ordinal,
             "item": to_value(item)?,
@@ -400,7 +359,7 @@ impl AntflyThreadStore {
                 map.insert("turn_id".to_string(), Value::String(turn_id));
             }
         }
-        Ok(Write::put(keys::item(thread_id, ordinal), doc))
+        Ok(Write::put(keys::history_item_id(thread_id, ordinal), doc))
     }
 
     /// Makes a live thread durable, writing its pending items and `extra`.
@@ -418,26 +377,28 @@ impl AntflyThreadStore {
             .history_base
             .map(|base| base.end_ordinal_exclusive)
             .unwrap_or(0);
-        let mut writes = Vec::with_capacity(items.len() + 5);
+        let mut writes = Vec::with_capacity(items.len());
         for (offset, item) in items.iter().enumerate() {
             writes.push(Self::item_write(thread_id, base + offset as u64, item)?);
         }
+        self.antfly
+            .documents(schema::HISTORY_ITEMS)
+            .write(writes)
+            .await
+            .map_err(internal)?;
         if record.history_mode() == ThreadHistoryMode::Paginated {
-            writes.extend(
-                projection::build_writes(
-                    self,
-                    thread_id,
-                    live.created.subagent_history_start_ordinal,
-                    base,
-                    &items,
-                    Utc::now(),
-                )
-                .await?,
-            );
+            projection::apply_batch(
+                self,
+                thread_id,
+                live.created.subagent_history_start_ordinal,
+                base,
+                &items,
+                Utc::now(),
+            )
+            .await?;
         }
         record.next_ordinal = base + items.len() as u64;
-        writes.extend(Self::record_writes(None, &record)?);
-        self.antfly.write(writes).await.map_err(internal)?;
+        self.save_record(&record).await?;
         live.record = Some(record);
         Ok(())
     }
@@ -451,7 +412,7 @@ impl AntflyThreadStore {
             return self.materialize(live, items).await;
         };
         let thread_id = record.thread_id();
-        let mut writes = Vec::with_capacity(items.len() + 1);
+        let mut writes = Vec::with_capacity(items.len());
         for (offset, item) in items.iter().enumerate() {
             writes.push(Self::item_write(
                 thread_id,
@@ -459,24 +420,24 @@ impl AntflyThreadStore {
                 item,
             )?);
         }
+        self.antfly
+            .documents(schema::HISTORY_ITEMS)
+            .write(writes)
+            .await
+            .map_err(internal)?;
         if record.history_mode() == ThreadHistoryMode::Paginated {
-            writes.extend(
-                projection::build_writes(
-                    self,
-                    thread_id,
-                    live.created.subagent_history_start_ordinal,
-                    record.next_ordinal,
-                    &items,
-                    Utc::now(),
-                )
-                .await?,
-            );
+            projection::apply_batch(
+                self,
+                thread_id,
+                live.created.subagent_history_start_ordinal,
+                record.next_ordinal,
+                &items,
+                Utc::now(),
+            )
+            .await?;
         }
-        let mut updated = record.clone();
-        updated.next_ordinal += items.len() as u64;
-        writes.push(Write::put(keys::thread(thread_id), to_value(&updated)?));
-        self.antfly.write(writes).await.map_err(internal)?;
-        *record = updated;
+        record.next_ordinal += items.len() as u64;
+        self.save_record(record).await?;
         Ok(())
     }
 
@@ -690,16 +651,20 @@ impl AntflyThreadStore {
         &self,
         params: ReadThreadByRolloutPathParams,
     ) -> ThreadStoreResult<StoredThread> {
-        let mapping = self
-            .antfly
-            .get(keys::rollout_path(&params.rollout_path))
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        let path = params.rollout_path.to_string_lossy().to_string();
+        let row = sql
+            .fetch_optional(
+                "SELECT id FROM codex_threads WHERE rollout_path = $1 AND rollout_path <> ''",
+                sql_params![path],
+            )
             .await
             .map_err(internal)?;
-        let thread_id = mapping
-            .as_ref()
-            .and_then(|doc| doc.get("thread_id"))
-            .and_then(Value::as_str)
-            .and_then(|id| ThreadId::from_string(id).ok())
+        let thread_id = row
+            .map(|row| row.string("id"))
+            .transpose()
+            .map_err(internal)?
+            .and_then(|id| ThreadId::from_string(&id).ok())
             .ok_or_else(|| ThreadStoreError::InvalidRequest {
                 message: format!(
                     "no thread was imported from rollout path {}",
@@ -745,8 +710,7 @@ impl AntflyThreadStore {
             .await?;
         let mut record = previous.clone();
         record.patch.merge(patch);
-        let writes = Self::record_writes(Some(&previous), &record)?;
-        self.antfly.write(writes).await.map_err(internal)?;
+        self.save_record(&record).await?;
         if let Some(live) = state.live.get_mut(&thread_id) {
             live.record = Some(record.clone());
         }
@@ -775,44 +739,33 @@ impl AntflyThreadStore {
                 message: format!("no archived thread found for thread id {thread_id}"),
             });
         }
-        let mut record = previous.clone();
+        let mut record = previous;
         record.archived_at = archived.then(Utc::now);
-        let writes = Self::record_writes(Some(&previous), &record)?;
-        self.antfly.write(writes).await.map_err(internal)?;
+        self.save_record(&record).await?;
         if let Some(live) = state.live.get_mut(&thread_id) {
             live.record = Some(record.clone());
         }
         Ok(record)
     }
 
-    /// Deletes for every paginated-history projection row of `thread_id`
-    /// (spec §2.25). Harmless no-op scans for Legacy threads.
-    pub(crate) async fn projection_delete_writes(
-        &self,
-        thread_id: ThreadId,
-    ) -> ThreadStoreResult<Vec<Write>> {
-        let mut writes = Vec::new();
-        for prefix in [
-            keys::turn_id_prefix(thread_id),
-            keys::turn_start_prefix(thread_id),
-            keys::turn_end_prefix(thread_id),
-            keys::item_id_prefix(thread_id),
-            keys::item_created_prefix(thread_id),
-            keys::item_updated_prefix(thread_id),
-            keys::realtime_prefix(thread_id),
+    /// Deletes every paginated-history projection row of `thread_id` (spec
+    /// §2.25). Harmless no-op for Legacy threads.
+    pub(crate) async fn projection_delete(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        for table in [
+            "codex_thread_turns",
+            "codex_thread_items",
+            "codex_thread_realtime_items",
+            "codex_thread_history_projection_state",
         ] {
-            let documents = self
-                .antfly
-                .scan(ScanRequest::prefix(&prefix))
-                .await
-                .map_err(internal)?;
-            writes.extend(
-                documents
-                    .into_iter()
-                    .map(|document| Write::delete(document.key)),
-            );
+            sql.execute(
+                &format!("DELETE FROM {table} WHERE thread_id = $1"),
+                sql_params![thread_id.to_string()],
+            )
+            .await
+            .map_err(internal)?;
         }
-        Ok(writes)
+        Ok(())
     }
 
     /// Threads whose history starts inside `thread_id`'s, with the exclusive
@@ -821,19 +774,27 @@ impl AntflyThreadStore {
         &self,
         thread_id: ThreadId,
     ) -> ThreadStoreResult<Vec<(ThreadId, u64)>> {
-        let records = self
-            .antfly
-            .scan_as::<ThreadRecord>(ScanRequest::prefix(keys::THREAD_PREFIX))
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        let rows = sql
+            .fetch_all(
+                "SELECT id, history_base_end_ordinal FROM codex_threads \
+                 WHERE history_base_thread_id = $1",
+                sql_params![thread_id.to_string()],
+            )
             .await
             .map_err(internal)?;
-        Ok(records
-            .into_iter()
-            .filter_map(|(_, record)| {
-                let base = record.created.history_base?;
-                (base.thread_id == thread_id && record.thread_id() != thread_id)
-                    .then_some((record.thread_id(), base.end_ordinal_exclusive))
+        rows.into_iter()
+            .map(|row| {
+                let id =
+                    ThreadId::from_string(&row.string("id").map_err(internal)?).map_err(|err| {
+                        ThreadStoreError::Internal {
+                            message: format!("invalid thread id: {err}"),
+                        }
+                    })?;
+                let end_ordinal = row.i64("history_base_end_ordinal").map_err(internal)? as u64;
+                Ok((id, end_ordinal))
             })
-            .collect())
+            .collect()
     }
 
     async fn delete_thread_impl(&self, params: DeleteThreadParams) -> ThreadStoreResult<()> {
@@ -846,7 +807,10 @@ impl AntflyThreadStore {
         let record = self.load_record(thread_id).await?;
         let items = self
             .antfly
-            .scan(ScanRequest::prefix(&keys::items_prefix(thread_id)))
+            .documents(schema::HISTORY_ITEMS)
+            .scan(codex_antfly::ScanRequest::prefix(
+                &keys::history_item_prefix(thread_id),
+            ))
             .await
             .map_err(internal)?;
         if record.is_none() && items.is_empty() {
@@ -860,154 +824,35 @@ impl AntflyThreadStore {
                 ),
             });
         }
-        let mut writes: Vec<Write> = items
+        let item_writes: Vec<Write> = items
             .into_iter()
             .map(|document| Write::delete(document.key))
             .collect();
-        writes.push(Write::delete(keys::thread(thread_id)));
-        writes.extend(self.projection_delete_writes(thread_id).await?);
-        if let Some(record) = &record {
-            for sort_key in SORT_KEYS {
-                writes.push(Write::delete(keys::index_entry(
-                    record.archived_at.is_some(),
-                    sort_key,
-                    record.sort_millis(sort_key),
-                    thread_id,
-                )));
-            }
-            if let Some(section) = record.section.as_deref() {
-                writes.push(Write::delete(keys::section_entry(
-                    section,
-                    record.section_position.unwrap_or(i64::MAX),
-                    thread_id,
-                )));
-            }
-            if let Some(path) = &record.legacy_rollout_path {
-                writes.push(Write::delete(keys::rollout_path(path)));
-            }
+        if !item_writes.is_empty() {
+            self.antfly
+                .documents(schema::HISTORY_ITEMS)
+                .write(item_writes)
+                .await
+                .map_err(internal)?;
         }
-        writes.extend(attachments::delete_writes_for_thread(self, thread_id).await?);
-        self.antfly.write(writes).await.map_err(internal)?;
+        self.projection_delete(thread_id).await?;
+        let sql = self.antfly.sql().await.map_err(internal)?;
+        sql.execute(
+            "DELETE FROM codex_thread_spawn_edges WHERE parent_thread_id = $1 OR child_thread_id = $1",
+            sql_params![thread_id.to_string()],
+        )
+        .await
+        .map_err(internal)?;
+        // `codex_thread_attachments` and `codex_thread_dynamic_tools` cascade
+        // from this delete.
+        sql.execute(
+            "DELETE FROM codex_threads WHERE id = $1",
+            sql_params![thread_id.to_string()],
+        )
+        .await
+        .map_err(internal)?;
         state.live.remove(&thread_id);
         state.staged_metadata.remove(&thread_id);
-        Ok(())
-    }
-
-    async fn move_thread_to_section_impl(
-        &self,
-        params: MoveThreadToSectionParams,
-    ) -> ThreadStoreResult<()> {
-        if params
-            .section
-            .as_deref()
-            .is_some_and(|section| section.trim().is_empty())
-        {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: "section must not be empty".to_owned(),
-            });
-        }
-        if params.section.is_none() && params.before_thread_id.is_some() {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: "before thread cannot be specified without a section".to_owned(),
-            });
-        }
-        let mut state = Arc::clone(&self.state).lock_owned().await;
-        let _guard = self.antfly.lock().await;
-        let previous =
-            self.load_record(params.thread_id)
-                .await?
-                .ok_or(ThreadStoreError::ThreadNotFound {
-                    thread_id: params.thread_id,
-                })?;
-        let mut changed: Vec<(ThreadRecord, ThreadRecord)> = Vec::new();
-        let mut record = previous.clone();
-        match params.section.as_deref() {
-            None => {
-                record.section = None;
-                record.section_position = None;
-                record.section_entered_at = None;
-                record.section_name = None;
-                record.section_appearance = None;
-            }
-            Some(section) => {
-                if let Some(before) = params.before_thread_id
-                    && before == params.thread_id
-                {
-                    return Err(ThreadStoreError::InvalidRequest {
-                        message: format!(
-                            "thread {} cannot be moved before itself",
-                            params.thread_id
-                        ),
-                    });
-                }
-                let members = self
-                    .antfly
-                    .scan_as::<ThreadRecord>(ScanRequest::prefix(&keys::section_prefix(section)))
-                    .await
-                    .map_err(internal)?;
-                let mut ordered: Vec<ThreadRecord> = members
-                    .into_iter()
-                    .map(|(_, member)| member)
-                    .filter(|member| member.thread_id() != params.thread_id)
-                    .collect();
-                if let Some(before) = params.before_thread_id
-                    && !ordered.iter().any(|member| member.thread_id() == before)
-                {
-                    return Err(ThreadStoreError::InvalidRequest {
-                        message: format!("before thread {before} is not in section {section}"),
-                    });
-                }
-                if previous.section.as_deref() != Some(section) {
-                    record.section = Some(section.to_owned());
-                    record.section_entered_at = Some(Utc::now());
-                }
-                match sections::load_section(self, section).await? {
-                    Some(definition) => {
-                        record.section_name = Some(definition.name);
-                        record.section_appearance = definition.appearance;
-                    }
-                    None => {
-                        record.section_name = None;
-                        record.section_appearance = None;
-                    }
-                }
-                let insert_at = params
-                    .before_thread_id
-                    .and_then(|before| {
-                        ordered
-                            .iter()
-                            .position(|member| member.thread_id() == before)
-                    })
-                    .unwrap_or(ordered.len());
-                ordered.insert(insert_at, record.clone());
-                for (index, member) in ordered.into_iter().enumerate() {
-                    let position = i64::try_from(index)
-                        .unwrap_or(i64::MAX)
-                        .saturating_add(1)
-                        .saturating_mul(1_000_000);
-                    if member.thread_id() == params.thread_id {
-                        record.section_position = Some(position);
-                    } else if member.section_position != Some(position) {
-                        // Re-read the authoritative record before rewriting it.
-                        if let Some(current) = self.load_record(member.thread_id()).await? {
-                            let mut moved = current.clone();
-                            moved.section_position = Some(position);
-                            changed.push((current, moved));
-                        }
-                    }
-                }
-            }
-        }
-        let mut writes = Self::record_writes(Some(&previous), &record)?;
-        for (old, new) in &changed {
-            writes.extend(Self::record_writes(Some(old), new)?);
-        }
-        self.antfly.write(writes).await.map_err(internal)?;
-        for (_, new) in changed.into_iter().chain([(previous, record)]) {
-            if let Some(live) = state.live.get_mut(&new.thread_id()) {
-                live.record = Some(new);
-            }
-        }
         Ok(())
     }
 }
@@ -1179,7 +1024,7 @@ impl ThreadStore for AntflyThreadStore {
         &self,
         params: MoveThreadToSectionParams,
     ) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(self.move_thread_to_section_impl(params))
+        Box::pin(sections::move_thread_to_section(self, params))
     }
 
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {

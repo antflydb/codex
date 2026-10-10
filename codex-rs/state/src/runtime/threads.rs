@@ -1,4 +1,4 @@
-use super::antfly_backend::thread_adapter;
+use super::antfly_backend::threads as antfly_threads;
 use super::*;
 use crate::SortDirection;
 use codex_protocol::SanitizedGitUrl;
@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::get_thread_metadata(antfly, id).await;
+            return antfly_threads::get_thread(antfly, id).await;
         }
         let row = sqlx::query(
             r#"
@@ -76,6 +76,9 @@ WHERE threads.id = ?
         thread_id: ThreadId,
         legacy_name: Option<&str>,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::mark_thread_paginated(antfly, thread_id, legacy_name).await;
+        }
         // Legacy threads display `title`, then fall back to the name index. Paginated threads
         // display `name`; `title` remains derived metadata used for search. Preserve an existing
         // `name`, unless it is the Guardian default seeded by metadata cleanup.
@@ -104,7 +107,7 @@ WHERE id = ?
     }
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::get_memory_mode(antfly, id).await;
+            return antfly_threads::get_thread_memory_mode(antfly, id).await;
         }
         let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
             .bind(id.to_string())
@@ -119,7 +122,7 @@ WHERE id = ?
         preview: &str,
     ) -> anyhow::Result<bool> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::set_preview_if_empty(antfly, thread_id, preview).await;
+            return antfly_threads::set_thread_preview_if_empty(antfly, thread_id, preview).await;
         }
         let preview = preview.trim();
         if preview.is_empty() {
@@ -147,7 +150,7 @@ WHERE id = ? AND preview = ''
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::upsert_spawn_edge(
+            return antfly_threads::upsert_thread_spawn_edge(
                 antfly,
                 parent_thread_id,
                 child_thread_id,
@@ -182,7 +185,8 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::set_spawn_edge_status(antfly, child_thread_id, status).await;
+            return antfly_threads::set_thread_spawn_edge_status(antfly, child_thread_id, status)
+                .await;
         }
         sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
             .bind(status.as_ref())
@@ -241,7 +245,7 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::find_spawn_child_by_path(antfly, parent_thread_id, agent_path)
+            return antfly_threads::find_spawn_child_by_path(antfly, parent_thread_id, agent_path)
                 .await;
         }
         let rows = sqlx::query(
@@ -269,7 +273,7 @@ LIMIT 2
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::find_spawn_descendant_by_path(
+            return antfly_threads::find_spawn_descendant_by_path(
                 antfly,
                 root_thread_id,
                 agent_path,
@@ -308,7 +312,12 @@ LIMIT 2
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::list_spawn_children(antfly, parent_thread_id, status).await;
+            return antfly_threads::list_thread_spawn_children_matching(
+                antfly,
+                parent_thread_id,
+                status,
+            )
+            .await;
         }
         let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ",
@@ -333,7 +342,12 @@ LIMIT 2
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
         if let Some(antfly) = &self.antfly {
-            return thread_adapter::list_spawn_descendants(antfly, root_thread_id, status).await;
+            return antfly_threads::list_thread_spawn_descendants_matching(
+                antfly,
+                root_thread_id,
+                status,
+            )
+            .await;
         }
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
@@ -425,6 +439,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
         id: ThreadId,
         archived_only: Option<bool>,
     ) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::find_rollout_path_by_id(antfly, id, archived_only).await;
+        }
         let mut builder =
             QueryBuilder::<Sqlite>::new("SELECT rollout_path FROM threads WHERE id = ");
         builder.push_bind(id.to_string());
@@ -453,6 +470,15 @@ ON CONFLICT(child_thread_id) DO NOTHING
         expected: &Path,
         replacement: &Path,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::replace_rollout_path_if_current(
+                antfly,
+                id,
+                expected,
+                replacement,
+            )
+            .await;
+        }
         let result =
             sqlx::query("UPDATE threads SET rollout_path = ? WHERE id = ? AND rollout_path = ?")
                 .bind(replacement.display().to_string())
@@ -473,6 +499,17 @@ ON CONFLICT(child_thread_id) DO NOTHING
         archived_only: bool,
         cwd: Option<&Path>,
     ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::find_thread_by_exact_title(
+                antfly,
+                title,
+                allowed_sources,
+                model_providers,
+                archived_only,
+                cwd,
+            )
+            .await;
+        }
         let mut builder = QueryBuilder::<Sqlite>::new("");
         push_thread_select_columns(&mut builder);
         builder.push(" FROM threads");
@@ -554,6 +591,15 @@ ON CONFLICT(child_thread_id) DO NOTHING
         filters: ThreadFilterOptions<'_>,
         relation_filter: Option<crate::ThreadRelationFilter>,
     ) -> anyhow::Result<crate::ThreadsPage> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::list_threads_matching(
+                antfly,
+                page_size,
+                filters,
+                relation_filter,
+            )
+            .await;
+        }
         let limit = page_size.saturating_add(1);
 
         let mut builder = QueryBuilder::<Sqlite>::new("");
@@ -601,6 +647,18 @@ ON CONFLICT(child_thread_id) DO NOTHING
         model_providers: Option<&[String]>,
         archived_only: bool,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::list_thread_ids(
+                antfly,
+                limit,
+                anchor,
+                sort_key,
+                allowed_sources,
+                model_providers,
+                archived_only,
+            )
+            .await;
+        }
         let mut builder = QueryBuilder::<Sqlite>::new("SELECT threads.id FROM threads");
         push_thread_filters(
             &mut builder,
@@ -648,6 +706,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
 
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::upsert_thread(antfly, metadata).await;
+        }
         self.upsert_thread_with_creation_memory_mode(metadata, /*creation_memory_mode*/ None)
             .await
     }
@@ -656,6 +717,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
         &self,
         metadata: &crate::ThreadMetadata,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::insert_thread_if_absent(antfly, metadata).await;
+        }
         let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
         let recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
         let preview = metadata_preview(metadata);
@@ -769,6 +833,14 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         daybreak_enabled: bool,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::set_thread_daybreak_enabled(
+                antfly,
+                thread_id,
+                daybreak_enabled,
+            )
+            .await;
+        }
         let result = sqlx::query("UPDATE threads SET daybreak_enabled = ? WHERE id = ?")
             .bind(daybreak_enabled)
             .bind(thread_id.to_string())
@@ -782,6 +854,9 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         memory_mode: &str,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::set_thread_memory_mode(antfly, thread_id, memory_mode).await;
+        }
         let result = sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
             .bind(memory_mode)
             .bind(thread_id.to_string())
@@ -795,6 +870,9 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         title: &str,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::update_thread_title(antfly, thread_id, title).await;
+        }
         let result = sqlx::query("UPDATE threads SET title = ? WHERE id = ?")
             .bind(title)
             .bind(thread_id.to_string())
@@ -808,6 +886,9 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         name: Option<&str>,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::update_thread_name(antfly, thread_id, name).await;
+        }
         let result = sqlx::query("UPDATE threads SET name = ? WHERE id = ?")
             .bind(name)
             .bind(thread_id.to_string())
@@ -822,6 +903,9 @@ ON CONFLICT(id) DO NOTHING
         updated_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         let updated_at = self.allocate_thread_updated_at(updated_at)?;
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::touch_thread_updated_at(antfly, thread_id, updated_at).await;
+        }
         let result =
             sqlx::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
                 .bind(datetime_to_epoch_seconds(updated_at))
@@ -838,6 +922,9 @@ ON CONFLICT(id) DO NOTHING
         recency_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         let recency_at = self.allocate_thread_recency_at(recency_at)?;
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::touch_thread_recency_at(antfly, thread_id, recency_at).await;
+        }
         let recency_at_seconds = datetime_to_epoch_seconds(recency_at);
         let recency_at_millis = datetime_to_epoch_millis(recency_at);
         let result = sqlx::query(
@@ -925,6 +1012,16 @@ impl StateRuntime {
         git_branch: Option<Option<&str>>,
         git_origin_url: Option<Option<&SanitizedGitUrl>>,
     ) -> anyhow::Result<bool> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::update_thread_git_info(
+                antfly,
+                thread_id,
+                git_sha,
+                git_branch,
+                git_origin_url,
+            )
+            .await;
+        }
         let result = sqlx::query(
             r#"
 UPDATE threads
@@ -1110,6 +1207,17 @@ ON CONFLICT(id) DO UPDATE SET
         if items.is_empty() {
             return Ok(());
         }
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::apply_rollout_items(
+                antfly,
+                builder,
+                items,
+                &self.default_provider,
+                new_thread_memory_mode,
+                updated_at_override,
+            )
+            .await;
+        }
         let existing_metadata = self.get_thread(builder.id).await?;
         let mut metadata = existing_metadata
             .clone()
@@ -1152,6 +1260,10 @@ ON CONFLICT(id) DO UPDATE SET
         rollout_path: &Path,
         archived_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::mark_archived(antfly, thread_id, rollout_path, archived_at)
+                .await;
+        }
         let Some(mut metadata) = self.get_thread(thread_id).await? else {
             return Ok(());
         };
@@ -1175,6 +1287,9 @@ ON CONFLICT(id) DO UPDATE SET
         thread_id: ThreadId,
         rollout_path: &Path,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::mark_unarchived(antfly, thread_id, rollout_path).await;
+        }
         let Some(mut metadata) = self.get_thread(thread_id).await? else {
             return Ok(());
         };
@@ -1204,6 +1319,9 @@ ON CONFLICT(id) DO UPDATE SET
     pub async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64> {
         if thread_ids.is_empty() {
             return Ok(0);
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_threads::delete_threads_strict(antfly, thread_ids).await;
         }
 
         let thread_id_strings = thread_ids

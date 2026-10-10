@@ -1,4 +1,5 @@
 use super::StateRuntime;
+use super::antfly_backend::thread_sections as antfly_sections;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
@@ -16,6 +17,9 @@ impl StateRuntime {
     ) -> anyhow::Result<HashMap<ThreadId, (Option<i64>, Option<DateTime<Utc>>)>> {
         if thread_ids.is_empty() {
             return Ok(HashMap::new());
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::get_thread_section_ordering(antfly, thread_ids).await;
         }
 
         let mut builder = QueryBuilder::<Sqlite>::new(
@@ -51,6 +55,9 @@ impl StateRuntime {
         &self,
         id: &str,
     ) -> anyhow::Result<Option<crate::ThreadSection>> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::get_thread_section(antfly, id).await;
+        }
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT id, name, appearance FROM thread_sections WHERE id = ?",
         )
@@ -66,6 +73,9 @@ impl StateRuntime {
         cursor: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<crate::ThreadSectionsPage> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::list_thread_sections(antfly, cursor, limit).await;
+        }
         let page_size = limit.max(1);
         let fetch_limit = i64::try_from(page_size.saturating_add(1))?;
         let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
@@ -111,6 +121,15 @@ LIMIT ?
             return Err(anyhow::anyhow!(
                 "before thread cannot be specified without a section"
             ));
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::move_thread_to_section(
+                antfly,
+                thread_id,
+                section,
+                before_thread_id,
+            )
+            .await;
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;

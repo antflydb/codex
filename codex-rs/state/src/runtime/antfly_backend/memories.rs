@@ -30,13 +30,8 @@
 //!
 //! # Thread lookups
 //!
-//! The legacy key-prefix backend this replaces read thread state through
-//! `thread_adapter`, which re-parses the old `ts:t:{thread_id}` document
-//! (another agent is mid-port of that file to the `codex_threads` SQL
-//! table concurrently with this change). Since `codex_threads` already
-//! carries every column the SQLite `threads` table does (migration 1), this
-//! module queries it directly with plain SQL instead of depending on
-//! `thread_adapter`: `enabled_thread_metadata`-equivalent lookups filter
+//! Thread state comes straight from `codex_threads`:
+//! `enabled_thread_metadata`-equivalent lookups filter
 //! `memory_mode = 'enabled'`, and `mark_thread_memory_mode_polluted` writes
 //! `codex_threads.memory_mode` directly, matching the SQLite implementation
 //! exactly. Only a handful of `ThreadMetadata` fields

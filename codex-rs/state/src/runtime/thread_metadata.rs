@@ -20,6 +20,9 @@ impl StateRuntime {
         &self,
         thread_ids: &[ThreadId],
     ) -> anyhow::Result<HashMap<ThreadId, ThreadMetadata>> {
+        if let Some(antfly) = &self.antfly {
+            return super::antfly_backend::threads::get_threads(antfly, thread_ids).await;
+        }
         let mut threads = HashMap::with_capacity(thread_ids.len());
         // Keep each query within SQLite's bind limit, including for large search result sets.
         for thread_ids in thread_ids.chunks(THREAD_METADATA_BATCH_SIZE) {

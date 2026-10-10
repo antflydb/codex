@@ -1,6 +1,7 @@
 //! Transactional thread attachment storage using the attachment SQL schema.
 
 use super::StateRuntime;
+use super::antfly_backend::thread_attachments as antfly_attachments;
 use crate::AddThreadAttachmentOutcome;
 use crate::MAX_THREAD_ATTACHMENT_IDENTITY_KEY_BYTES;
 use crate::MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE;
@@ -32,6 +33,14 @@ impl StateRuntime {
         source_thread_id: ThreadId,
         destination_thread_id: ThreadId,
     ) -> anyhow::Result<()> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_attachments::copy_thread_attachments(
+                antfly,
+                source_thread_id,
+                destination_thread_id,
+            )
+            .await;
+        }
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let destination = destination_thread_id.to_string();
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
@@ -82,6 +91,16 @@ impl StateRuntime {
             anyhow::bail!(
                 "invalid thread attachment request: attachment payload exceeds {MAX_THREAD_ATTACHMENT_PAYLOAD_BYTES} bytes"
             );
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_attachments::add_thread_attachment(
+                antfly,
+                thread_id,
+                attachment_type,
+                identity_key,
+                payload,
+            )
+            .await;
         }
 
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -152,6 +171,15 @@ impl StateRuntime {
         identity_key: &str,
     ) -> anyhow::Result<RemoveThreadAttachmentOutcome> {
         validate_attachment_identity(attachment_type, identity_key)?;
+        if let Some(antfly) = &self.antfly {
+            return antfly_attachments::remove_thread_attachment(
+                antfly,
+                thread_id,
+                attachment_type,
+                identity_key,
+            )
+            .await;
+        }
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let thread_id_string = thread_id.to_string();
         let thread_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
@@ -194,6 +222,17 @@ impl StateRuntime {
             anyhow::bail!(
                 "invalid thread attachment request: page limit must be between 1 and {MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE}"
             );
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_attachments::list_thread_attachment_threads(
+                antfly,
+                attachment_type,
+                identity_key,
+                archive_filter,
+                cursor,
+                limit,
+            )
+            .await;
         }
         let archived = match archive_filter {
             ThreadAttachmentArchiveFilter::All => None,
@@ -273,6 +312,10 @@ impl StateRuntime {
             anyhow::bail!(
                 "invalid thread attachment request: page limit must be between 1 and {MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE}"
             );
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_attachments::list_thread_attachments(antfly, thread_id, cursor, limit)
+                .await;
         }
 
         let thread_id_string = thread_id.to_string();
