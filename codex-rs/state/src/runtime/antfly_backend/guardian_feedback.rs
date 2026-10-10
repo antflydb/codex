@@ -1,27 +1,28 @@
-//! Antfly backend for guardian review feedback. Mirrors
-//! `state/src/runtime/guardian_feedback.rs` (SQLite: `guardian_review_feedback`
-//! table, `ON DELETE CASCADE` on `thread_id`) exactly, except the cascade:
-//! Antfly has no foreign keys, so a thread's guardian records must be deleted
-//! explicitly (by whichever wiring hooks a thread delete into
-//! `codex_antfly::Antfly`'s `ThreadDataCleanup`-style callback; not done in
-//! this module).
+//! Antfly backend for guardian review feedback, backed by the
+//! `codex_guardian_review_feedback` SQL table (see `codex-antfly/src/schema.rs`,
+//! migration 1). Mirrors `state/src/runtime/guardian_feedback.rs` exactly:
+//! the insert and both evictions (per-thread, then global by count and
+//! bytes) run in one transaction, and the foreign key on `codex_threads`
+//! cascades deletes and rejects captures for deleted threads.
 //!
-//! All records live under one small, capped collection (`st:guardian:`), so
-//! every operation scans and rewrites the whole collection rather than
-//! maintaining a secondary per-thread index: eviction never lets it grow
-//! past [`crate::MAX_GUARDIAN_REVIEW_RECORDS`] rows or
-//! [`crate::MAX_GUARDIAN_REVIEW_BYTES`] bytes, so the scan is always cheap.
+//! Antfly SQL has no BLOB type, so `record` holds the base64 of the opaque
+//! bytes and `record_bytes` their raw length, which the global byte budget
+//! sums exactly as SQLite summed `length(record)` over the BLOB.
 //!
-//! `GuardianReviewRecord::id` is a UUIDv7 (`Uuid::now_v7()`), whose canonical
-//! hex string representation sorts lexicographically in creation order, so
-//! an ascending key scan over `st:guardian:` is already oldest-first and a
-//! reversed scan is newest-first — no separate ordering index is needed.
+//! Known gap: Antfly rejects a single TEXT value between 1,000,000 and
+//! 1,400,000 characters and a transaction writing between 1.5 and 2 MiB
+//! (SQLSTATE 54000, "The statement exceeds the supported work, result, or
+//! mutation limit."), so records above roughly 750 KiB (1 MB of base64)
+//! fail here although SQLite accepts up to `MAX_GUARDIAN_REVIEW_BYTES`.
 
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use codex_antfly::Antfly;
-use codex_antfly::ScanRequest;
-use codex_antfly::Write;
+use codex_antfly::sql::SqlRow;
+use codex_antfly::sql::SqlTx;
+use codex_antfly::sql_params;
 use codex_protocol::ThreadId;
 
 use super::internal;
@@ -30,47 +31,23 @@ use crate::MAX_GUARDIAN_REVIEW_BYTES;
 use crate::MAX_GUARDIAN_REVIEW_RECORDS;
 use crate::MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD;
 
-const PREFIX: &str = "st:guardian:";
-
-fn key(id: &str) -> String {
-    format!("{PREFIX}{id}")
+fn record_from_row(row: &SqlRow) -> anyhow::Result<GuardianReviewRecord> {
+    Ok(GuardianReviewRecord {
+        id: row.string("id").map_err(internal)?,
+        thread_id: ThreadId::from_string(&row.string("thread_id").map_err(internal)?)?,
+        record: STANDARD.decode(super::text_column(row, "record").map_err(internal)?)?,
+    })
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Doc {
-    id: String,
-    thread_id: ThreadId,
-    record: Vec<u8>,
-}
-
-impl From<&GuardianReviewRecord> for Doc {
-    fn from(record: &GuardianReviewRecord) -> Self {
-        Self {
-            id: record.id.clone(),
-            thread_id: record.thread_id,
-            record: record.record.clone(),
-        }
+async fn delete_ids(tx: &mut SqlTx, ids: &[String]) -> codex_antfly::AntflyResult<()> {
+    for id in ids {
+        tx.execute(
+            "DELETE FROM codex_guardian_review_feedback WHERE id = $1",
+            sql_params![id.as_str()],
+        )
+        .await?;
     }
-}
-
-impl From<Doc> for GuardianReviewRecord {
-    fn from(doc: Doc) -> Self {
-        Self {
-            id: doc.id,
-            thread_id: doc.thread_id,
-            record: doc.record,
-        }
-    }
-}
-
-async fn scan_all(antfly: &Arc<Antfly>) -> anyhow::Result<Vec<Doc>> {
-    Ok(antfly
-        .scan_as::<Doc>(ScanRequest::prefix(PREFIX))
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .map(|(_, doc)| doc)
-        .collect())
+    Ok(())
 }
 
 pub(crate) async fn record_guardian_review_failure(
@@ -81,190 +58,210 @@ pub(crate) async fn record_guardian_review_failure(
         record.record.len() < MAX_GUARDIAN_REVIEW_BYTES,
         "Guardian feedback record exceeds its size limit"
     );
+    let sql = antfly.sql().await.map_err(internal)?;
+    let mut tx = sql.begin().await.map_err(internal)?;
+    let result = async {
+        tx.execute(
+            "INSERT INTO codex_guardian_review_feedback (id, thread_id, record, record_bytes) \
+             VALUES ($1, $2, $3, $4)",
+            sql_params![
+                record.id.clone(),
+                record.thread_id.to_string(),
+                STANDARD.encode(&record.record),
+                record.record.len() as i64,
+            ],
+        )
+        .await?;
+        // Antfly rejects the SQLite statements' `ORDER BY ... OFFSET` and
+        // windowed derived table inside `DELETE ... WHERE id IN (subquery)`
+        // (SQLSTATE 54000, "exceeds the supported work, result, or mutation
+        // limit", even on an empty table), so select the evicted ids here
+        // and delete them by id. The table is capped, so both reads are small.
+        let per_thread_evicted = tx
+            .fetch_all(
+                "SELECT id FROM codex_guardian_review_feedback WHERE thread_id = $1 \
+                 ORDER BY id DESC OFFSET $2",
+                sql_params![
+                    record.thread_id.to_string(),
+                    MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD as i64
+                ],
+            )
+            .await?
+            .iter()
+            .map(|row| row.string("id"))
+            .collect::<codex_antfly::AntflyResult<Vec<_>>>()?;
+        delete_ids(&mut tx, &per_thread_evicted).await?;
 
-    let _guard = antfly.lock().await;
-    let mut all = scan_all(antfly).await?;
-    all.push(Doc::from(record));
-
-    // Per-thread cap: keep only the newest MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD
-    // rows for this thread (id desc = newest first); drop the rest.
-    let mut same_thread: Vec<&Doc> = all
-        .iter()
-        .filter(|doc| doc.thread_id == record.thread_id)
-        .collect();
-    same_thread.sort_by(|a, b| b.id.cmp(&a.id));
-    let evicted_per_thread: std::collections::HashSet<String> = same_thread
-        .into_iter()
-        .skip(MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD)
-        .map(|doc| doc.id.clone())
-        .collect();
-    all.retain(|doc| !evicted_per_thread.contains(&doc.id));
-
-    // Global cap: keep a newest-first prefix bounded by both row count and
-    // cumulative byte size (`length(record) + 1` per row, matching the SQL
-    // window-function eviction).
-    all.sort_by(|a, b| b.id.cmp(&a.id));
-    let mut cumulative_bytes: i64 = 0;
-    let mut surviving_ids = std::collections::HashSet::new();
-    for (rank, doc) in all.iter().enumerate() {
-        let rank = rank + 1;
-        cumulative_bytes += doc.record.len() as i64 + 1;
-        if rank > MAX_GUARDIAN_REVIEW_RECORDS || cumulative_bytes > MAX_GUARDIAN_REVIEW_BYTES as i64
-        {
-            continue;
+        // Global budget: newest first, evict past the row count or once the
+        // running sum of `record_bytes + 1` exceeds the byte budget.
+        let rows = tx
+            .fetch_all(
+                "SELECT id, record_bytes FROM codex_guardian_review_feedback ORDER BY id DESC",
+                vec![],
+            )
+            .await?;
+        let mut cumulative_bytes = 0_i64;
+        let mut globally_evicted = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            cumulative_bytes += row.i64("record_bytes")? + 1;
+            if index + 1 > MAX_GUARDIAN_REVIEW_RECORDS
+                || cumulative_bytes > MAX_GUARDIAN_REVIEW_BYTES as i64
+            {
+                globally_evicted.push(row.string("id")?);
+            }
         }
-        surviving_ids.insert(doc.id.clone());
+        delete_ids(&mut tx, &globally_evicted).await?;
+        Ok::<_, codex_antfly::AntflyError>(())
     }
-
-    let mut writes = vec![Write::put(
-        key(&record.id),
-        serde_json::to_value(Doc::from(record))?,
-    )];
-    for id in &evicted_per_thread {
-        writes.push(Write::delete(key(id)));
-    }
-    for doc in &all {
-        if doc.id != record.id && !surviving_ids.contains(&doc.id) {
-            writes.push(Write::delete(key(&doc.id)));
+    .await;
+    match result {
+        Ok(()) => tx.commit().await.map_err(internal),
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(internal(err))
         }
     }
-    // The just-inserted record always has the newest id (Uuid::now_v7 is
-    // monotonic with wall-clock), so it is always rank 1 in both orderings
-    // above and never evicted by its own insert.
-    antfly.write(writes).await.map_err(internal)?;
-    Ok(())
 }
 
 pub(crate) async fn list_guardian_review_records(
     antfly: &Arc<Antfly>,
 ) -> anyhow::Result<Vec<GuardianReviewRecord>> {
-    Ok(scan_all(antfly)
-        .await?
-        .into_iter()
-        .map(GuardianReviewRecord::from)
-        .collect())
+    let sql = antfly.sql().await.map_err(internal)?;
+    sql.fetch_all(
+        "SELECT id, thread_id, record FROM codex_guardian_review_feedback ORDER BY id",
+        vec![],
+    )
+    .await
+    .map_err(internal)?
+    .iter()
+    .map(record_from_row)
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::sql_test_support::AntflyRuntime;
     use super::*;
     use pretty_assertions::assert_eq;
 
-    async fn test_antfly() -> (Arc<Antfly>, std::path::PathBuf) {
-        let dir = crate::runtime::test_support::unique_temp_dir();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let mut config = codex_antfly::AntflyConfig::embedded(dir.join("codex.aflite"));
-        config.embedder = None;
-        (Arc::new(Antfly::new(config)), dir)
-    }
-
-    /// Closes the database (waiting for background work) before removing
-    /// its directory.
-    async fn cleanup(antfly: &Antfly, dir: std::path::PathBuf) {
-        antfly.close().await.expect("close antfly");
-        let _ = tokio::fs::remove_dir_all(dir).await;
-    }
-
-    fn thread(n: u32) -> ThreadId {
-        ThreadId::from_string(&format!("00000000-0000-0000-0000-{n:012}")).expect("valid thread id")
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_oversized_records() {
-        let (antfly, dir) = test_antfly().await;
-        let record = GuardianReviewRecord::new(thread(1), vec![0u8; MAX_GUARDIAN_REVIEW_BYTES]);
-        let err = record_guardian_review_failure(&antfly, &record)
-            .await
-            .expect_err("oversized record should be rejected");
-        assert!(err.to_string().contains("size limit"));
-        cleanup(&antfly, dir).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn list_is_oldest_first_and_roundtrips() {
-        let (antfly, dir) = test_antfly().await;
-        let a = GuardianReviewRecord::new(thread(1), b"a".to_vec());
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let b = GuardianReviewRecord::new(thread(2), b"b".to_vec());
-        record_guardian_review_failure(&antfly, &a).await.unwrap();
-        record_guardian_review_failure(&antfly, &b).await.unwrap();
-
-        let records = list_guardian_review_records(&antfly).await.unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].id, a.id);
-        assert_eq!(records[1].id, b.id);
-        assert_eq!(records[0].record, b"a".to_vec());
-        cleanup(&antfly, dir).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn per_thread_cap_evicts_oldest_for_that_thread_only() {
-        let (antfly, dir) = test_antfly().await;
-        let busy_thread = thread(1);
-        let other_thread = thread(2);
-        record_guardian_review_failure(
-            &antfly,
-            &GuardianReviewRecord::new(other_thread, b"keep-me".to_vec()),
-        )
-        .await
-        .unwrap();
-        for i in 0..(MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD + 3) {
-            record_guardian_review_failure(
-                &antfly,
-                &GuardianReviewRecord::new(busy_thread, format!("record-{i}").into_bytes()),
-            )
-            .await
-            .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    async fn retention_bounds_count_per_thread_and_bytes() -> anyhow::Result<()> {
+        let harness = AntflyRuntime::open().await;
+        let state = &harness.runtime;
+        let mut ids = Vec::new();
+        for _ in 0..=MAX_GUARDIAN_REVIEW_RECORDS {
+            let id = ThreadId::new();
+            harness.insert_thread(id).await;
+            let record = GuardianReviewRecord::new(id, b"{}".to_vec());
+            state.record_guardian_review_failure(&record).await?;
+            ids.push(id);
         }
+        assert_eq!(
+            state
+                .list_guardian_review_records()
+                .await?
+                .iter()
+                .map(|record| record.thread_id)
+                .collect::<Vec<_>>(),
+            ids[1..],
+        );
+        let id = ids[0];
+        for index in 0..12 {
+            state
+                .record_guardian_review_failure(&GuardianReviewRecord::new(
+                    id,
+                    index.to_string().into_bytes(),
+                ))
+                .await?;
+        }
+        assert_eq!(
+            state
+                .list_guardian_review_records()
+                .await?
+                .into_iter()
+                .filter(|record| record.thread_id == id)
+                .map(|record| record.record)
+                .collect::<Vec<_>>(),
+            (4..12)
+                .map(|index| index.to_string().into_bytes())
+                .collect::<Vec<_>>(),
+        );
+        // The SQLite test fills the byte budget with MAX_GUARDIAN_REVIEW_BYTES/3
+        // records, which exceed Antfly's per-value limit (see the module
+        // docs); twelve 700 KB records on separate threads cross the 8 MiB
+        // budget instead, evicting only the oldest.
+        let payload = vec![b' '; 700_000];
+        let mut big = Vec::new();
+        for _ in 0..12 {
+            let id = ThreadId::new();
+            harness.insert_thread(id).await;
+            state
+                .record_guardian_review_failure(&GuardianReviewRecord::new(id, payload.clone()))
+                .await?;
+            big.push(id);
+        }
+        assert_eq!(
+            state
+                .list_guardian_review_records()
+                .await?
+                .into_iter()
+                .map(|record| (record.thread_id, record.record.len()))
+                .collect::<Vec<_>>(),
+            big[1..]
+                .iter()
+                .map(|id| (*id, payload.len()))
+                .collect::<Vec<_>>(),
+        );
+        harness.close().await;
+        Ok(())
+    }
 
-        let records = list_guardian_review_records(&antfly).await.unwrap();
-        let for_busy = records
-            .iter()
-            .filter(|r| r.thread_id == busy_thread)
-            .count();
-        let for_other = records
-            .iter()
-            .filter(|r| r.thread_id == other_thread)
-            .count();
-        assert_eq!(for_busy, MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD);
-        assert_eq!(for_other, 1);
-        // The newest records for the busy thread survive.
-        let newest_kept: Vec<String> = records
-            .iter()
-            .filter(|r| r.thread_id == busy_thread)
-            .map(|r| String::from_utf8(r.record.clone()).unwrap())
-            .collect();
-        assert!(newest_kept.contains(&"record-5".to_string()));
-        assert!(!newest_kept.contains(&"record-0".to_string()));
-        cleanup(&antfly, dir).await;
+    /// Documents the Antfly value-size gap: SQLite accepts this record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn records_over_the_antfly_value_limit_are_rejected() -> anyhow::Result<()> {
+        let harness = AntflyRuntime::open().await;
+        let id = ThreadId::new();
+        harness.insert_thread(id).await;
+        let record = GuardianReviewRecord::new(id, vec![b' '; MAX_GUARDIAN_REVIEW_BYTES / 3]);
+        assert!(
+            harness
+                .runtime
+                .record_guardian_review_failure(&record)
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .runtime
+                .list_guardian_review_records()
+                .await?
+                .is_empty()
+        );
+        harness.close().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn global_cap_evicts_oldest_once_count_exceeded() {
-        let (antfly, dir) = test_antfly().await;
-        // Spread across many threads so the per-thread cap never kicks in,
-        // only the global row-count cap.
-        for i in 0..(MAX_GUARDIAN_REVIEW_RECORDS + 5) {
-            record_guardian_review_failure(
-                &antfly,
-                &GuardianReviewRecord::new(thread(i as u32), format!("r{i}").into_bytes()),
+    async fn deleting_an_actor_removes_evidence_and_rejects_late_captures() -> anyhow::Result<()> {
+        let harness = AntflyRuntime::open().await;
+        let state = &harness.runtime;
+        let id = ThreadId::new();
+        harness.insert_thread(id).await;
+        let record = GuardianReviewRecord::new(id, b"private review context".to_vec());
+        state.record_guardian_review_failure(&record).await?;
+        assert_eq!(1, state.list_guardian_review_records().await?.len());
+        harness
+            .antfly
+            .sql()
+            .await?
+            .execute(
+                "DELETE FROM codex_threads WHERE id = $1",
+                sql_params![id.to_string()],
             )
-            .await
-            .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-
-        let records = list_guardian_review_records(&antfly).await.unwrap();
-        assert_eq!(records.len(), MAX_GUARDIAN_REVIEW_RECORDS);
-        // Oldest ones (r0..) should have been evicted; newest (the last
-        // inserted) must survive.
-        let bodies: Vec<String> = records
-            .iter()
-            .map(|r| String::from_utf8(r.record.clone()).unwrap())
-            .collect();
-        assert!(!bodies.contains(&"r0".to_string()));
-        assert!(bodies.contains(&format!("r{}", MAX_GUARDIAN_REVIEW_RECORDS + 4)));
-        cleanup(&antfly, dir).await;
+            .await?;
+        assert!(state.list_guardian_review_records().await?.is_empty());
+        assert!(state.record_guardian_review_failure(&record).await.is_err());
+        harness.close().await;
+        Ok(())
     }
 }

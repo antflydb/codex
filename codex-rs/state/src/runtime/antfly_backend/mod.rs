@@ -38,16 +38,39 @@
 //! so it must never be held across an `.await` that is not itself part of
 //! the read-modify-write (for example, never across a search call).
 
+pub(crate) mod backfill;
 pub(crate) mod external_agent_config_imports;
 pub(crate) mod goals;
 pub(crate) mod guardian_feedback;
 pub(crate) mod memories;
 pub(crate) mod queue;
 pub(crate) mod remote_control;
+pub(crate) mod rollout_migration;
+#[cfg(test)]
+pub(crate) mod sql_test_support;
 pub(crate) mod thread_adapter;
 
 /// Maps an [`codex_antfly::AntflyError`] to `anyhow::Error` with a module tag,
 /// matching the style of the thread-store's `internal()` helper.
 pub(crate) fn internal(err: codex_antfly::AntflyError) -> anyhow::Error {
     anyhow::anyhow!("antfly: {err}")
+}
+
+/// Reads a column as text. `JSONB` columns such as `payload_json` decode as
+/// [`codex_antfly::sql::SqlValue::Json`]; a JSON string yields its contents
+/// and any other JSON value its serialized form.
+pub(crate) fn text_column(
+    row: &codex_antfly::sql::SqlRow,
+    column: &str,
+) -> codex_antfly::AntflyResult<String> {
+    match row.get(column)? {
+        codex_antfly::sql::SqlValue::Text(text) => Ok(text.clone()),
+        codex_antfly::sql::SqlValue::Json(value) => match value {
+            serde_json::Value::String(text) => Ok(text.clone()),
+            other => Ok(other.to_string()),
+        },
+        other => Err(codex_antfly::AntflyError::Malformed(format!(
+            "column {column}: expected text, got {other:?}"
+        ))),
+    }
 }

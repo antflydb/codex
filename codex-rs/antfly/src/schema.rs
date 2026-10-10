@@ -291,9 +291,11 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         "CREATE TABLE IF NOT EXISTS codex_thread_goal_continuation_deferrals (
             thread_id TEXT PRIMARY KEY REFERENCES codex_thread_goals (thread_id) ON DELETE CASCADE
         )",
-        // Memories pipeline.
+        // Memories pipeline. `version` separates the v1 and v2 memory
+        // stores (see `MemoryStore::new_antfly`).
         "CREATE TABLE IF NOT EXISTS codex_stage1_outputs (
-            thread_id TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
             source_updated_at BIGINT NOT NULL,
             raw_memory TEXT NOT NULL,
             rollout_summary TEXT NOT NULL,
@@ -302,10 +304,12 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             usage_count BIGINT,
             last_usage BIGINT,
             selected_for_phase2 BOOLEAN NOT NULL DEFAULT false,
-            selected_for_phase2_source_updated_at BIGINT
+            selected_for_phase2_source_updated_at BIGINT,
+            PRIMARY KEY (version, thread_id)
         )",
-        "CREATE INDEX IF NOT EXISTS codex_stage1_outputs_source ON codex_stage1_outputs (source_updated_at DESC, thread_id DESC)",
+        "CREATE INDEX IF NOT EXISTS codex_stage1_outputs_source ON codex_stage1_outputs (version, source_updated_at DESC, thread_id DESC)",
         "CREATE TABLE IF NOT EXISTS codex_jobs (
+            version TEXT NOT NULL,
             kind TEXT NOT NULL,
             job_key TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -319,11 +323,11 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             last_error TEXT,
             input_watermark BIGINT,
             last_success_watermark BIGINT,
-            PRIMARY KEY (kind, job_key)
+            PRIMARY KEY (version, kind, job_key)
         )",
-        "CREATE INDEX IF NOT EXISTS codex_jobs_claim ON codex_jobs (kind, status, retry_at, lease_until)",
+        "CREATE INDEX IF NOT EXISTS codex_jobs_claim ON codex_jobs (version, kind, status, retry_at, lease_until)",
         "CREATE TABLE IF NOT EXISTS codex_consolidation_progress (
-            singleton BIGINT PRIMARY KEY CHECK (singleton = 1),
+            version TEXT PRIMARY KEY,
             max_thread_count BIGINT NOT NULL DEFAULT 0
         )",
         // Queued turns. `revision` is assigned by the store as
