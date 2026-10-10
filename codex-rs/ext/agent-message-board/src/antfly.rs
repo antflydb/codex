@@ -485,10 +485,6 @@ impl AntflyAgentMessageBoard {
         unreachable!("the loop above always returns")
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "mirrors the single transactional post path; splitting would only move the arguments"
-    )]
     async fn post_attempt(
         &self,
         caller: ThreadId,
