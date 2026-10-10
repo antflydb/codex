@@ -1,18 +1,16 @@
-//! `list_threads` over the ordered listing and section indexes.
+//! `list_threads` over `codex_threads` with SQL keyset pagination.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
-use codex_antfly::ScanRequest;
+use codex_antfly::sql::SqlValue;
 use codex_protocol::ThreadId;
 
 use super::AntflyThreadStore;
 use super::internal;
-use super::keys;
 use super::record::ThreadRecord;
 use crate::ListThreadsParams;
 use crate::SortDirection;
@@ -22,11 +20,8 @@ use crate::ThreadSortKey;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-/// Records fetched per index scan while filling a page.
-const SCAN_BATCH: usize = 200;
-
-/// Listing cursor in the local store's format: `{rfc3339}|{thread_id}`, or
-/// `{position}|{thread_id}` for section ordering.
+/// Listing cursor: `{rfc3339}|{thread_id}`, or `{position}|{thread_id}` for
+/// section ordering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ListCursor {
     pub(crate) value: i64,
@@ -69,16 +64,6 @@ impl ListCursor {
         };
         Ok(Self { value, thread_id })
     }
-
-    /// The index key this cursor points at, for resuming a descending scan.
-    fn index_key(&self, archived: bool, sort_key: ThreadSortKey, section: Option<&str>) -> String {
-        match (sort_key, section) {
-            (ThreadSortKey::SectionPosition, Some(section)) => {
-                keys::section_entry(section, self.value, self.thread_id)
-            }
-            _ => keys::index_entry(archived, sort_key, self.value, self.thread_id),
-        }
-    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -87,93 +72,37 @@ fn normalize(path: &Path) -> PathBuf {
     PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed })
 }
 
-struct Filter<'a> {
-    params: &'a ListThreadsParams,
-    descendants: Option<HashSet<ThreadId>>,
-    cwds: Option<Vec<PathBuf>>,
-}
-
-impl Filter<'_> {
-    fn matches(&self, record: &ThreadRecord) -> bool {
-        let params = self.params;
-        if params.archived != record.archived_at.is_some() {
-            return false;
-        }
-        let in_section_listing = matches!(params.section, Some(Some(_)));
-        if !params.archived && !in_section_listing && record.preview().is_empty() {
-            return false;
-        }
-        if !params.allowed_sources.is_empty() && !params.allowed_sources.contains(&record.source())
-        {
-            return false;
-        }
-        if let Some(providers) = &params.model_providers
-            && !providers.is_empty()
-            && !providers.contains(&record.model_provider())
-        {
-            return false;
-        }
-        if let Some(cwds) = &self.cwds
-            && !cwds.contains(&normalize(&record.cwd()))
-        {
-            return false;
-        }
-        if let Some(section) = &params.section
-            && section.as_deref() != record.section.as_deref()
-        {
-            return false;
-        }
-        if let Some(project) = &params.project_id
-            && project.as_deref() != record.project_id().as_deref()
-        {
-            return false;
-        }
-        if let Some(term) = &params.search_term
-            && !record.searchable_summary().contains(term.as_str())
-        {
-            return false;
-        }
-        match &params.relation_filter {
-            Some(ThreadRelationFilter::DirectChildrenOf(parent)) => {
-                record.created.parent_thread_id == Some(*parent)
-            }
-            Some(ThreadRelationFilter::DescendantsOf(_)) => self
-                .descendants
-                .as_ref()
-                .is_some_and(|descendants| descendants.contains(&record.thread_id())),
-            None => true,
-        }
+fn sort_column(sort_key: ThreadSortKey) -> &'static str {
+    match sort_key {
+        ThreadSortKey::CreatedAt => "created_at_ms",
+        ThreadSortKey::UpdatedAt => "updated_at_ms",
+        ThreadSortKey::RecencyAt => "recency_at_ms",
+        ThreadSortKey::SectionPosition => "section_position",
     }
 }
 
-/// Every thread transitively spawned from `ancestor`, excluding it.
-async fn descendants_of(
-    store: &AntflyThreadStore,
-    ancestor: ThreadId,
-) -> ThreadStoreResult<HashSet<ThreadId>> {
-    let records = store
-        .antfly()
-        .scan_as::<ThreadRecord>(ScanRequest::prefix(keys::THREAD_PREFIX))
-        .await
-        .map_err(internal)?;
-    let parents: Vec<(ThreadId, Option<ThreadId>)> = records
-        .iter()
-        .map(|(_, record)| (record.thread_id(), record.created.parent_thread_id))
-        .collect();
-    let mut subtree = HashSet::from([ancestor]);
-    loop {
-        let mut discovered = false;
-        for (thread_id, parent) in &parents {
-            if parent.is_some_and(|parent| subtree.contains(&parent)) {
-                discovered |= subtree.insert(*thread_id);
-            }
+/// Appends `value` to `params` and returns its `$n` placeholder.
+fn bind(params: &mut Vec<SqlValue>, value: impl Into<SqlValue>) -> String {
+    params.push(value.into());
+    format!("${}", params.len())
+}
+
+/// A `LIKE` pattern matching `term` as a literal substring, case-sensitively
+/// (Antfly's embedded SQL engine does not support `strpos`, the dialect's
+/// suggested `instr` translation: `antfly SQL failed (0A000): This SQL
+/// statement or expression is not supported`). `%`, `_`, and `\` are escaped
+/// so the pattern cannot act as a glob.
+fn contains_pattern(term: &str) -> String {
+    let mut pattern = String::with_capacity(term.len() + 2);
+    pattern.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
         }
-        if !discovered {
-            break;
-        }
+        pattern.push(ch);
     }
-    subtree.remove(&ancestor);
-    Ok(subtree)
+    pattern.push('%');
+    pattern
 }
 
 pub(super) async fn list_threads(
@@ -189,104 +118,135 @@ pub(super) async fn list_threads(
         }
         _ => None,
     };
-    let section_ordered = params.sort_key == ThreadSortKey::SectionPosition;
+    let in_section_listing = section.is_some();
     let cursor = params
         .cursor
         .as_deref()
         .map(|token| ListCursor::parse(token, params.sort_key))
         .transpose()?;
-    let descendants = match &params.relation_filter {
-        Some(ThreadRelationFilter::DescendantsOf(ancestor)) => {
-            Some(descendants_of(store, *ancestor).await?)
-        }
-        _ => None,
-    };
-    let filter = Filter {
-        cwds: params
-            .cwd_filters
-            .as_ref()
-            .map(|cwds| cwds.iter().map(|cwd| normalize(cwd)).collect()),
-        params: &params,
-        descendants,
-    };
     let page_size = params.page_size.max(1);
 
-    // Index order: section listings ascend by position; time listings are
-    // stored newest first.
-    let prefix = match (&section, section_ordered) {
-        (Some(section), true) => keys::section_prefix(section),
-        _ => keys::index_prefix(params.archived, params.sort_key),
-    };
-    let index_descends = !section_ordered;
-    let wants_descending = params.sort_direction == SortDirection::Desc;
+    let mut values: Vec<SqlValue> = Vec::new();
+    let mut sql = String::from(super::record::SELECT_THREAD);
+    sql.push(' ');
 
-    let mut matched: Vec<ThreadRecord> = Vec::new();
-    let mut has_more = false;
-    if index_descends == wants_descending {
-        // The index order is the requested order: resume after the cursor.
-        let mut from = match &cursor {
-            Some(cursor) => format!(
-                "{}\u{0}",
-                cursor.index_key(params.archived, params.sort_key, section.as_deref())
-            ),
-            None => prefix.clone(),
-        };
-        let to = codex_antfly::keys::prefix_end(&prefix);
-        'scan: loop {
-            let batch = store
-                .antfly()
-                .scan_as::<ThreadRecord>(ScanRequest {
-                    from: from.clone(),
-                    to: to.clone(),
-                    limit: Some(SCAN_BATCH),
-                })
-                .await
-                .map_err(internal)?;
-            let exhausted = batch.len() < SCAN_BATCH;
-            for (key, record) in batch {
-                from = format!("{key}\u{0}");
-                if !filter.matches(&record) {
-                    continue;
-                }
-                if matched.len() == page_size {
-                    has_more = true;
-                    break 'scan;
-                }
-                matched.push(record);
-            }
-            if exhausted {
-                break;
-            }
+    if let Some(ThreadRelationFilter::DescendantsOf(ancestor)) = params.relation_filter {
+        let placeholder = bind(&mut values, ancestor.to_string());
+        sql = format!(
+            "WITH RECURSIVE subtree(child_thread_id) AS ( \
+                SELECT child_thread_id FROM codex_thread_spawn_edges WHERE parent_thread_id = {placeholder} \
+                UNION \
+                SELECT edge.child_thread_id FROM codex_thread_spawn_edges edge \
+                JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id \
+            ) {sql} JOIN subtree ON subtree.child_thread_id = t.id "
+        );
+    } else if let Some(ThreadRelationFilter::DirectChildrenOf(parent)) = params.relation_filter {
+        let placeholder = bind(&mut values, parent.to_string());
+        sql.push_str(&format!(
+            "JOIN codex_thread_spawn_edges e ON e.child_thread_id = t.id AND e.parent_thread_id = {placeholder} "
+        ));
+    }
+
+    let archived_placeholder = bind(&mut values, params.archived);
+    sql.push_str(&format!("WHERE t.archived = {archived_placeholder}"));
+    if !params.archived && !in_section_listing {
+        sql.push_str(" AND t.preview <> ''");
+    }
+    match &params.section {
+        Some(Some(section)) => {
+            let placeholder = bind(&mut values, section.clone());
+            sql.push_str(&format!(" AND t.thread_section_id = {placeholder}"));
         }
-    } else {
-        // Reverse of the index order: read everything, then page.
-        let mut all: Vec<ThreadRecord> = store
-            .antfly()
-            .scan_as::<ThreadRecord>(ScanRequest::prefix(&prefix))
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .map(|(_, record)| record)
+        Some(None) => sql.push_str(" AND t.thread_section_id IS NULL"),
+        None => {}
+    }
+    match &params.project_id {
+        Some(Some(project)) => {
+            let placeholder = bind(&mut values, project.clone());
+            sql.push_str(&format!(" AND t.project_id = {placeholder}"));
+        }
+        Some(None) => sql.push_str(" AND t.project_id IS NULL"),
+        None => {}
+    }
+    if !params.allowed_sources.is_empty() {
+        let placeholders: Vec<String> = params
+            .allowed_sources
+            .iter()
+            .map(|source| bind(&mut values, super::record::source_text(source)))
             .collect();
-        all.reverse();
-        let mut started = cursor.is_none();
-        for record in all {
-            if !started {
-                started = cursor.as_ref().is_some_and(|cursor| {
-                    ListCursor::for_record(&record, params.sort_key) == *cursor
-                });
-                continue;
-            }
-            if !filter.matches(&record) {
-                continue;
-            }
-            if matched.len() == page_size {
-                has_more = true;
-                break;
-            }
-            matched.push(record);
+        sql.push_str(&format!(" AND t.source IN ({})", placeholders.join(", ")));
+    }
+    if let Some(providers) = &params.model_providers
+        && !providers.is_empty()
+    {
+        let placeholders: Vec<String> = providers
+            .iter()
+            .map(|provider| bind(&mut values, provider.clone()))
+            .collect();
+        sql.push_str(&format!(
+            " AND t.model_provider IN ({})",
+            placeholders.join(", ")
+        ));
+    }
+    if let Some(cwds) = &params.cwd_filters {
+        if cwds.is_empty() {
+            sql.push_str(" AND 1 = 0");
+        } else {
+            let placeholders: Vec<String> = cwds
+                .iter()
+                .map(|cwd| bind(&mut values, normalize(cwd).to_string_lossy().to_string()))
+                .collect();
+            sql.push_str(&format!(" AND t.cwd IN ({})", placeholders.join(", ")));
         }
     }
+    if let Some(term) = &params.search_term {
+        let pattern = contains_pattern(term);
+        let p1 = bind(&mut values, pattern.clone());
+        let p2 = bind(&mut values, pattern.clone());
+        let p3 = bind(&mut values, pattern.clone());
+        let p4 = bind(&mut values, pattern);
+        sql.push_str(&format!(
+            " AND (COALESCE(t.name, '') LIKE {p1} \
+                OR t.title LIKE {p2} \
+                OR t.preview LIKE {p3} \
+                OR t.first_user_message LIKE {p4})"
+        ));
+    }
+
+    let order_column: String =
+        if section.is_some() && params.sort_key == ThreadSortKey::SectionPosition {
+            "t.section_position".to_string()
+        } else {
+            format!("t.{}", sort_column(params.sort_key))
+        };
+    let op = match params.sort_direction {
+        SortDirection::Asc => ">",
+        SortDirection::Desc => "<",
+    };
+    if let Some(cursor) = &cursor {
+        let value_param = bind(&mut values, cursor.value);
+        let id_param = bind(&mut values, cursor.thread_id.to_string());
+        sql.push_str(&format!(
+            " AND ({order_column} {op} {value_param} OR ({order_column} = {value_param} AND t.id {op} {id_param}))"
+        ));
+    }
+    let direction = match params.sort_direction {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
+    };
+    let limit_placeholder = bind(&mut values, (page_size + 1) as i64);
+    sql.push_str(&format!(
+        " ORDER BY {order_column} {direction}, t.id {direction} LIMIT {limit_placeholder}"
+    ));
+
+    let sql_handle = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql_handle.fetch_all(&sql, values).await.map_err(internal)?;
+    let mut matched: Vec<ThreadRecord> = rows
+        .iter()
+        .map(ThreadRecord::from_row)
+        .collect::<ThreadStoreResult<Vec<_>>>()?;
+    let has_more = matched.len() > page_size;
+    matched.truncate(page_size);
 
     let next_cursor = if has_more {
         matched

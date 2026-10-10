@@ -1,4 +1,5 @@
 use super::StateRuntime;
+use super::antfly_backend::thread_sections as antfly_sections;
 use crate::PINNED_THREAD_SECTION_ID;
 use crate::ThreadSection;
 use crate::ThreadSectionAppearance;
@@ -11,6 +12,9 @@ impl StateRuntime {
         name: &str,
         appearance: Option<ThreadSectionAppearance>,
     ) -> anyhow::Result<ThreadSection> {
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::create_thread_section(antfly, name, appearance).await;
+        }
         let section = ThreadSection {
             id: Uuid::now_v7().to_string(),
             name: name.to_string(),
@@ -43,6 +47,9 @@ impl StateRuntime {
         if id == PINNED_THREAD_SECTION_ID {
             anyhow::bail!("built-in pinned thread section cannot be renamed");
         }
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::rename_thread_section(antfly, id, name, appearance).await;
+        }
 
         let replace_appearance = appearance.is_some();
         let appearance = appearance
@@ -66,6 +73,9 @@ impl StateRuntime {
     pub async fn delete_thread_section(&self, id: &str) -> anyhow::Result<bool> {
         if id == PINNED_THREAD_SECTION_ID {
             anyhow::bail!("built-in pinned thread section cannot be deleted");
+        }
+        if let Some(antfly) = &self.antfly {
+            return antfly_sections::delete_thread_section(antfly, id).await;
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;

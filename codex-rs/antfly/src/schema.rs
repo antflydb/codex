@@ -394,6 +394,26 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY (migration_id, rollout_path)
         )",
     ],
+}, Migration {
+    version: 2,
+    name: "thread store columns",
+    statements: &[
+        // Fork lineage and paginated-history bookkeeping the SQLite `threads`
+        // table never needed (only `AntflyThreadStore` uses these): the
+        // immediate fork source, the inherited rollout prefix a fork reads
+        // through, the first ordinal that belongs to a subagent's own
+        // projected history, the multi-agent runtime version preserved
+        // across a revert, and the next ordinal a persisted item receives.
+        "ALTER TABLE codex_threads ADD COLUMN forked_from_id TEXT",
+        "ALTER TABLE codex_threads ADD COLUMN history_base_thread_id TEXT",
+        "ALTER TABLE codex_threads ADD COLUMN history_base_end_ordinal BIGINT",
+        "ALTER TABLE codex_threads ADD COLUMN subagent_history_start_ordinal BIGINT",
+        "ALTER TABLE codex_threads ADD COLUMN multi_agent_version TEXT",
+        "ALTER TABLE codex_threads ADD COLUMN next_ordinal BIGINT NOT NULL DEFAULT 0",
+        // Backfills `final_agent_item_id` for a turn that terminates without
+        // ever emitting a `final_answer`-phase agent message (spec §2.25).
+        "ALTER TABLE codex_thread_turns ADD COLUMN latest_unphased_agent_item_id TEXT",
+    ],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

@@ -1,3 +1,7 @@
+// TEMPORARY, pre-existing and unrelated to thread/state persistence: see
+// `codex-core`'s `lib.rs` for the same `recursion_limit` workaround and why.
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 use std::sync::Weak;
 

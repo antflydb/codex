@@ -1,5 +1,13 @@
 //! Root of the `codex-core` library.
-
+//
+// TEMPORARY, pre-existing and unrelated to thread/state persistence: a
+// debug-profile build of this crate alone (e.g. `cargo check -p codex-core`)
+// overflows rustc's default query-recursion limit while computing the
+// layout of `session::turn_input::handle`'s async fn body ("query depth
+// increased by 130"), independent of any change in this port. Bumping the
+// limit is the compiler's own suggested fix; please remove this once the
+// underlying type-nesting is addressed upstream.
+#![recursion_limit = "256"]
 // Prevent accidental direct writes to stdout/stderr in library code. All
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).

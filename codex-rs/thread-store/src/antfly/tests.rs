@@ -1221,23 +1221,20 @@ async fn delete_thread_removes_paginated_projection_rows() -> TestResult {
         .delete_thread(DeleteThreadParams { thread_id })
         .await?;
 
-    for prefix in [
-        super::keys::turn_id_prefix(thread_id),
-        super::keys::turn_start_prefix(thread_id),
-        super::keys::turn_end_prefix(thread_id),
-        super::keys::item_id_prefix(thread_id),
-        super::keys::item_created_prefix(thread_id),
-        super::keys::item_updated_prefix(thread_id),
-        super::keys::realtime_prefix(thread_id),
+    let sql = store.antfly().sql().await?;
+    for table in [
+        "codex_thread_turns",
+        "codex_thread_items",
+        "codex_thread_realtime_items",
+        "codex_thread_history_projection_state",
     ] {
-        let remaining = store
-            .antfly()
-            .scan(codex_antfly::ScanRequest::prefix(&prefix))
+        let remaining = sql
+            .fetch_all(
+                &format!("SELECT 1 AS present FROM {table} WHERE thread_id = $1"),
+                codex_antfly::sql_params![thread_id.to_string()],
+            )
             .await?;
-        assert!(
-            remaining.is_empty(),
-            "leftover projection rows under {prefix}"
-        );
+        assert!(remaining.is_empty(), "leftover projection rows in {table}");
     }
 
     settle(store, dir).await;

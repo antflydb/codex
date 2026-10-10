@@ -10,7 +10,8 @@
 
 use std::collections::HashSet;
 
-use codex_antfly::ScanRequest;
+use codex_antfly::sql::SqlRow;
+use codex_antfly::sql_params;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRealtimeItem;
 use codex_app_server_protocol::ThreadTimelineEntry;
@@ -25,7 +26,6 @@ use serde::Serialize;
 
 use super::AntflyThreadStore;
 use super::internal;
-use super::keys;
 use super::projection::ItemDoc;
 use super::projection::TurnDoc;
 use crate::ItemPage;
@@ -223,21 +223,20 @@ async fn scan_turns(
     store: &AntflyThreadStore,
     segment: Segment,
 ) -> ThreadStoreResult<Vec<TurnDoc>> {
-    let from = keys::turn_start_bound(segment.thread_id, segment.start_ordinal);
-    let to = match segment.end_ordinal {
-        Some(end) => keys::turn_start_bound(segment.thread_id, end),
-        None => codex_antfly::keys::prefix_end(&keys::turn_start_prefix(segment.thread_id)),
-    };
-    let rows = store
-        .antfly()
-        .scan_as::<TurnDoc>(ScanRequest {
-            from,
-            to,
-            limit: None,
-        })
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql
+        .fetch_all(
+            "SELECT * FROM codex_thread_turns WHERE thread_id = $1 AND rollout_ordinal >= $2 \
+             AND ($3::bigint IS NULL OR rollout_ordinal < $3) ORDER BY rollout_ordinal ASC",
+            sql_params![
+                segment.thread_id.to_string(),
+                segment.start_ordinal as i64,
+                segment.end_ordinal.map(|end| end as i64)
+            ],
+        )
         .await
         .map_err(internal)?;
-    Ok(rows.into_iter().map(|(_, turn)| turn).collect())
+    rows.iter().map(TurnDoc::from_row).collect()
 }
 
 /// Whether `turn_id` is hidden because a strictly newer segment has its own
@@ -247,14 +246,17 @@ async fn hidden_by_newer_segment(
     newer_segments: &[Segment],
     turn_id: &str,
 ) -> ThreadStoreResult<bool> {
+    let sql = store.antfly().sql().await.map_err(internal)?;
     for segment in newer_segments {
-        if store
-            .antfly()
-            .get(keys::turn_id_key(segment.thread_id, turn_id))
+        let present = sql
+            .fetch_optional(
+                "SELECT 1 AS present FROM codex_thread_turns WHERE thread_id = $1 AND turn_id = $2",
+                sql_params![segment.thread_id.to_string(), turn_id],
+            )
             .await
             .map_err(internal)?
-            .is_some()
-        {
+            .is_some();
+        if present {
             return Ok(true);
         }
     }
@@ -285,12 +287,16 @@ async fn load_summary_item(
     turn_id: &str,
     item_id: &str,
 ) -> ThreadStoreResult<Option<StoredThreadItem>> {
-    let doc = store
-        .antfly()
-        .get_as::<ItemDoc>(keys::item_id_key(thread_id, turn_id, item_id))
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let row = sql
+        .fetch_optional(
+            "SELECT * FROM codex_thread_items WHERE thread_id = $1 AND turn_id = $2 AND item_id = $3",
+            sql_params![thread_id.to_string(), turn_id, item_id],
+        )
         .await
         .map_err(internal)?;
-    Ok(doc.map(item_doc_to_stored))
+    row.map(|row| ItemDoc::from_row(&row).map(item_doc_to_stored))
+        .transpose()
 }
 
 fn item_doc_to_stored(item: ItemDoc) -> StoredThreadItem {
@@ -420,33 +426,37 @@ async fn scan_items_created(
     store: &AntflyThreadStore,
     segment: Segment,
 ) -> ThreadStoreResult<Vec<ItemDoc>> {
-    let from = keys::item_created_bound(segment.thread_id, segment.start_ordinal);
-    let to = match segment.end_ordinal {
-        Some(end) => keys::item_created_bound(segment.thread_id, end),
-        None => codex_antfly::keys::prefix_end(&keys::item_created_prefix(segment.thread_id)),
-    };
-    let rows = store
-        .antfly()
-        .scan_as::<ItemDoc>(ScanRequest {
-            from,
-            to,
-            limit: None,
-        })
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql
+        .fetch_all(
+            "SELECT * FROM codex_thread_items WHERE thread_id = $1 AND rollout_ordinal >= $2 \
+             AND ($3::bigint IS NULL OR rollout_ordinal < $3) ORDER BY rollout_ordinal ASC",
+            sql_params![
+                segment.thread_id.to_string(),
+                segment.start_ordinal as i64,
+                segment.end_ordinal.map(|end| end as i64)
+            ],
+        )
         .await
         .map_err(internal)?;
-    Ok(rows.into_iter().map(|(_, item)| item).collect())
+    rows.iter().map(ItemDoc::from_row).collect()
 }
 
 async fn scan_items_updated(
     store: &AntflyThreadStore,
     thread_id: ThreadId,
+    watermark: u64,
 ) -> ThreadStoreResult<Vec<ItemDoc>> {
-    let rows = store
-        .antfly()
-        .scan_as::<ItemDoc>(ScanRequest::prefix(&keys::item_updated_prefix(thread_id)))
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql
+        .fetch_all(
+            "SELECT * FROM codex_thread_items WHERE thread_id = $1 AND updated_at_ordinal > $2 \
+             ORDER BY updated_at_ordinal ASC",
+            sql_params![thread_id.to_string(), watermark as i64],
+        )
         .await
         .map_err(internal)?;
-    Ok(rows.into_iter().map(|(_, item)| item).collect())
+    rows.iter().map(ItemDoc::from_row).collect()
 }
 
 async fn find_item_anchor_ordinal(
@@ -455,14 +465,17 @@ async fn find_item_anchor_ordinal(
     turn_id: &str,
     item_id: &str,
 ) -> ThreadStoreResult<Option<u64>> {
+    let sql = store.antfly().sql().await.map_err(internal)?;
     for segment in segments {
-        if let Some(item) = store
-            .antfly()
-            .get_as::<ItemDoc>(keys::item_id_key(segment.thread_id, turn_id, item_id))
+        let row = sql
+            .fetch_optional(
+                "SELECT rollout_ordinal FROM codex_thread_items WHERE thread_id = $1 AND turn_id = $2 AND item_id = $3",
+                sql_params![segment.thread_id.to_string(), turn_id, item_id],
+            )
             .await
-            .map_err(internal)?
-        {
-            return Ok(Some(item.rollout_ordinal));
+            .map_err(internal)?;
+        if let Some(row) = row {
+            return Ok(Some(row.i64("rollout_ordinal").map_err(internal)? as u64));
         }
     }
     Ok(None)
@@ -524,8 +537,7 @@ pub(super) async fn list_items(
             params.thread_id,
             CursorScope::ItemsByUpdatedAtOrdinal,
         )?;
-        let mut candidates = scan_items_updated(store, segment.thread_id).await?;
-        candidates.retain(|item| item.updated_at_ordinal > watermark);
+        let mut candidates = scan_items_updated(store, segment.thread_id, watermark).await?;
         if let Some(turn_id) = params.turn_id.as_deref() {
             candidates.retain(|item| item.turn_id == turn_id);
         }
@@ -674,38 +686,28 @@ async fn realtime_in_segment(
     store: &AntflyThreadStore,
     segment: Segment,
 ) -> ThreadStoreResult<Vec<(u64, RealtimeItem)>> {
-    let from = keys::realtime_bound(segment.thread_id, segment.start_ordinal);
-    let to = match segment.end_ordinal {
-        Some(end) => keys::realtime_bound(segment.thread_id, end),
-        None => codex_antfly::keys::prefix_end(&keys::realtime_prefix(segment.thread_id)),
-    };
-    let docs = store
-        .antfly()
-        .scan(ScanRequest {
-            from,
-            to,
-            limit: None,
-        })
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let rows = sql
+        .fetch_all(
+            "SELECT rollout_ordinal, item_json FROM codex_thread_realtime_items WHERE thread_id = $1 \
+             AND rollout_ordinal >= $2 AND ($3::bigint IS NULL OR rollout_ordinal < $3) ORDER BY rollout_ordinal ASC",
+            sql_params![
+                segment.thread_id.to_string(),
+                segment.start_ordinal as i64,
+                segment.end_ordinal.map(|end| end as i64)
+            ],
+        )
         .await
         .map_err(internal)?;
-    docs.into_iter()
-        .map(|document| {
-            let ordinal = document
-                .doc
-                .get("rollout_ordinal")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| ThreadStoreError::Internal {
-                    message: "realtime item is missing its ordinal".to_owned(),
-                })?;
-            let item_json = document.doc.get("item_json").cloned().ok_or_else(|| {
-                ThreadStoreError::Internal {
-                    message: "realtime item is missing its payload".to_owned(),
-                }
+    rows.iter()
+        .map(|row: &SqlRow| {
+            let ordinal = row.i64("rollout_ordinal").map_err(internal)? as u64;
+            let item: RealtimeItem = serde_json::from_value(
+                row.json("item_json").map_err(internal)?,
+            )
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to deserialize realtime item: {err}"),
             })?;
-            let item: RealtimeItem =
-                serde_json::from_value(item_json).map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to deserialize realtime item: {err}"),
-                })?;
             Ok((ordinal, item))
         })
         .collect()

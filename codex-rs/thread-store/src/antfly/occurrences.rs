@@ -4,16 +4,15 @@
 //!
 //! The matching and snippet rules are ported verbatim from
 //! `local/thread_history/search.rs` so the two stores agree on byte/UTF-16
-//! offsets; only the item source (Antfly projection docs instead of SQLite
+//! offsets; only the item source (SQL projection rows instead of SQLite
 //! rows) differs.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use codex_antfly::ScanRequest;
+use codex_antfly::sql_params;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
-use codex_protocol::ThreadId;
 use codex_protocol::protocol::strip_user_message_prefix;
 use pulldown_cmark::Event;
 use pulldown_cmark::Parser;
@@ -29,7 +28,6 @@ use super::history::segment_index_for_ordinal;
 use super::history::serialize_history_cursor;
 use super::history::validate_paginated;
 use super::internal;
-use super::keys;
 use super::projection::ItemDoc;
 use super::projection::TurnDoc;
 use crate::SearchTextRange;
@@ -38,6 +36,7 @@ use crate::StoredThreadOccurrence;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use codex_protocol::ThreadId;
 
 const SNIPPET_CONTEXT_BEFORE_CHARS: usize = 48;
 const SNIPPET_CONTEXT_AFTER_CHARS: usize = 96;
@@ -84,32 +83,36 @@ async fn candidates_in_segment(
     segment: Segment,
     from_ordinal: u64,
 ) -> ThreadStoreResult<Vec<Candidate>> {
-    let from = keys::item_created_bound(segment.thread_id, from_ordinal.max(segment.start_ordinal));
-    let to = match segment.end_ordinal {
-        Some(end) => keys::item_created_bound(segment.thread_id, end),
-        None => codex_antfly::keys::prefix_end(&keys::item_created_prefix(segment.thread_id)),
-    };
-    let rows = store
-        .antfly()
-        .scan_as::<ItemDoc>(ScanRequest {
-            from,
-            to,
-            limit: None,
-        })
+    let sql = store.antfly().sql().await.map_err(internal)?;
+    let start = from_ordinal.max(segment.start_ordinal);
+    let rows = sql
+        .fetch_all(
+            "SELECT * FROM codex_thread_items WHERE thread_id = $1 AND rollout_ordinal >= $2 \
+             AND ($3::bigint IS NULL OR rollout_ordinal < $3) ORDER BY rollout_ordinal ASC",
+            sql_params![
+                segment.thread_id.to_string(),
+                start as i64,
+                segment.end_ordinal.map(|end| end as i64)
+            ],
+        )
         .await
         .map_err(internal)?;
     let mut turns_cache: HashMap<String, Option<TurnDoc>> = HashMap::new();
     let mut candidates = Vec::new();
-    for (_, doc) in rows {
+    for row in &rows {
+        let doc = ItemDoc::from_row(row)?;
         let is_final_agent = {
             let turn = match turns_cache.get(&doc.turn_id) {
                 Some(turn) => turn.clone(),
                 None => {
-                    let turn = store
-                        .antfly()
-                        .get_as::<TurnDoc>(keys::turn_id_key(segment.thread_id, &doc.turn_id))
+                    let turn_row = sql
+                        .fetch_optional(
+                            "SELECT * FROM codex_thread_turns WHERE thread_id = $1 AND turn_id = $2",
+                            sql_params![segment.thread_id.to_string(), doc.turn_id.clone()],
+                        )
                         .await
                         .map_err(internal)?;
+                    let turn = turn_row.map(|row| TurnDoc::from_row(&row)).transpose()?;
                     turns_cache.insert(doc.turn_id.clone(), turn.clone());
                     turn
                 }
@@ -310,14 +313,17 @@ async fn find_visible_turn_ordinal(
     segments: &[Segment],
     turn_id: &str,
 ) -> ThreadStoreResult<u64> {
+    let sql = store.antfly().sql().await.map_err(internal)?;
     for segment in segments.iter().rev() {
-        if let Some(turn) = store
-            .antfly()
-            .get_as::<TurnDoc>(keys::turn_id_key(segment.thread_id, turn_id))
+        if let Some(row) = sql
+            .fetch_optional(
+                "SELECT rollout_ordinal FROM codex_thread_turns WHERE thread_id = $1 AND turn_id = $2",
+                sql_params![segment.thread_id.to_string(), turn_id],
+            )
             .await
             .map_err(internal)?
         {
-            return Ok(turn.rollout_ordinal);
+            return Ok(row.i64("rollout_ordinal").map_err(internal)? as u64);
         }
     }
     Err(ThreadStoreError::InvalidRequest {
