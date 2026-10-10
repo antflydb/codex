@@ -394,6 +394,74 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY (migration_id, rollout_path)
         )",
     ],
+}, Migration {
+    version: 20,
+    name: "agent message board tables",
+    statements: &[
+        // Tombstones for permanently deleted boards (trees). A tombstoned
+        // board rejects every later write.
+        "CREATE TABLE IF NOT EXISTS codex_message_board_tombstones (
+            board TEXT PRIMARY KEY
+        )",
+        "CREATE TABLE IF NOT EXISTS codex_message_board_channels (
+            board TEXT NOT NULL,
+            name TEXT NOT NULL,
+            name_search TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            timestamp_us BIGINT NOT NULL,
+            author TEXT NOT NULL,
+            PRIMARY KEY (board, name)
+        )",
+        // `seq` is assigned by the store as
+        // `COALESCE(MAX(seq) WHERE board = ?, 0) + 1` in the same
+        // transaction that inserts the post (Antfly has no AUTOINCREMENT),
+        // retrying the transaction on a 40001 conflict. `is_root` mirrors
+        // `id = root` as an explicit boolean so the partial index below
+        // compares a boolean literal (antflydb/antfly#1054).
+        "CREATE TABLE IF NOT EXISTS codex_message_board_posts (
+            board TEXT NOT NULL,
+            id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            root TEXT NOT NULL,
+            is_root BOOLEAN NOT NULL,
+            author TEXT NOT NULL,
+            timestamp_us BIGINT NOT NULL,
+            seq BIGINT NOT NULL,
+            body_search TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            request_id TEXT NOT NULL,
+            request JSONB NOT NULL,
+            PRIMARY KEY (board, id)
+        )",
+        "CREATE UNIQUE INDEX IF NOT EXISTS codex_message_board_posts_request \
+         ON codex_message_board_posts (board, request_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS codex_message_board_posts_seq \
+         ON codex_message_board_posts (board, seq)",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_channel \
+         ON codex_message_board_posts (board, channel, seq)",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_channel_timestamp \
+         ON codex_message_board_posts (board, channel, timestamp_us, seq)",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_roots_created \
+         ON codex_message_board_posts (board, channel, timestamp_us, seq) WHERE is_root = true",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_root \
+         ON codex_message_board_posts (board, root, seq)",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_root_timestamp \
+         ON codex_message_board_posts (board, root, timestamp_us, seq)",
+        "CREATE INDEX IF NOT EXISTS codex_message_board_posts_timestamp \
+         ON codex_message_board_posts (board, timestamp_us, seq)",
+        "CREATE TABLE IF NOT EXISTS codex_message_board_subscriptions (
+            board TEXT NOT NULL,
+            target TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            PRIMARY KEY (board, target, agent)
+        )",
+        "CREATE TABLE IF NOT EXISTS codex_message_board_subscription_opt_outs (
+            board TEXT NOT NULL,
+            target TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            PRIMARY KEY (board, target, agent)
+        )",
+    ],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

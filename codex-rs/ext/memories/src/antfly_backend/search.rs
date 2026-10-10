@@ -5,6 +5,8 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use codex_antfly::schema;
+
 use super::AntflyMemoriesBackend;
 use crate::MAX_SEARCH_RESULTS;
 use crate::backend::ListMemoriesRequest;
@@ -66,16 +68,14 @@ pub(super) async fn search(
         request.normalized,
     )?;
 
-    let prefix = match &request.path {
-        Some(path) => backend.doc_key(path),
-        None => backend.note_prefix(),
-    };
+    let filter = backend.namespace_filter(request.path.as_deref());
     let search_term = queries.join(" ");
     let hits = backend
         .antfly
+        .documents(schema::MEMORY_NOTES)
         .search_text(
-            &prefix,
             &search_term,
+            Some(filter),
             FULL_TEXT_CANDIDATE_LIMIT,
             SEMANTIC_CANDIDATE_LIMIT,
         )

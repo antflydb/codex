@@ -1,13 +1,18 @@
-//! Offset pagination, matching the local and in-memory backends' cursor
-//! format so cursors stay opaque but structurally familiar across backends.
+//! Offset pagination and row decoding, matching
+//! [`crate::local::paging`]'s cursor format and SQL helpers so cursors stay
+//! opaque but structurally familiar, and so query results decode the same
+//! way, across backends.
 
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use codex_protocol::error::Result;
 
+use super::StoredPost;
 use super::invalid;
+use super::storage_error;
 use crate::Page;
 use crate::PageRequest;
+use crate::SortDirection;
 
 pub(super) struct Window {
     offset: u32,
@@ -35,8 +40,8 @@ impl Window {
         })
     }
 
-    pub(super) fn offset(&self) -> usize {
-        self.offset as usize
+    pub(super) fn offset(&self) -> i64 {
+        i64::from(self.offset)
     }
 
     pub(super) fn finish<T>(self, mut results: Vec<T>) -> Result<Page<T>> {
@@ -56,4 +61,20 @@ impl Window {
             next_cursor,
         })
     }
+}
+
+/// `ASC`/`DESC`, safe to interpolate directly since it never comes from user
+/// input.
+pub(super) fn direction(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::NewestFirst => "DESC",
+        SortDirection::OldestFirst => "ASC",
+    }
+}
+
+/// Decodes a `payload` JSONB column into [`StoredPost`]s, in row order.
+pub(super) fn decode_posts(rows: Vec<serde_json::Value>) -> Result<Vec<StoredPost>> {
+    rows.into_iter()
+        .map(|value| serde_json::from_value(value).map_err(storage_error))
+        .collect()
 }

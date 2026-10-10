@@ -6,7 +6,7 @@ use std::sync::Weak;
 use codex_antfly::Antfly;
 use codex_antfly::ApprovalMode;
 use codex_antfly::Write;
-use codex_antfly::keys;
+use codex_antfly::schema;
 use codex_core::ThreadManager;
 use codex_core::config::ThreadStoreConfig;
 use codex_extension_api::ApprovalDecision;
@@ -29,8 +29,6 @@ use crate::request::build_decide_request;
 use crate::request::describe_state;
 use crate::request::verdict;
 
-/// Key prefix for recorded approval decisions.
-pub(crate) const APPROVAL_PREFIX: &str = "approval:";
 /// Similar earlier decisions included in the model's context.
 const PRECEDENTS: usize = 3;
 
@@ -39,7 +37,8 @@ struct LatestUserRequest(String);
 
 /// Decision recorded for a tool call that has not finished yet.
 pub(crate) struct PendingOutcome {
-    pub(crate) key: String,
+    /// Document id in [`schema::APPROVALS`]; the approval's own id.
+    pub(crate) id: String,
     pub(crate) doc: Value,
 }
 
@@ -71,9 +70,13 @@ impl LayaApprovalReviewer {
         }
     }
 
+    /// Searches every recorded approval for ones whose `search_text`
+    /// resembles `action_text`, regardless of thread: precedents are meant
+    /// to generalize across the whole local history, not just this thread.
     async fn precedents(antfly: &Antfly, action_text: &str) -> Vec<String> {
         let hits = match antfly
-            .search_text(APPROVAL_PREFIX, action_text, PRECEDENTS, PRECEDENTS)
+            .documents(schema::APPROVALS)
+            .search_text(action_text, /*filter*/ None, PRECEDENTS, PRECEDENTS)
             .await
         {
             Ok(hits) => hits,
@@ -167,6 +170,13 @@ impl LayaApprovalReviewer {
         applied
     }
 
+    /// Records this decision as a document in [`schema::APPROVALS`], keyed
+    /// by the approval's own id. A simple id (rather than a time-ordered key,
+    /// as the legacy `approval:{desc ts}:{id}` layout used) is enough:
+    /// precedent search ranks by relevance, not recency, and a newest-first
+    /// listing (if one is ever added) can sort on the declared
+    /// `decided_at_ms` field through SQL or `antfly_search`, same as any
+    /// other document table.
     async fn record(
         &self,
         antfly: &Antfly,
@@ -177,11 +187,7 @@ impl LayaApprovalReviewer {
         applied: bool,
     ) {
         let now = chrono_millis();
-        let key = keys::join(&[
-            "approval",
-            &keys::descending(now),
-            &keys::escape(input.approval_id),
-        ]);
+        let id = input.approval_id.to_string();
         let outcome = match (applied, decided) {
             (true, Verdict::Deny { .. }) => "denied_by_review",
             _ => "pending",
@@ -212,12 +218,16 @@ impl LayaApprovalReviewer {
             pending.insert(
                 call_id.to_string(),
                 PendingOutcome {
-                    key: key.clone(),
+                    id: id.clone(),
                     doc: doc.clone(),
                 },
             );
         }
-        if let Err(err) = antfly.write(vec![Write::put(key, doc)]).await {
+        if let Err(err) = antfly
+            .documents(schema::APPROVALS)
+            .write(vec![Write::put(id, doc)])
+            .await
+        {
             tracing::warn!("failed to record approval decision: {err}");
         }
     }

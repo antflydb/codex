@@ -1,6 +1,14 @@
 //! Memories backend over Antfly: hybrid search over indexed notes, with the
 //! filesystem remaining the source of truth for note content.
 //!
+//! Notes are indexed as documents in `schema::MEMORY_NOTES`
+//! (`codex_memory_notes`), one document per note path, with declared fields
+//! `namespace`, `path` and `updated_at_ms` plus `search_text`. V1
+//! (`memories`) and V2 (`memories_v2`) notes share that one table and are
+//! distinguished by `namespace`; every search filters on it so the two
+//! versions' notes never mix, matching the old `mem:{ns}:note:{path}`
+//! key-prefix separation.
+//!
 //! `list` and `read` keep the local backend's exact semantics (same paths,
 //! same validation, same errors): they delegate to [`LocalMemoriesBackend`]
 //! unchanged. `add_ad_hoc_note` and `read` additionally index note content
@@ -31,6 +39,7 @@ use std::sync::Arc;
 use codex_antfly::Antfly;
 use codex_antfly::SEARCH_TEXT_FIELD;
 use codex_antfly::Write as AntflyWrite;
+use codex_antfly::schema;
 
 use crate::backend::AddAdHocMemoryNoteRequest;
 use crate::backend::AddAdHocMemoryNoteResponse;
@@ -44,16 +53,13 @@ use crate::backend::SearchMemoriesRequest;
 use crate::backend::SearchMemoriesResponse;
 use crate::local::LocalMemoriesBackend;
 
-const KEY_PREFIX: &str = "mem";
-const NOTE_SEGMENT: &str = "note";
-
 #[derive(Debug, Clone)]
 pub(crate) struct AntflyMemoriesBackend {
     local: LocalMemoriesBackend,
     antfly: Arc<Antfly>,
     root: PathBuf,
     /// Distinguishes V1 (`memories`) and V2 (`memories_v2`) notes sharing one
-    /// Antfly database.
+    /// `codex_memory_notes` table; every search filters on it.
     namespace: String,
 }
 
@@ -72,24 +78,38 @@ impl AntflyMemoriesBackend {
         }
     }
 
-    fn doc_key(&self, path: &str) -> String {
-        format!("{KEY_PREFIX}:{}:{NOTE_SEGMENT}:{path}", self.namespace)
+    /// Document id for one note: unique across namespaces since both share
+    /// `codex_memory_notes`.
+    fn doc_id(&self, path: &str) -> String {
+        format!("{}:{path}", self.namespace)
     }
 
-    fn note_prefix(&self) -> String {
-        format!("{KEY_PREFIX}:{}:{NOTE_SEGMENT}:", self.namespace)
+    /// `antfly_search` filter restricting a search to this namespace, and
+    /// optionally to one exact note path (used when the caller named a
+    /// `path`, which previously scanned a single-key KV prefix).
+    fn namespace_filter(&self, path: Option<&str>) -> serde_json::Value {
+        let namespace_term = serde_json::json!({"term": {"namespace": self.namespace}});
+        match path {
+            Some(path) => serde_json::json!({
+                "conjuncts": [namespace_term, {"term": {"path": path}}],
+            }),
+            None => namespace_term,
+        }
     }
 
     /// Best-effort: a failed index never fails the caller's read or write,
     /// since the filesystem (not Antfly) is the source of truth.
     async fn index_note(&self, path: &str, content: &str) {
         let doc = serde_json::json!({
+            "namespace": self.namespace,
             "path": path,
+            "updated_at_ms": now_ms(),
             SEARCH_TEXT_FIELD: content,
         });
         if let Err(err) = self
             .antfly
-            .write(vec![AntflyWrite::put(self.doc_key(path), doc)])
+            .documents(schema::MEMORY_NOTES)
+            .write(vec![AntflyWrite::put(self.doc_id(path), doc)])
             .await
         {
             tracing::warn!(path, %err, "failed to index memory note into Antfly");
@@ -115,6 +135,13 @@ impl AntflyMemoriesBackend {
             }
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 impl MemoriesBackend for AntflyMemoriesBackend {
