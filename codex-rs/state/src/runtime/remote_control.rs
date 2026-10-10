@@ -34,11 +34,13 @@ impl StateRuntime {
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<Option<RemoteControlEnrollmentRecord>> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::remote_control::get_remote_control_enrollment(
-                antfly,
-                websocket_url,
-                account_id,
-                app_server_client_name,
+            return Box::pin(
+                super::antfly_backend::remote_control::get_remote_control_enrollment(
+                    antfly,
+                    websocket_url,
+                    account_id,
+                    app_server_client_name,
+                ),
             )
             .await;
         }
@@ -78,8 +80,10 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         enrollment: &RemoteControlEnrollmentRecord,
     ) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::remote_control::upsert_remote_control_enrollment(
-                antfly, enrollment,
+            return Box::pin(
+                super::antfly_backend::remote_control::upsert_remote_control_enrollment(
+                    antfly, enrollment,
+                ),
             )
             .await;
         }
@@ -125,12 +129,14 @@ ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE SET
         remote_control_enabled: bool,
     ) -> anyhow::Result<u64> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::remote_control::set_remote_control_enabled(
-                antfly,
-                websocket_url,
-                account_id,
-                app_server_client_name,
-                remote_control_enabled,
+            return Box::pin(
+                super::antfly_backend::remote_control::set_remote_control_enabled(
+                    antfly,
+                    websocket_url,
+                    account_id,
+                    app_server_client_name,
+                    remote_control_enabled,
+                ),
             )
             .await;
         }
@@ -160,11 +166,13 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<u64> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::remote_control::delete_remote_control_enrollment(
-                antfly,
-                websocket_url,
-                account_id,
-                app_server_client_name,
+            return Box::pin(
+                super::antfly_backend::remote_control::delete_remote_control_enrollment(
+                    antfly,
+                    websocket_url,
+                    account_id,
+                    app_server_client_name,
+                ),
             )
             .await;
         }

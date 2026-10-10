@@ -10,6 +10,7 @@ use std::sync::Arc;
 use antfly_embedded::sqlx::Antfly as AntflyDb;
 use antfly_embedded::sqlx::AntflyArguments;
 use antfly_embedded::sqlx::AntflyConnectOptions;
+use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::Arguments;
 use sqlx::AssertSqlSafe;
@@ -388,62 +389,72 @@ impl Sql {
         })
     }
 
-    pub async fn execute(&self, statement: &str, params: Vec<SqlValue>) -> AntflyResult<u64> {
-        let statement = AssertSqlSafe(statement.to_string());
-        match &self.pool {
-            Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
-                .execute(pool)
-                .await
-                .map(|result| result.rows_affected())
-                .map_err(sql_error),
-            Pool::Remote(pool) => sqlx::query_with(statement, pg_arguments(params)?)
-                .execute(pool)
-                .await
-                .map(|result| result.rows_affected())
-                .map_err(sql_error),
-        }
+    pub fn execute<'a>(
+        &'a self,
+        statement: &'a str,
+        params: Vec<SqlValue>,
+    ) -> BoxFuture<'a, AntflyResult<u64>> {
+        Box::pin(async move {
+            let statement = AssertSqlSafe(statement.to_string());
+            match &self.pool {
+                Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
+                    .execute(pool)
+                    .await
+                    .map(|result| result.rows_affected())
+                    .map_err(sql_error),
+                Pool::Remote(pool) => sqlx::query_with(statement, pg_arguments(params)?)
+                    .execute(pool)
+                    .await
+                    .map(|result| result.rows_affected())
+                    .map_err(sql_error),
+            }
+        })
     }
 
-    pub async fn fetch_all(
-        &self,
-        statement: &str,
+    pub fn fetch_all<'a>(
+        &'a self,
+        statement: &'a str,
         params: Vec<SqlValue>,
-    ) -> AntflyResult<Vec<SqlRow>> {
-        let statement = AssertSqlSafe(statement.to_string());
-        match &self.pool {
-            Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
-                .fetch_all(pool)
-                .await
-                .map_err(sql_error)?
-                .iter()
-                .map(antfly_row)
-                .collect(),
-            Pool::Remote(pool) => sqlx::query_with(statement, pg_arguments(params)?)
-                .fetch_all(pool)
-                .await
-                .map_err(sql_error)?
-                .iter()
-                .map(pg_row)
-                .collect(),
-        }
+    ) -> BoxFuture<'a, AntflyResult<Vec<SqlRow>>> {
+        Box::pin(async move {
+            let statement = AssertSqlSafe(statement.to_string());
+            match &self.pool {
+                Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(sql_error)?
+                    .iter()
+                    .map(antfly_row)
+                    .collect(),
+                Pool::Remote(pool) => sqlx::query_with(statement, pg_arguments(params)?)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(sql_error)?
+                    .iter()
+                    .map(pg_row)
+                    .collect(),
+            }
+        })
     }
 
-    pub async fn fetch_optional(
-        &self,
-        statement: &str,
+    pub fn fetch_optional<'a>(
+        &'a self,
+        statement: &'a str,
         params: Vec<SqlValue>,
-    ) -> AntflyResult<Option<SqlRow>> {
-        Ok(self.fetch_all(statement, params).await?.into_iter().next())
+    ) -> BoxFuture<'a, AntflyResult<Option<SqlRow>>> {
+        Box::pin(async move { Ok(self.fetch_all(statement, params).await?.into_iter().next()) })
     }
 
     /// Starts a READ COMMITTED transaction. Concurrent commits to the same
     /// rows fail with SQLSTATE 40001 ([`AntflyError::is_conflict`]).
-    pub async fn begin(&self) -> AntflyResult<SqlTx> {
-        Ok(SqlTx {
-            inner: match &self.pool {
-                Pool::Embedded(pool) => Tx::Embedded(pool.begin().await.map_err(sql_error)?),
-                Pool::Remote(pool) => Tx::Remote(pool.begin().await.map_err(sql_error)?),
-            },
+    pub fn begin(&self) -> BoxFuture<'_, AntflyResult<SqlTx>> {
+        Box::pin(async move {
+            Ok(SqlTx {
+                inner: match &self.pool {
+                    Pool::Embedded(pool) => Tx::Embedded(pool.begin().await.map_err(sql_error)?),
+                    Pool::Remote(pool) => Tx::Remote(pool.begin().await.map_err(sql_error)?),
+                },
+            })
         })
     }
 
@@ -466,65 +477,77 @@ pub struct SqlTx {
 }
 
 impl SqlTx {
-    pub async fn execute(&mut self, statement: &str, params: Vec<SqlValue>) -> AntflyResult<u64> {
-        let statement = AssertSqlSafe(statement.to_string());
-        match &mut self.inner {
-            Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
-                .execute(&mut **tx)
-                .await
-                .map(|result| result.rows_affected())
-                .map_err(sql_error),
-            Tx::Remote(tx) => sqlx::query_with(statement, pg_arguments(params)?)
-                .execute(&mut **tx)
-                .await
-                .map(|result| result.rows_affected())
-                .map_err(sql_error),
-        }
-    }
-
-    pub async fn fetch_all(
-        &mut self,
-        statement: &str,
+    pub fn execute<'a>(
+        &'a mut self,
+        statement: &'a str,
         params: Vec<SqlValue>,
-    ) -> AntflyResult<Vec<SqlRow>> {
-        let statement = AssertSqlSafe(statement.to_string());
-        match &mut self.inner {
-            Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(sql_error)?
-                .iter()
-                .map(antfly_row)
-                .collect(),
-            Tx::Remote(tx) => sqlx::query_with(statement, pg_arguments(params)?)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(sql_error)?
-                .iter()
-                .map(pg_row)
-                .collect(),
-        }
+    ) -> BoxFuture<'a, AntflyResult<u64>> {
+        Box::pin(async move {
+            let statement = AssertSqlSafe(statement.to_string());
+            match &mut self.inner {
+                Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
+                    .execute(&mut **tx)
+                    .await
+                    .map(|result| result.rows_affected())
+                    .map_err(sql_error),
+                Tx::Remote(tx) => sqlx::query_with(statement, pg_arguments(params)?)
+                    .execute(&mut **tx)
+                    .await
+                    .map(|result| result.rows_affected())
+                    .map_err(sql_error),
+            }
+        })
     }
 
-    pub async fn fetch_optional(
-        &mut self,
-        statement: &str,
+    pub fn fetch_all<'a>(
+        &'a mut self,
+        statement: &'a str,
         params: Vec<SqlValue>,
-    ) -> AntflyResult<Option<SqlRow>> {
-        Ok(self.fetch_all(statement, params).await?.into_iter().next())
+    ) -> BoxFuture<'a, AntflyResult<Vec<SqlRow>>> {
+        Box::pin(async move {
+            let statement = AssertSqlSafe(statement.to_string());
+            match &mut self.inner {
+                Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(sql_error)?
+                    .iter()
+                    .map(antfly_row)
+                    .collect(),
+                Tx::Remote(tx) => sqlx::query_with(statement, pg_arguments(params)?)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(sql_error)?
+                    .iter()
+                    .map(pg_row)
+                    .collect(),
+            }
+        })
     }
 
-    pub async fn commit(self) -> AntflyResult<()> {
-        match self.inner {
-            Tx::Embedded(tx) => tx.commit().await.map_err(sql_error),
-            Tx::Remote(tx) => tx.commit().await.map_err(sql_error),
-        }
+    pub fn fetch_optional<'a>(
+        &'a mut self,
+        statement: &'a str,
+        params: Vec<SqlValue>,
+    ) -> BoxFuture<'a, AntflyResult<Option<SqlRow>>> {
+        Box::pin(async move { Ok(self.fetch_all(statement, params).await?.into_iter().next()) })
     }
 
-    pub async fn rollback(self) -> AntflyResult<()> {
-        match self.inner {
-            Tx::Embedded(tx) => tx.rollback().await.map_err(sql_error),
-            Tx::Remote(tx) => tx.rollback().await.map_err(sql_error),
-        }
+    pub fn commit(self) -> BoxFuture<'static, AntflyResult<()>> {
+        Box::pin(async move {
+            match self.inner {
+                Tx::Embedded(tx) => tx.commit().await.map_err(sql_error),
+                Tx::Remote(tx) => tx.commit().await.map_err(sql_error),
+            }
+        })
+    }
+
+    pub fn rollback(self) -> BoxFuture<'static, AntflyResult<()>> {
+        Box::pin(async move {
+            match self.inner {
+                Tx::Embedded(tx) => tx.rollback().await.map_err(sql_error),
+                Tx::Remote(tx) => tx.rollback().await.map_err(sql_error),
+            }
+        })
     }
 }

@@ -3,7 +3,7 @@ use super::*;
 impl StateRuntime {
     pub async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::backfill::get_backfill_state(antfly).await;
+            return Box::pin(super::antfly_backend::backfill::get_backfill_state(antfly)).await;
         }
         self.ensure_backfill_state_row().await?;
         let row = sqlx::query(
@@ -25,8 +25,11 @@ WHERE id = 1
     /// non-expired worker.
     pub async fn try_claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<bool> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::backfill::try_claim_backfill(antfly, lease_seconds)
-                .await;
+            return Box::pin(super::antfly_backend::backfill::try_claim_backfill(
+                antfly,
+                lease_seconds,
+            ))
+            .await;
         }
         self.ensure_backfill_state_row().await?;
         let now = Utc::now().timestamp();
@@ -53,7 +56,10 @@ WHERE id = 1
     /// Mark rollout metadata backfill as running.
     pub async fn mark_backfill_running(&self) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::backfill::mark_backfill_running(antfly).await;
+            return Box::pin(super::antfly_backend::backfill::mark_backfill_running(
+                antfly,
+            ))
+            .await;
         }
         self.ensure_backfill_state_row().await?;
         sqlx::query(
@@ -73,7 +79,10 @@ WHERE id = 1
     /// Persist rollout metadata backfill progress.
     pub async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::backfill::checkpoint_backfill(antfly, watermark).await;
+            return Box::pin(super::antfly_backend::backfill::checkpoint_backfill(
+                antfly, watermark,
+            ))
+            .await;
         }
         self.ensure_backfill_state_row().await?;
         sqlx::query(
@@ -94,8 +103,11 @@ WHERE id = 1
     /// Mark rollout metadata backfill as complete.
     pub async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()> {
         if let Some(antfly) = &self.antfly {
-            return super::antfly_backend::backfill::mark_backfill_complete(antfly, last_watermark)
-                .await;
+            return Box::pin(super::antfly_backend::backfill::mark_backfill_complete(
+                antfly,
+                last_watermark,
+            ))
+            .await;
         }
         self.ensure_backfill_state_row().await?;
         let now = Utc::now().timestamp();

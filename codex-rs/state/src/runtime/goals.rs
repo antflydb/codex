@@ -62,7 +62,7 @@ impl GoalStore {
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::get_thread_goal(antfly, thread_id).await;
+                return Box::pin(antfly_goals::get_thread_goal(antfly, thread_id)).await;
             }
         };
         let row = sqlx::query(
@@ -95,7 +95,7 @@ WHERE thread_id = ?
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::replace_thread_goal_snapshot(antfly, goal).await;
+                return Box::pin(antfly_goals::replace_thread_goal_snapshot(antfly, goal)).await;
             }
         };
         let mut transaction = pool.begin().await?;
@@ -158,8 +158,10 @@ ON CONFLICT(thread_id) DO NOTHING
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::has_thread_goal_continuation_deferral(antfly, thread_id)
-                    .await;
+                return Box::pin(antfly_goals::has_thread_goal_continuation_deferral(
+                    antfly, thread_id,
+                ))
+                .await;
             }
         };
         sqlx::query_scalar(
@@ -184,8 +186,10 @@ SELECT EXISTS(
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::clear_thread_goal_continuation_deferral(antfly, thread_id)
-                    .await;
+                return Box::pin(antfly_goals::clear_thread_goal_continuation_deferral(
+                    antfly, thread_id,
+                ))
+                .await;
             }
         };
         sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
@@ -206,13 +210,13 @@ SELECT EXISTS(
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::replace_thread_goal(
+                return Box::pin(antfly_goals::replace_thread_goal(
                     antfly,
                     thread_id,
                     objective,
                     status,
                     token_budget,
-                )
+                ))
                 .await;
             }
         };
@@ -276,13 +280,13 @@ RETURNING
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::insert_thread_goal(
+                return Box::pin(antfly_goals::insert_thread_goal(
                     antfly,
                     thread_id,
                     objective,
                     status,
                     token_budget,
-                )
+                ))
                 .await;
             }
         };
@@ -345,7 +349,7 @@ RETURNING
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::update_thread_goal(antfly, thread_id, update).await;
+                return Box::pin(antfly_goals::update_thread_goal(antfly, thread_id, update)).await;
             }
         };
         let GoalUpdate {
@@ -517,10 +521,14 @@ WHERE thread_id = ?
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => match status {
                 crate::ThreadGoalStatus::Paused => {
-                    return antfly_goals::pause_active_thread_goal(antfly, thread_id).await;
+                    return Box::pin(antfly_goals::pause_active_thread_goal(antfly, thread_id))
+                        .await;
                 }
                 _ => {
-                    return antfly_goals::usage_limit_active_thread_goal(antfly, thread_id).await;
+                    return Box::pin(antfly_goals::usage_limit_active_thread_goal(
+                        antfly, thread_id,
+                    ))
+                    .await;
                 }
             },
         };
@@ -562,7 +570,7 @@ WHERE thread_id = ?
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::delete_thread_goal(antfly, thread_id).await;
+                return Box::pin(antfly_goals::delete_thread_goal(antfly, thread_id)).await;
             }
         };
         let row = sqlx::query(
@@ -599,14 +607,14 @@ RETURNING
         let pool = match &self.backend {
             GoalBackend::Sqlite(pool) => pool,
             GoalBackend::Antfly(antfly) => {
-                return antfly_goals::account_thread_goal_usage(
+                return Box::pin(antfly_goals::account_thread_goal_usage(
                     antfly,
                     thread_id,
                     time_delta_seconds,
                     token_delta,
                     mode,
                     expected_goal_id,
-                )
+                ))
                 .await;
             }
         };
