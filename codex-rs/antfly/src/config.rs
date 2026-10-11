@@ -29,15 +29,16 @@ pub enum BackendConfig {
 pub struct EmbedderConfig {
     /// Model id as registered with Antfly inference.
     pub model: String,
-    /// Output dimensions of `model`.
-    pub dims: u32,
+    /// Matryoshka truncation of `model`'s output. `None` uses the model's
+    /// native size, which Antfly detects by probing the embedder.
+    pub dims: Option<u32>,
 }
 
 impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
-            model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1".to_string(),
-            dims: 1024,
+            model: "google/embeddinggemma-2".to_string(),
+            dims: None,
         }
     }
 }
@@ -172,7 +173,7 @@ impl AntflyConfig {
             let default = EmbedderConfig::default();
             Some(EmbedderConfig {
                 model: settings.embedder_model.unwrap_or(default.model),
-                dims: settings.embedder_dims.unwrap_or(default.dims),
+                dims: settings.embedder_dims.or(default.dims),
             })
         };
         let defaults = ApprovalSettings::default();

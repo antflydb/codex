@@ -226,7 +226,7 @@ async fn semantic_keys(antfly: &Antfly) -> Result<Vec<String>, codex_antfly::Ant
 
 #[test]
 fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error>> {
-    if !has_models("Qwen") {
+    if !has_models("google") {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
@@ -242,7 +242,7 @@ fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn switching_embedders_reindexes_existing_documents() -> Result<(), Box<dyn std::error::Error>> {
-    if !has_models("BAAI") || !has_models("Qwen") {
+    if !has_models("BAAI") || !has_models("google") {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
@@ -250,14 +250,14 @@ fn switching_embedders_reindexes_existing_documents() -> Result<(), Box<dyn std:
         let mut config = AntflyConfig::embedded(dir.path().join("codex.aflite"));
         config.embedder = Some(codex_antfly::EmbedderConfig {
             model: "BAAI/bge-small-en-v1.5".to_string(),
-            dims: 384,
+            dims: None,
         });
         let antfly = Antfly::open(config)?;
         write_semantic_fixture(&antfly).await?;
         assert_eq!(semantic_keys(&antfly).await?, vec!["a"]);
         antfly.close().await?;
 
-        // The default (Qwen3) embedder gets its own index, filled from the
+        // The default (EmbeddingGemma 2) embedder gets its own index, filled from the
         // documents already stored, and the bge index is dropped.
         let antfly = open(&dir, true);
         assert_eq!(semantic_keys(&antfly).await?, vec!["a"]);

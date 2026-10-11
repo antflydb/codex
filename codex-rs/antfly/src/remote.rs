@@ -246,12 +246,16 @@ impl Backend for RemoteBackend {
             if existing.status().is_success() {
                 return Ok(());
             }
-            let body = json!({
+            let mut body = json!({
                 "type": "embeddings",
                 "field": dense.field,
-                "dimension": dense.dims,
                 "embedder": {"provider": "antfly", "model": dense.model},
             });
+            // Without a dimension the server probes the embedder.
+            if let Some(dims) = dense.dims {
+                body["dimension"] = json!(dims);
+                body["embedder"]["dimensions"] = json!(dims);
+            }
             let response = self
                 .send(self.request(reqwest::Method::POST, url).json(&body))
                 .await?;

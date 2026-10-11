@@ -101,7 +101,8 @@ pub struct DenseIndex {
     pub name: String,
     pub field: String,
     pub model: String,
-    pub dims: u32,
+    /// `None` lets Antfly detect the embedder's native size.
+    pub dims: Option<u32>,
 }
 
 /// A document table and the indexes Codex needs on it. Full-text search over

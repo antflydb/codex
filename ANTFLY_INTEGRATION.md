@@ -54,10 +54,10 @@ implementation differs and why.
   replicated (outbox) backend was removed with the move to SQL tables.
 - **Search.** `search_threads` unions full-text matches with the top semantic
   neighbors (dense index over the `search_text` field, embedded by Antfly
-  inference with `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, 1,024
-  dimensions, by default; Antfly adds Qwen3's query instruction to searches
-  only), then sorts and pages by the requested key with the local store's
-  cursor format. The index name carries a hash of the model and dimensions,
+  inference with `google/embeddinggemma-2` by default; Antfly detects its
+  768 native dimensions and applies the `RETRIEVAL_QUERY` role to searches and
+  `RETRIEVAL_DOCUMENT` to writes), then sorts and pages by the requested key with the local store's
+  cursor format. The index name carries a hash of the model (and dimensions, if set),
   so changing `embedder_model` builds a new index; the embedded backend drops
   the old one.
 - **Approval review calibration.** Against the Laya checkpoint, independent
@@ -364,8 +364,8 @@ path = "~/.codex/antfly.aflite"      # embedded (the default without `url`)
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
 decide_model = "convaiinnovations/laya"
-# embedder_model = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"  # default
-# embedder_dims = 1024                # must match embedder_model
+# embedder_model = "google/embeddinggemma-2"  # default
+# embedder_dims = 256                 # optional Matryoshka truncation; omit for native size
 # semantic_search = false            # full text only, no embedder needed
 
 [experimental_thread_store.approvals]

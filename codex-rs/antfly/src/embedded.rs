@@ -358,20 +358,24 @@ impl Backend for EmbeddedBackend {
             {
                 return Ok(());
             }
-            let embedder = json!({"provider": "antfly", "model": dense.model});
+            let mut embedder = json!({"provider": "antfly", "model": dense.model});
+            let mut config = json!({
+                "type": "embeddings",
+                // Without a field the index reads `embedding` and never
+                // sees the enriched text.
+                "field": dense.field,
+                "metric": "cosine",
+            });
+            // Without dims Antfly probes the embedder for its native size.
+            if let Some(dims) = dense.dims {
+                embedder["dimensions"] = json!(dims);
+                config["dims"] = json!(dims);
+            }
+            config["embedder"] = embedder.clone();
             let index = json!({
                 "name": dense.name,
                 "kind": "dense_vector",
-                "config_json": json!({
-                    "type": "embeddings",
-                    // Without a field the index reads `embedding` and never
-                    // sees the enriched text.
-                    "field": dense.field,
-                    "dims": dense.dims,
-                    "metric": "cosine",
-                    "embedder": embedder,
-                })
-                .to_string(),
+                "config_json": config.to_string(),
             });
             let enrichment_name = format!("{}_embedder", dense.name);
             let enrichment = json!({

@@ -32,10 +32,14 @@ pub const SEARCH_TEXT_FIELD: &str = "search_text";
 /// index instead of silently reusing vectors from the old one.
 pub(crate) const DENSE_INDEX_PREFIX: &str = "codex_search_text";
 
-/// `codex_search_text_<FNV-1a of "model:dims">`, stable across releases.
+/// `codex_search_text_<FNV-1a of "model[:dims]">`, stable across releases.
 fn dense_index_name(embedder: &crate::config::EmbedderConfig) -> String {
+    let identity = match embedder.dims {
+        Some(dims) => format!("{}:{dims}", embedder.model),
+        None => embedder.model.clone(),
+    };
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in format!("{}:{}", embedder.model, embedder.dims).bytes() {
+    for byte in identity.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
