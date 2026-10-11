@@ -559,7 +559,7 @@ async fn execute_ddl(sql: &Sql, statement: &str) -> AntflyResult<u64> {
 /// Safe to run concurrently from several processes: statements are
 /// idempotent and the version insert ignores conflicts.
 pub async fn migrate(sql: &Sql, migrations: &[Migration]) -> AntflyResult<()> {
-    sql.execute(MIGRATIONS_TABLE, vec![]).await?;
+    execute_ddl(sql, MIGRATIONS_TABLE).await?;
     let applied: Vec<i64> = sql
         .fetch_all("SELECT version FROM codex_schema_migrations", vec![])
         .await?
