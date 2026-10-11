@@ -34,7 +34,7 @@ fn sql_round_trips_types_transactions_and_errors() -> Result<(), Box<dyn std::er
             .documents(codex_antfly::schema::HISTORY_ITEMS)
             .write(vec![Write::put("doc:1", json!({"text": "hello"}))])
             .await?;
-        let sql = Sql::connect_embedded(&path, true).await?;
+        let sql = Sql::connect_embedded(&path, true, antfly.backend().await?.embedded_database()).await?;
 
         sql.execute(
             "CREATE TABLE IF NOT EXISTS codex_things (id TEXT PRIMARY KEY, n BIGINT NOT NULL, \
@@ -117,7 +117,7 @@ fn migrations_create_every_table_and_rerun_cleanly() -> Result<(), Box<dyn std::
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("codex.aflite");
     runtime().block_on(async {
-        let sql = Sql::connect_embedded(&path, true).await?;
+        let sql = Sql::connect_embedded(&path, true, None).await?;
         codex_antfly::schema::migrate(&sql, codex_antfly::schema::MIGRATIONS).await?;
         codex_antfly::schema::migrate(&sql, codex_antfly::schema::MIGRATIONS).await?;
         let pinned = sql

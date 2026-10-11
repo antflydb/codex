@@ -406,6 +406,10 @@ impl Backend for EmbeddedBackend {
         })
     }
 
+    fn embedded_database(&self) -> Option<Arc<Database>> {
+        self.db.as_ref().map(Arc::clone)
+    }
+
     fn close(&self) -> BackendFuture<'_, ()> {
         Box::pin(async move {
             let Some(db) = self.db.as_ref().map(Arc::clone) else {

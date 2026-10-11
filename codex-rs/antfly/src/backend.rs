@@ -81,6 +81,13 @@ pub trait Backend: Send + Sync {
     /// Creates the table, its indexes, and its enrichments when missing.
     fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()>;
 
+    /// The in-process database handle, when there is one. Relational SQL
+    /// shares it so its connections never contend with this backend for the
+    /// file's writer lease.
+    fn embedded_database(&self) -> Option<std::sync::Arc<antfly_embedded::Database>> {
+        None
+    }
+
     /// Releases the backend's resources and resolves once they are released,
     /// including background work. Later calls fail.
     fn close(&self) -> BackendFuture<'_, ()> {

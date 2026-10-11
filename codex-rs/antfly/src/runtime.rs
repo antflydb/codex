@@ -154,9 +154,9 @@ impl Antfly {
                 let sql = match &self.config.backend {
                     BackendConfig::Embedded { path } => {
                         // The document backend creates the file and its
-                        // directory; open it first.
-                        self.backend().await?;
-                        Sql::connect_embedded(path.clone(), false).await?
+                        // directory; open it first and share its handle.
+                        let database = self.backend().await?.embedded_database();
+                        Sql::connect_embedded(path.clone(), false, database).await?
                     }
                     BackendConfig::Remote { sql_url, .. } => {
                         let url = sql_url.as_deref().ok_or_else(|| {

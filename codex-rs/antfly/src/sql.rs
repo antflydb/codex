@@ -351,8 +351,10 @@ pub struct Sql {
 }
 
 impl Sql {
-    /// Opens connections on an embedded `.aflite` file. libantfly queues
-    /// writers fairly, so this can share the file with a `Database` handle.
+    /// Opens connections on an embedded `.aflite` file. With `database`, the
+    /// connections run on that already-open handle; independent handles on
+    /// one file hand the writer lease back and forth, which costs roughly an
+    /// order of magnitude in throughput under concurrency.
     #[expect(
         clippy::disallowed_methods,
         reason = "the SQLite pool constructors are banned in favor of codex-state's shim; this pool is Antfly's, not SQLite's"
@@ -360,8 +362,12 @@ impl Sql {
     pub async fn connect_embedded(
         path: impl Into<std::path::PathBuf>,
         no_sync: bool,
+        database: Option<Arc<antfly_embedded::Database>>,
     ) -> AntflyResult<Self> {
-        let options = AntflyConnectOptions::new(path).no_sync(no_sync);
+        let mut options = AntflyConnectOptions::new(path).no_sync(no_sync);
+        if let Some(database) = database {
+            options = options.with_database(database);
+        }
         let pool = sqlx::pool::PoolOptions::<AntflyDb>::new()
             .max_connections(4)
             .connect_with(options)
