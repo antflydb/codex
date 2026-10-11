@@ -384,11 +384,7 @@ impl Sql {
         let options = url
             .parse::<sqlx_postgres::PgConnectOptions>()
             .map_err(sql_error)?
-            .extra_float_digits(None)
-            // Migrations and other DDL invalidate prepared statements
-            // (40001 "table definition changed"); prepare every query fresh
-            // as an unnamed statement instead of caching it per connection.
-            .statement_cache_capacity(0);
+            .extra_float_digits(None);
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect_with(options)

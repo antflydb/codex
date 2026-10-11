@@ -100,7 +100,8 @@ implementation differs and why.
   tables, a misreported NOT NULL error, 2 MiB statement and transaction
   limits; #1057) are fixed by #1060. The PostgreSQL listener now accepts
   sqlx-postgres's startup parameters (#1062, fixed by #1065). Standalone DDL over the PostgreSQL listener
-  (#1067) is fixed by #1070 (see Known limitations).
+  (#1067, #1070), prepared statements across DDL, and readiness (#1071,
+  #1073) are fixed.
 - Embedded `filter_prefix` takes the plain prefix string, not base64 as the
   OpenAPI `format: byte` suggests.
 - A dense index created without `field` reads `embedding` and never indexes
@@ -142,21 +143,19 @@ Known limitations:
 - The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
   full import takes hours on a debug build. Imported forks and reverts are
   flattened into self-contained threads.
-- The remote backend works end to end against `antfly standalone` built
-  from antflydb/antfly#1070 (standalone DDL publication, the fix for #1067):
-  from a fresh server, `antfly/tests/remote.rs` migrates every table over the
-  PostgreSQL listener, round-trips SQL, and writes, scans, and searches the
-  document tables over HTTP. Run it with `ANTFLY_TEST_URL`,
-  `ANTFLY_TEST_SQL_URL` (`postgres://admin:<pw>@host:port/default`), and
-  `ANTFLY_TEST_API_KEY` (an API key's `encoded` value). The migration runner
-  follows the server's publication protocol (retry `53300`, including during
-  startup; after `55000`, poll for the new table), and remote connections
-  disable the prepared-statement cache because DDL invalidates prepared
-  statements. Pin a release containing #1070 before relying on remote
-  storage. Antfly Cloud does not expose the PostgreSQL listener yet
+- The remote backend works end to end against `antfly standalone` from
+  Antfly main `22eebec31a` (#1062, #1067, #1071 fixed): from a fresh server,
+  `antfly/tests/remote.rs` migrates every table over the PostgreSQL listener
+  with sqlx's default prepared-statement cache, round-trips SQL, and writes,
+  scans, and searches the document tables over HTTP. Run it with
+  `ANTFLY_TEST_URL`, `ANTFLY_TEST_SQL_URL`
+  (`postgres://admin:<pw>@host:port/default`), and `ANTFLY_TEST_API_KEY` (an
+  API key's `encoded` value). The migration runner follows the server's
+  publication protocol (retry `53300`; after `55000`, poll for the new
+  table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `e70e7dc191` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `22eebec31a` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -164,7 +163,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `e70e7dc191` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `22eebec31a` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
