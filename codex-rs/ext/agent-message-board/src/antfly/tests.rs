@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 use super::AntflyAgentMessageBoard;
 use crate::AgentMessageBoard;
+use crate::ChannelDescription;
 use crate::ChannelQuery;
 use crate::CreateChannelRequest;
 use crate::MessageBoardHost;
@@ -163,11 +164,15 @@ async fn posting_updates_channel_and_thread_summaries_and_notifies_subscribers()
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: Some(ChannelDescription::try_from(
+                    "Team-wide chatter".to_string(),
+                )?),
                 subscription: SubscriptionChange::Subscribe,
             },
         )
         .await?;
     assert_eq!(channel.message_count, 0);
+    assert_eq!(channel.description.as_deref(), Some("Team-wide chatter"));
     assert_eq!(channel.created_by, alice_path.clone());
 
     // Bob subscribes to the channel so he is notified of new roots.
@@ -210,6 +215,7 @@ async fn posting_updates_channel_and_thread_summaries_and_notifies_subscribers()
             },
         )
         .await?
+        .channels
         .results
         .into_iter()
         .next()
@@ -303,6 +309,7 @@ async fn posting_is_idempotent_on_request_id_and_rejects_mismatched_retries() ->
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -376,6 +383,7 @@ async fn explicit_unsubscribe_survives_participation_and_search_filters_posts() 
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Subscribe,
             },
         )
@@ -485,6 +493,7 @@ async fn read_post_windows_text_and_delete_boards_tombstones_future_writes() -> 
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -561,6 +570,7 @@ async fn list_channels_orders_by_activity_then_name_and_filters_by_substring() -
                 alice,
                 CreateChannelRequest {
                     channel_name: name.to_string(),
+                    description: None,
                     subscription: SubscriptionChange::Unsubscribe,
                 },
             )
@@ -585,6 +595,7 @@ async fn list_channels_orders_by_activity_then_name_and_filters_by_substring() -
             },
         )
         .await?
+        .channels
         .results
         .into_iter()
         .map(|channel| channel.channel_name)
@@ -601,6 +612,7 @@ async fn list_channels_orders_by_activity_then_name_and_filters_by_substring() -
             },
         )
         .await?
+        .channels
         .results
         .into_iter()
         .map(|channel| channel.channel_name)
@@ -634,6 +646,7 @@ async fn channel_creation_rejects_duplicates_and_invalid_names() -> TestResult {
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -643,6 +656,7 @@ async fn channel_creation_rejects_duplicates_and_invalid_names() -> TestResult {
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -654,6 +668,7 @@ async fn channel_creation_rejects_duplicates_and_invalid_names() -> TestResult {
             alice,
             CreateChannelRequest {
                 channel_name: " padded ".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -682,6 +697,7 @@ async fn two_boards_in_one_database_do_not_see_each_others_data() -> TestResult 
             alice,
             CreateChannelRequest {
                 channel_name: "general".to_string(),
+                description: None,
                 subscription: SubscriptionChange::Unsubscribe,
             },
         )
@@ -697,7 +713,7 @@ async fn two_boards_in_one_database_do_not_see_each_others_data() -> TestResult 
             },
         )
         .await?;
-    assert!(board_b_channels.results.is_empty());
+    assert!(board_b_channels.channels.results.is_empty());
 
     settle(antfly, dir).await;
     Ok(())

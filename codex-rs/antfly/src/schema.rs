@@ -479,6 +479,22 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY (board, target, agent)
         )",
     ],
+}, Migration {
+    version: 21,
+    name: "agent message board channel descriptions",
+    statements: &["ALTER TABLE codex_message_board_channels ADD COLUMN description TEXT"],
+}, Migration {
+    version: 22,
+    name: "thread read receipts",
+    // No foreign key: rebuilding thread metadata keeps receipts, and only
+    // thread deletion removes them. NULL `first_unread_turn` means read; the
+    // empty string means manually unread from the start.
+    statements: &["CREATE TABLE IF NOT EXISTS codex_thread_read_receipts (
+        thread_id TEXT PRIMARY KEY,
+        first_unread_turn TEXT,
+        revision TEXT NOT NULL,
+        last_published_turn TEXT
+    )"],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (
@@ -501,6 +517,10 @@ const CATALOG_NOT_READY: &str = "53300";
 /// publishing (for example a table with foreign keys). The receipt says to
 /// poll for the table and not to replay the statement.
 const DDL_COMMITTED_NOT_READY: &str = "55000";
+/// SQLSTATE for `ADD COLUMN` of a column that already exists. Antfly has no
+/// `ADD COLUMN IF NOT EXISTS`, so a concurrent migrator that lost the race
+/// treats this as already applied.
+const DUPLICATE_COLUMN: &str = "42701";
 const CATALOG_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The table a `CREATE TABLE [IF NOT EXISTS] <name>` statement creates.
@@ -550,9 +570,21 @@ async fn execute_ddl(sql: &Sql, statement: &str) -> AntflyResult<u64> {
                     }
                 }
             }
+            Err(err) if err.sqlstate() == Some(DUPLICATE_COLUMN) && adds_column(statement) => {
+                return Ok(0);
+            }
             result => return result,
         }
     }
+}
+
+fn adds_column(statement: &str) -> bool {
+    let words: Vec<&str> = statement.split_whitespace().take(5).collect();
+    matches!(words.as_slice(), [alter, table, _, add, column]
+        if alter.eq_ignore_ascii_case("ALTER")
+            && table.eq_ignore_ascii_case("TABLE")
+            && add.eq_ignore_ascii_case("ADD")
+            && column.eq_ignore_ascii_case("COLUMN"))
 }
 
 /// Applies every migration that `codex_schema_migrations` has not recorded.

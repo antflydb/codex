@@ -257,22 +257,38 @@ pub enum RealtimeVoice {
     Alloy,
     Arbor,
     Ash,
+    Aube,
     Ballad,
     Breeze,
+    Bubbie,
     Cedar,
     Coral,
     Cove,
     Echo,
     Ember,
+    Haetsal,
+    Hanul,
+    Himari,
     Juniper,
+    Leher,
     Maple,
     Marin,
+    Miko,
+    Neer,
+    Porto,
+    Rindo,
+    Rio,
+    Rivage,
     Sage,
+    Selva,
     Shimmer,
     Sol,
+    Sonna,
     Spruce,
+    Tinta,
     Vale,
     Verse,
+    Viola,
 }
 
 impl RealtimeVoice {
@@ -281,22 +297,38 @@ impl RealtimeVoice {
             Self::Alloy => "alloy",
             Self::Arbor => "arbor",
             Self::Ash => "ash",
+            Self::Aube => "aube",
             Self::Ballad => "ballad",
             Self::Breeze => "breeze",
+            Self::Bubbie => "bubbie",
             Self::Cedar => "cedar",
             Self::Coral => "coral",
             Self::Cove => "cove",
             Self::Echo => "echo",
             Self::Ember => "ember",
+            Self::Haetsal => "haetsal",
+            Self::Hanul => "hanul",
+            Self::Himari => "himari",
             Self::Juniper => "juniper",
+            Self::Leher => "leher",
             Self::Maple => "maple",
             Self::Marin => "marin",
+            Self::Miko => "miko",
+            Self::Neer => "neer",
+            Self::Porto => "porto",
+            Self::Rindo => "rindo",
+            Self::Rio => "rio",
+            Self::Rivage => "rivage",
             Self::Sage => "sage",
+            Self::Selva => "selva",
             Self::Shimmer => "shimmer",
             Self::Sol => "sol",
+            Self::Sonna => "sonna",
             Self::Spruce => "spruce",
+            Self::Tinta => "tinta",
             Self::Vale => "vale",
             Self::Verse => "verse",
+            Self::Viola => "viola",
         }
     }
 }
@@ -307,6 +339,9 @@ impl RealtimeVoice {
 pub struct RealtimeVoicesList {
     pub v1: Vec<RealtimeVoice>,
     pub v2: Vec<RealtimeVoice>,
+    #[serde(default)]
+    #[ts(as = "Option<_>", optional)]
+    pub v3: Vec<RealtimeVoice>,
     pub default_v1: RealtimeVoice,
     pub default_v2: RealtimeVoice,
 }
@@ -336,6 +371,33 @@ impl RealtimeVoicesList {
                 RealtimeVoice::Verse,
                 RealtimeVoice::Marin,
                 RealtimeVoice::Cedar,
+            ],
+            v3: vec![
+                RealtimeVoice::Juniper,
+                RealtimeVoice::Maple,
+                RealtimeVoice::Spruce,
+                RealtimeVoice::Ember,
+                RealtimeVoice::Vale,
+                RealtimeVoice::Breeze,
+                RealtimeVoice::Arbor,
+                RealtimeVoice::Sol,
+                RealtimeVoice::Cove,
+                RealtimeVoice::Aube,
+                RealtimeVoice::Bubbie,
+                RealtimeVoice::Haetsal,
+                RealtimeVoice::Hanul,
+                RealtimeVoice::Himari,
+                RealtimeVoice::Leher,
+                RealtimeVoice::Miko,
+                RealtimeVoice::Neer,
+                RealtimeVoice::Porto,
+                RealtimeVoice::Rindo,
+                RealtimeVoice::Rio,
+                RealtimeVoice::Rivage,
+                RealtimeVoice::Selva,
+                RealtimeVoice::Sonna,
+                RealtimeVoice::Tinta,
+                RealtimeVoice::Viola,
             ],
             default_v1: RealtimeVoice::Cove,
             default_v2: RealtimeVoice::Marin,
@@ -914,6 +976,8 @@ impl InterAgentCommunication {
         ResponseInputItem::Message {
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: serde_json::to_string(&communication).unwrap_or_default(),
             }],
             phase: Some(MessagePhase::Commentary),
@@ -961,7 +1025,7 @@ impl InterAgentCommunication {
 
     pub fn from_message_content(content: &[ContentItem]) -> Option<Self> {
         match content {
-            [ContentItem::InputText { text }] | [ContentItem::OutputText { text }] => {
+            [ContentItem::InputText { text }] | [ContentItem::OutputText { text, .. }] => {
                 serde_json::from_str(text).ok()
             }
             _ => None,
@@ -4770,6 +4834,8 @@ mod tests {
             ResponseInputItem::Message {
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: serde_json::to_string(&serialized_communication)
                         .expect("serialize communication"),
                 }],
@@ -5985,6 +6051,7 @@ mod tests {
                     RealtimeVoice::Marin,
                     RealtimeVoice::Cedar,
                 ],
+                v3: RealtimeVoicesList::builtin().v3,
                 default_v1: RealtimeVoice::Cove,
                 default_v2: RealtimeVoice::Marin,
             }

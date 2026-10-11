@@ -26,6 +26,7 @@ use super::paging::direction;
 use super::preview;
 use super::storage_error;
 use crate::AgentMessageBoard;
+use crate::ChannelPage;
 use crate::ChannelQuery;
 use crate::ChannelSummary;
 use crate::CreateChannelRequest;
@@ -127,7 +128,7 @@ impl AgentMessageBoard for AntflyAgentMessageBoard {
         &self,
         caller: ThreadId,
         query: ChannelQuery,
-    ) -> BoxFuture<'_, Result<Page<ChannelSummary>>> {
+    ) -> BoxFuture<'_, Result<ChannelPage>> {
         Box::pin(async move {
             self.host.agent_path(caller).await?;
             let sql = self.antfly.sql().await.map_err(storage_error)?;
@@ -166,7 +167,10 @@ impl AgentMessageBoard for AntflyAgentMessageBoard {
                 channels.push(self.require_channel_summary(&mut tx, &name).await?);
             }
             let _ = tx.rollback().await;
-            window.finish(channels)
+            Ok(ChannelPage {
+                channels: window.finish(channels)?,
+                board_permissions: None,
+            })
         })
     }
 

@@ -15,6 +15,10 @@ pub(crate) enum KeyEventAction {
 }
 
 impl ChatWidget {
+    pub(crate) fn clear_composer_selection(&mut self) {
+        self.bottom_pane.clear_composer_selection();
+    }
+
     pub(crate) fn end_composer_drag(&mut self) {
         self.bottom_pane.end_composer_drag();
     }
@@ -57,7 +61,25 @@ impl ChatWidget {
         self.bottom_pane.keymap_contexts()
     }
 
+    pub(crate) fn take_key_chord_reset(&mut self) -> bool {
+        std::mem::take(&mut self.bottom_pane.key_chord_reset_requested)
+    }
+
+    pub(crate) fn consume_view_transition_key_event(&mut self, key_event: KeyEvent) -> bool {
+        self.bottom_pane
+            .consume_view_transition_key_event(key_event)
+    }
+
+    #[cfg(test)]
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) -> KeyEventAction {
+        self.handle_key_event_with_activation_key(key_event, /*activation_key*/ None)
+    }
+
+    pub(crate) fn handle_key_event_with_activation_key(
+        &mut self,
+        key_event: KeyEvent,
+        activation_key: Option<crate::key_hint::KeyBinding>,
+    ) -> KeyEventAction {
         if self.handle_startup_submission_key(key_event) {
             return KeyEventAction::None;
         }
@@ -81,7 +103,8 @@ impl ChatWidget {
             let should_pause_active_goal = self
                 .bottom_pane
                 .active_view_will_interrupt_turn_on_key_event(key_event);
-            self.bottom_pane.handle_key_event(key_event);
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key_event, activation_key);
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
             }
@@ -92,7 +115,8 @@ impl ChatWidget {
         }
 
         if self.shortcut_overlay_visible() && key_hint::plain(KeyCode::Esc).is_press(key_event) {
-            self.bottom_pane.handle_key_event(key_event);
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key_event, activation_key);
             return KeyEventAction::None;
         }
 
@@ -250,7 +274,9 @@ impl ChatWidget {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
                 let should_pause_active_goal =
                     self.bottom_pane.should_interrupt_running_task(key_event);
-                let input_result = self.bottom_pane.handle_key_event(key_event);
+                let input_result = self
+                    .bottom_pane
+                    .handle_key_event_with_activation_key(key_event, activation_key);
                 if matches!(
                     input_result,
                     InputResult::None | InputResult::ParentOwnedInputBlocked
@@ -491,6 +517,10 @@ impl ChatWidget {
         self.refresh_startup_recovery();
     }
 
+    pub(crate) fn is_in_paste_burst(&self) -> bool {
+        self.bottom_pane.is_in_paste_burst()
+    }
+
     // Returns true if caller should skip rendering this frame (a future frame is scheduled).
     pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
         if self.bottom_pane.flush_paste_burst_if_due() {
@@ -498,7 +528,7 @@ impl ChatWidget {
             // A paste just flushed; request an immediate redraw and skip this frame.
             self.request_redraw();
             true
-        } else if self.bottom_pane.is_in_paste_burst() {
+        } else if self.is_in_paste_burst() {
             // While capturing a burst, schedule a follow-up tick and skip this frame
             // to avoid redundant renders between ticks.
             frame_requester.schedule_frame_in(

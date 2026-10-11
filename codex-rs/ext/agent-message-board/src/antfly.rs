@@ -202,7 +202,7 @@ impl AntflyAgentMessageBoard {
     ) -> codex_antfly::AntflyResult<Option<ChannelSummary>> {
         let Some(row) = tx
             .fetch_optional(
-                "SELECT c.created_at AS created_at, c.author AS author,
+                "SELECT c.created_at AS created_at, c.author AS author, c.description AS description,
                  (SELECT COUNT(*) FROM codex_message_board_posts p
                   WHERE p.board=c.board AND p.channel=c.name) AS message_count
                  FROM codex_message_board_channels c WHERE c.board=$1 AND c.name=$2",
@@ -230,7 +230,9 @@ impl AntflyAgentMessageBoard {
             .transpose()
             .map_err(|err| codex_antfly::AntflyError::Malformed(err.to_string()))?;
         Ok(Some(ChannelSummary {
+            permissions: None,
             channel_name: name.to_string(),
+            description: row.opt_string("description")?,
             created_at,
             created_by,
             message_count: row.i64("message_count")? as usize,
@@ -378,15 +380,16 @@ impl AntflyAgentMessageBoard {
         let inserted = tx
             .execute(
                 "INSERT INTO codex_message_board_channels \
-                 (board, name, name_search, created_at, timestamp_us, author) \
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (board, name) DO NOTHING",
+                 (board, name, name_search, created_at, timestamp_us, author, description) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (board, name) DO NOTHING",
                 sql_params![
                     self.identity.to_string(),
                     request.channel_name.clone(),
                     default_case_fold_str(&request.channel_name),
                     now.to_rfc3339(),
                     now.timestamp_micros(),
-                    author.to_string()
+                    author.to_string(),
+                    request.description.map(String::from)
                 ],
             )
             .await

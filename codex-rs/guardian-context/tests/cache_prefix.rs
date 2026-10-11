@@ -13,6 +13,7 @@ use codex_guardian_context::SectionInput;
 use codex_guardian_context::TranscriptFormat;
 use codex_guardian_context::TrustedSkills;
 use codex_guardian_context::TrustedTool;
+use codex_guardian_context::TrustedToolSource;
 use codex_guardian_context::default_registry;
 use codex_history::RetainedContext;
 use codex_history::RetainedInputSource;
@@ -39,6 +40,8 @@ impl SectionHistory for History {
 
 fn user_message(texts: Vec<String>) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_owned(),
         content: texts
@@ -106,7 +109,7 @@ fn changing_retained_context_and_attestations_preserves_history_before_the_curre
             let tool = TrustedTool {
                 server: format!("server-{generation}"),
                 connector_id: None,
-                source: "user configuration".to_owned(),
+                source: TrustedToolSource::UserConfiguration("user configuration".to_owned()),
             };
             let skills = TrustedSkills {
                 paths: vec![format!("/skills/skill-{generation}/SKILL.md")],

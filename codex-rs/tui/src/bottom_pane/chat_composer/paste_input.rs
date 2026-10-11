@@ -1,8 +1,9 @@
 //! Classify and integrate composer pastes and capture raw paste tabs before completion or submission.
 //! Multiline pastes on a line beginning with `> ` continue that prefix after every newline,
-//! including blank and trailing lines. This happens before large pastes are collapsed, so their
-//! expanded text retains the quoting. Two unquoted newlines after the inserted text or placeholder
-//! leave the cursor in the next Markdown block, including in embedded answer fields.
+//! including blank lines, but not after a single trailing newline. This happens before large pastes
+//! are collapsed, so their expanded text retains the quoting. Two unquoted newlines after the
+//! inserted text or placeholder leave the cursor in the next Markdown block, including in embedded
+//! answer fields.
 //! Provisional startup input, search queries, and shell input remain literal.
 //! Paste classification and insertion share one textarea edit target, including selection replacement.
 
@@ -37,13 +38,31 @@ impl ChatComposer {
     /// Include accepted but unflushed keys without changing live paste detection.
     pub(crate) fn recovery_snapshot(&self) -> ComposerDraftSnapshot {
         let mut snapshot = self.draft_snapshot();
-        if let Some(pending) = self.draft.paste_burst.clone().flush_before_modified_input() {
-            let mut textarea = TextArea::new();
-            textarea.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
-            textarea.insert_str_at(snapshot.cursor, &pending);
-            snapshot.text = textarea.text().to_owned();
-            snapshot.text_elements = textarea.text_elements();
+        let pending = self.draft.paste_burst.clone().flush_pending();
+        if matches!(pending, FlushResult::None) {
+            return snapshot;
         }
+        let mut textarea = TextArea::new();
+        textarea.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
+        match pending {
+            FlushResult::Typed(ch) if self.draft.textarea.is_vim_replace_mode() => {
+                textarea.set_cursor(snapshot.cursor);
+                if let Some(selection) = self.draft.textarea.mouse_selection_range() {
+                    let offset = usize::from(self.draft.is_bash_mode);
+                    textarea.replace_range(
+                        selection.start + offset..selection.end + offset,
+                        &ch.to_string(),
+                    );
+                } else {
+                    textarea.replace_vim_text(&ch.to_string());
+                }
+            }
+            FlushResult::Typed(ch) => textarea.insert_str_at(snapshot.cursor, &ch.to_string()),
+            FlushResult::Paste(pasted) => textarea.insert_str_at(snapshot.cursor, &pasted),
+            FlushResult::None => {}
+        }
+        snapshot.text = textarea.text().to_owned();
+        snapshot.text_elements = textarea.text_elements();
         snapshot
     }
 
@@ -149,6 +168,10 @@ impl ChatComposer {
             && current_line.starts_with("> ")
             && pasted.contains('\n');
         let pasted = if is_blockquote {
+            let pasted = pasted
+                .strip_suffix('\n')
+                .filter(|pasted| !pasted.is_empty())
+                .unwrap_or(pasted.as_ref());
             std::borrow::Cow::Owned(pasted.replace('\n', "\n> "))
         } else {
             pasted

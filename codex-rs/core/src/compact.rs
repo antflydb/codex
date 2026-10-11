@@ -538,7 +538,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     let mut pieces = Vec::new();
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if !text.is_empty() {
                     pieces.push(text.as_str());
                 }
@@ -606,7 +606,7 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
 /// model-expected boundary.
 ///
 /// Placement rules:
-/// - Prefer immediately before the last real user or agent message.
+/// - Prefer immediately before the last real user, agent message, or retained standalone output.
 /// - If no real user messages remain, insert before the compaction summary so
 ///   the summary stays last.
 /// - If there are no user messages, insert before the last compaction item so
@@ -619,6 +619,10 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     let mut last_user_or_summary_index = None;
     let mut last_real_user_index = None;
     for (i, item) in compacted_history.iter().enumerate().rev() {
+        if crate::compact_retained_tool_outputs::is_retained_tool_output(item) {
+            last_real_user_index = Some(i);
+            break;
+        }
         if let ResponseItem::AgentMessage { content, .. } = &item.item
             && !matches!(
                 content.first(),
@@ -733,6 +737,8 @@ fn build_compacted_history_with_limit(
             }
             selected_messages.push(ResponseItemEnvelope {
                 item: ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: id.clone(),
                     role: "user".to_owned(),
                     content,

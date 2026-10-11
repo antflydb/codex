@@ -843,6 +843,13 @@ impl AntflyThreadStore {
         )
         .await
         .map_err(internal)?;
+        // Read receipts outlive metadata rebuilds, so only deletion removes them.
+        sql.execute(
+            "DELETE FROM codex_thread_read_receipts WHERE thread_id = $1",
+            sql_params![thread_id.to_string()],
+        )
+        .await
+        .map_err(internal)?;
         // `codex_thread_attachments` and `codex_thread_dynamic_tools` cascade
         // from this delete.
         sql.execute(

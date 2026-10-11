@@ -492,6 +492,7 @@ impl App {
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
         chat_widget.fork_in_progress = self.chat_widget.fork_in_progress;
         self.pending_right_click_paste = None;
+        self.config_notification_test_pending = None;
         if !self.chat_widget.realtime_conversation_is_running() {
             self.retain_realtime_replay_state_before_replace();
         }
@@ -504,6 +505,7 @@ impl App {
         if chat_widget.last_terminal_title.is_none() {
             chat_widget.last_terminal_title = previous_terminal_title;
         }
+        chat_widget.config_panel_tui = self.chat_widget.config_panel_tui.clone();
         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
         chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         chat_widget.set_local_worktree_operations(self.chat_widget.local_worktree_operations);
@@ -808,7 +810,7 @@ impl App {
         }
         if voice_owner.is_some() {
             for (thread_id, channel) in &self.thread_event_channels {
-                if Some(*thread_id) != voice_owner {
+                if Some(*thread_id) != voice_owner && !self.side_threads.contains_key(thread_id) {
                     for request in channel.store.lock().await.pending_replay_requests() {
                         self.pending_app_server_requests
                             .resolve_notification(&thread_id.to_string(), request.id());
@@ -817,7 +819,9 @@ impl App {
             }
         }
         self.thread_event_listener_tasks.retain(|id, task| {
-            if Some(*id) == voice_owner || self.agents_overview.dispatched_requests.contains_key(id)
+            if Some(*id) == voice_owner
+                || self.side_threads.contains_key(id)
+                || self.agents_overview.dispatched_requests.contains_key(id)
             {
                 true
             } else {
@@ -826,14 +830,13 @@ impl App {
             }
         });
         self.thread_event_channels
-            .retain(|id, _| Some(*id) == voice_owner);
+            .retain(|id, _| Some(*id) == voice_owner || self.side_threads.contains_key(id));
         self.pending_realtime_speech_replay.clear();
         self.pending_realtime_transcript_replay.clear();
         self.realtime_replay_order.clear();
         self.pending_server_profiles.clear();
         self.agents_overview.activity.clear();
         self.agent_navigation.clear();
-        self.side_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -842,6 +845,16 @@ impl App {
         self.pending_primary_events.clear();
         if voice_owner.is_none() {
             self.pending_app_server_requests.clear();
+            let side_thread_ids: Vec<_> = self.side_threads.keys().copied().collect();
+            for thread_id in side_thread_ids {
+                if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                    for request in channel.store.lock().await.pending_replay_requests() {
+                        let _ = self
+                            .pending_app_server_requests
+                            .note_server_request(&request);
+                    }
+                }
+            }
         }
         self.pending_startup_thread_start = false;
         self.pending_server_version_notice = None;

@@ -1300,6 +1300,7 @@ pub(crate) async fn delete_threads_strict(
             "codex_stage1_outputs",
             "codex_thread_goals",
             "codex_queued_items",
+            "codex_thread_read_receipts",
         ] {
             sql.execute(
                 &format!("DELETE FROM {table} WHERE thread_id = $1"),

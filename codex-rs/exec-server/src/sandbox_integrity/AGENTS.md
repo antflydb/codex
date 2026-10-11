@@ -30,7 +30,7 @@ negatives. Backend glob/symlink nuances and writable hard-link aliases are not
 fully modeled. The separate glob scan can differ from enforcement's snapshot.
 Metrics describe observed checker outcomes, not accuracy or missed violations.
 
-Windows scanner discovery currently uses `which`, while enforcement uses
+MXC scanner discovery currently uses `which`, while enforcement uses
 `Command`. Their search-order and environment differences can select different
 executables or cause only one scan to use the internal walker. This is an accepted
 telemetry limitation for this phase; changing production scanner selection is deferred.
@@ -40,9 +40,9 @@ implementations. Review against this scope. Regressions in explicit policy
 handling, executor context, or reporting remain actionable; this is not a blanket
 exemption for false positives or false negatives.
 
-## Open eligibility issue
+## Eligibility
 
-Approved escalations that retain only deny-read restrictions should be excluded.
-The current full-disk-write guard does not exclude `:root = write` plus denials,
-and `SandboxExecRequest` lacks the approval context to distinguish that escalation
-from a configured weak policy. Do not infer approval from policy shape.
+Skip `SandboxOverride::EscalatedSandboxWithRestrictions` before preparation or
+telemetry: these approved escalations retain only deny-read restrictions.
+An ordinary configured `:root = write` policy with denials is still checked.
+Do not infer approval from policy shape.

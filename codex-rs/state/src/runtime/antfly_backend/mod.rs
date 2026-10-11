@@ -53,6 +53,7 @@ pub(crate) mod rollout_migration;
 #[cfg(test)]
 pub(crate) mod sql_test_support;
 pub(crate) mod thread_attachments;
+pub(crate) mod thread_read_state;
 pub(crate) mod thread_sections;
 pub(crate) mod threads;
 

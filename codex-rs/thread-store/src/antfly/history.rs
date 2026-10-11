@@ -489,7 +489,7 @@ fn invalid_item_anchor() -> ThreadStoreError {
 
 pub(super) async fn list_items(
     store: &AntflyThreadStore,
-    params: ListItemsParams,
+    mut params: ListItemsParams,
 ) -> ThreadStoreResult<ItemPage> {
     validate_paginated(
         store,
@@ -498,6 +498,21 @@ pub(super) async fn list_items(
         "list_items",
     )
     .await?;
+    if let Some(ids) = &params.item_ids {
+        if params.turn_id.is_none()
+            || params.position.is_some()
+            || params.after_updated_at_ordinal.is_some()
+            || params.sort_key != ItemSortKey::CreatedAtOrdinal
+            || !(1..=100).contains(&ids.len())
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "itemIds requires turnId, 1 to 100 IDs, and no cursor or update replay"
+                    .to_string(),
+            });
+        }
+        params.page_size = ids.len();
+        params.sort_direction = SortDirection::Asc;
+    }
     validate_page_size(params.page_size)?;
     let segments = resolve_lineage(store, params.thread_id).await?;
 
@@ -606,6 +621,9 @@ pub(super) async fn list_items(
         let mut candidates = scan_items_created(store, segment).await?;
         if let Some(turn_id) = params.turn_id.as_deref() {
             candidates.retain(|item| item.turn_id == turn_id);
+        }
+        if let Some(item_ids) = params.item_ids.as_deref() {
+            candidates.retain(|item| item_ids.contains(&item.item_id));
         }
         if let Some(watermark) = params.after_updated_at_ordinal {
             candidates.retain(|item| item.updated_at_ordinal > watermark);

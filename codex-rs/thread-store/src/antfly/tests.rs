@@ -598,6 +598,7 @@ async fn paginated_projection_builds_turns_and_items() -> TestResult {
 
     let items = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: None,
             include_archived: false,
@@ -615,6 +616,41 @@ async fn paginated_projection_builds_turns_and_items() -> TestResult {
         .find(|item| item.item_id == "item-agent")
         .expect("agent item present");
     assert!(agent_item.updated_at_ordinal > items.items[0].updated_at_ordinal);
+
+    // Exact lookup returns the requested items in creation order and skips unknown IDs.
+    let lookup = ListItemsParams {
+        item_ids: Some(vec![
+            "item-agent".to_string(),
+            "item-user".to_string(),
+            "missing".to_string(),
+        ]),
+        thread_id,
+        turn_id: Some("turn-1".to_string()),
+        include_archived: false,
+        position: None,
+        page_size: 1,
+        sort_direction: SortDirection::Desc,
+        sort_key: ItemSortKey::CreatedAtOrdinal,
+        after_updated_at_ordinal: None,
+    };
+    let found = store.list_items(lookup.clone()).await?;
+    assert_eq!(
+        found
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["item-user", "item-agent"],
+    );
+    assert!(
+        store
+            .list_items(ListItemsParams {
+                turn_id: None,
+                ..lookup
+            })
+            .await
+            .is_err()
+    );
 
     store.shutdown_thread(thread_id).await?;
     settle(store, dir).await;
@@ -716,6 +752,7 @@ async fn list_turns_and_items_page_both_directions_with_anchor() -> TestResult {
     // Item anchor: the item after "u2" within turn-2, in creation order.
     let anchored = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: Some("turn-2".to_string()),
             include_archived: false,
@@ -734,6 +771,7 @@ async fn list_turns_and_items_page_both_directions_with_anchor() -> TestResult {
     // An anchor outside the requested turn is rejected.
     let bad_anchor = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: Some("turn-2".to_string()),
             include_archived: false,
@@ -754,6 +792,7 @@ async fn list_turns_and_items_page_both_directions_with_anchor() -> TestResult {
     // An item anchor without a turn id is rejected.
     let missing_turn = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: None,
             include_archived: false,
@@ -1115,6 +1154,7 @@ async fn forked_lineage_reads_see_ancestor_and_own_turns() -> TestResult {
     // Items across both segments, in creation order.
     let items = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id: child_id,
             turn_id: None,
             include_archived: false,

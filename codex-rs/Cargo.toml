@@ -44,7 +44,6 @@ members = [
     "config-schema",
     "context-fragments",
     "shell-command",
-    "shell-escalation",
     "skills",
     "core",
     "core-api",
@@ -278,7 +277,6 @@ codex-rollout-trace = { path = "rollout-trace" }
 codex-sandboxing = { path = "sandboxing" }
 codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
-codex-shell-escalation = { path = "shell-escalation" }
 codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
 codex-antfly = { path = "antfly" }
@@ -328,10 +326,13 @@ codex-windows-sandbox-test-support = { path = "windows-sandbox-rs/tests/support"
 core_test_support = { path = "core/tests/common" }
 
 # External
+learning_mode_windows = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
+wxc_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 age = "0.12.1"
 ansi-to-tui = "8.0.1"
 antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "1258e8cfcb83a638d69e869234bfa747e52f0029", features = ["libantfly", "sqlx"] }
 anyhow = "1"
+appcontainer_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"
 assert_cmd = "2"
@@ -392,6 +393,7 @@ globset = "0.4"
 hmac = "0.12.1"
 http = "1.3.1"
 httpdate = "1.0.3"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 iana-time-zone = "0.1.64"
 icu_decimal = "2.1"
 icu_locale_core = "2.1"
@@ -418,7 +420,6 @@ maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
 multimap = "0.10.0"
-mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "a846837d827b496fc4a08dfe60554515758c6647" }
 notify = "8.2.0"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 once_cell = "1.20.2"
@@ -453,8 +454,7 @@ regex-automata = { version = "0.4.13", default-features = false, features = ["st
 regex-lite = "0.1.8"
 regex-syntax = "0.8.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-# rmcp-v3.3.0 includes enterprise authorization helpers (rust-sdk#1234).
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "3e636cab26c013eca5131103c03d20237f12c4df", version = "=3.3.0", default-features = false }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "4048ac40e958fb1a7d614617a2ae8d26666ee2fa", version = "=3.5.1", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23.45", default-features = false, features = [
@@ -487,7 +487,6 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "ogg",
     "wav",
 ] }
-socket2 = "0.6.1"
 # Keep SQLx versions in sync; when bumping, audit the SQLite constructor deny list in clippy.toml.
 sqlx = { version = "=0.9.0", default-features = false, features = [
     "chrono",
