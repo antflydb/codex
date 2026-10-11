@@ -354,17 +354,18 @@ is registered before `codex_guardian_v2::install`
 ```toml
 [experimental_thread_store]
 type = "antfly"
-backend = "embedded"                 # or "remote"
-path = "~/.codex/antfly.aflite"      # embedded
-# url = "https://<host>/cloud/v1/<instance_id>"   # remote documents (HTTP)
+path = "~/.codex/antfly.aflite"      # embedded (the default without `url`)
+# url = "https://<host>/cloud/v1/<instance_id>"            # remote documents (HTTP)
 # sql_url = "postgres://codex:secret@<host>:5432/default"  # remote SQL tables
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
 decide_model = "convaiinnovations/laya"
+# semantic_search = false            # full text only, no embedder needed
 
-[antfly.approvals]
-mode = "shadow"                      # shadow | enforce | off
-allow_threshold = 0.9
+[experimental_thread_store.approvals]
+mode = "shadow"                      # off | shadow | enforce
+allow_threshold = 0.7
+deny_threshold = 0.8
 ```
 
 ## Upstream patch points

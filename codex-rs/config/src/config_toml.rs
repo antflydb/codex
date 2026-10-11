@@ -580,8 +580,8 @@ pub enum ThreadStoreToml {
 pub struct AntflyStoreToml {
     /// Embedded database file.
     pub path: Option<PathBuf>,
-    /// Remote Antfly or Antfly Cloud base URL. Alone it selects the remote
-    /// backend; with `path` the local database replicates to it.
+    /// Remote Antfly base URL for document tables; selects the remote
+    /// backend (set either `path` or `url`, not both).
     pub url: Option<String>,
     /// PostgreSQL connection URL for the remote instance's SQL listener,
     /// which holds Codex's relational tables.

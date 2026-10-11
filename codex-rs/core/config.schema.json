@@ -4398,7 +4398,7 @@
               "type": "string"
             },
             "url": {
-              "description": "Remote Antfly or Antfly Cloud base URL. Alone it selects the remote backend; with `path` the local database replicates to it.",
+              "description": "Remote Antfly base URL for document tables; selects the remote backend (set either `path` or `url`, not both).",
               "type": "string"
             }
           },
