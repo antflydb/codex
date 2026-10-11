@@ -54,8 +54,12 @@ implementation differs and why.
   replicated (outbox) backend was removed with the move to SQL tables.
 - **Search.** `search_threads` unions full-text matches with the top semantic
   neighbors (dense index over the `search_text` field, embedded by Antfly
-  inference with `BAAI/bge-small-en-v1.5` by default), then sorts and pages by
-  the requested key with the local store's cursor format.
+  inference with `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, 1,024
+  dimensions, by default; Antfly adds Qwen3's query instruction to searches
+  only), then sorts and pages by the requested key with the local store's
+  cursor format. The index name carries a hash of the model and dimensions,
+  so changing `embedder_model` builds a new index; the embedded backend drops
+  the old one.
 - **Approval review calibration.** Against the Laya checkpoint, independent
   yes/no questions ("is this safe?") cluster between 0.5 and 0.9 regardless of
   the command and are not usable. A single four-way choice, "what is the worst
@@ -360,6 +364,8 @@ path = "~/.codex/antfly.aflite"      # embedded (the default without `url`)
 # api_key_env = "ANTFLY_API_KEY"
 models_dir = "~/.antfly/inference/models"
 decide_model = "convaiinnovations/laya"
+# embedder_model = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"  # default
+# embedder_dims = 1024                # must match embedder_model
 # semantic_search = false            # full text only, no embedder needed
 
 [experimental_thread_store.approvals]

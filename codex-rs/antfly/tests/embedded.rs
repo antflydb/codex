@@ -175,21 +175,26 @@ fn decide_with_local_model() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error>> {
+/// Whether `<models>/<owner>` holds an installed model, so tests needing
+/// real inference skip on machines without it.
+fn has_models(owner: &str) -> bool {
     let Some(home) = std::env::var_os("HOME") else {
-        return Ok(());
+        return false;
     };
-    let models = std::path::Path::new(&home).join(".antfly/inference/models/BAAI");
+    let models = std::path::Path::new(&home)
+        .join(".antfly/inference/models")
+        .join(owner);
     if !models.exists() {
-        eprintln!("skipping: no BAAI embedder under {models:?}");
-        return Ok(());
+        eprintln!("skipping: no {owner} embedder under {models:?}");
+        return false;
     }
-    let dir = tempfile::tempdir()?;
-    runtime().block_on(async {
-        let antfly = open(&dir, true);
-        let docs = antfly.documents(schema::HISTORY_ITEMS);
-        docs.write(vec![
+    true
+}
+
+async fn write_semantic_fixture(antfly: &Antfly) -> Result<(), codex_antfly::AntflyError> {
+    antfly
+        .documents(schema::HISTORY_ITEMS)
+        .write(vec![
             Write::put(
                 "a",
                 json!({"search_text": "fix the flaky raft snapshot test"}),
@@ -199,20 +204,63 @@ fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error
                 json!({"search_text": "write release notes for the cli"}),
             ),
         ])
-        .await?;
-        let mut hits = Vec::new();
-        for _ in 0..100 {
-            // No lexical overlap: only the semantic leg can match.
-            hits = docs
-                .search_text("consensus log compaction", None, 10, 1)
-                .await?;
-            if !hits.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        .await
+}
+
+/// Polls until the semantic leg finds a document; embedding is asynchronous.
+async fn semantic_keys(antfly: &Antfly) -> Result<Vec<String>, codex_antfly::AntflyError> {
+    let docs = antfly.documents(schema::HISTORY_ITEMS);
+    let mut hits = Vec::new();
+    for _ in 0..150 {
+        // No lexical overlap: only the semantic leg can match.
+        hits = docs
+            .search_text("consensus log compaction", None, 10, 1)
+            .await?;
+        if !hits.is_empty() {
+            break;
         }
-        let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
-        assert_eq!(keys, vec!["a"]);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(hits.into_iter().map(|hit| hit.key).collect())
+}
+
+#[test]
+fn semantic_search_with_local_embedder() -> Result<(), Box<dyn std::error::Error>> {
+    if !has_models("Qwen") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, true);
+        write_semantic_fixture(&antfly).await?;
+        assert_eq!(semantic_keys(&antfly).await?, vec!["a"]);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn switching_embedders_reindexes_existing_documents() -> Result<(), Box<dyn std::error::Error>> {
+    if !has_models("BAAI") || !has_models("Qwen") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let mut config = AntflyConfig::embedded(dir.path().join("codex.aflite"));
+        config.embedder = Some(codex_antfly::EmbedderConfig {
+            model: "BAAI/bge-small-en-v1.5".to_string(),
+            dims: 384,
+        });
+        let antfly = Antfly::open(config)?;
+        write_semantic_fixture(&antfly).await?;
+        assert_eq!(semantic_keys(&antfly).await?, vec!["a"]);
+        antfly.close().await?;
+
+        // The default (Qwen3) embedder gets its own index, filled from the
+        // documents already stored, and the bge index is dropped.
+        let antfly = open(&dir, true);
+        assert_eq!(semantic_keys(&antfly).await?, vec!["a"]);
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

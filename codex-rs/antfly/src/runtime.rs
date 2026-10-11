@@ -27,7 +27,20 @@ use crate::sql::Sql;
 /// Field that every searchable Codex document puts its text into. The dense
 /// index embeds it and full-text search matches it.
 pub const SEARCH_TEXT_FIELD: &str = "search_text";
-const DENSE_INDEX_NAME: &str = "codex_search_text";
+/// Prefix of the dense index name. The full name also identifies the
+/// embedder (see [`dense_index_name`]), so switching models builds a new
+/// index instead of silently reusing vectors from the old one.
+pub(crate) const DENSE_INDEX_PREFIX: &str = "codex_search_text";
+
+/// `codex_search_text_<FNV-1a of "model:dims">`, stable across releases.
+fn dense_index_name(embedder: &crate::config::EmbedderConfig) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in format!("{}:{}", embedder.model, embedder.dims).bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{DENSE_INDEX_PREFIX}_{hash:016x}")
+}
 
 /// Process-wide Antfly handle used by every Codex store.
 pub struct Antfly {
@@ -139,7 +152,7 @@ impl Antfly {
 
     fn dense_index(&self) -> Option<DenseIndex> {
         self.config.embedder.as_ref().map(|embedder| DenseIndex {
-            name: DENSE_INDEX_NAME.to_string(),
+            name: dense_index_name(embedder),
             field: SEARCH_TEXT_FIELD.to_string(),
             model: embedder.model.clone(),
             dims: embedder.dims,
@@ -302,12 +315,15 @@ impl Documents<'_> {
             full_text["filter_query"] = filter.clone();
         }
         let mut hits = self.search(full_text).await?;
-        if semantic_limit == 0 || self.antfly.config.embedder.is_none() {
+        let Some(embedder) = self.antfly.config.embedder.as_ref() else {
+            return Ok(hits);
+        };
+        if semantic_limit == 0 {
             return Ok(hits);
         }
         let mut semantic = serde_json::json!({
             "semantic_search": text,
-            "indexes": [DENSE_INDEX_NAME],
+            "indexes": [dense_index_name(embedder)],
             "limit": semantic_limit,
         });
         if let Some(filter) = filter {

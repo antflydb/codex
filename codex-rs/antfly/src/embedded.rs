@@ -384,6 +384,16 @@ impl Backend for EmbeddedBackend {
             let index_name = dense.name.clone();
             self.call_in(table, move |db| {
                 let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
+                // A dense index left by a previously configured embedder
+                // would keep embedding every write; drop it and its producer.
+                for stale in indexes.iter().filter(|name| {
+                    name.starts_with(crate::runtime::DENSE_INDEX_PREFIX) && **name != index_name
+                }) {
+                    db.delete_enrichment("embedding", &format!("{stale}_embedder"))
+                        .map_err(embedded("delete stale enrichment"))?;
+                    db.delete_index(stale)
+                        .map_err(embedded("delete stale index"))?;
+                }
                 if !indexes.contains(&index_name) {
                     db.add_index_json(serde_json::to_vec(&index)?)
                         .map_err(embedded("add index"))?;

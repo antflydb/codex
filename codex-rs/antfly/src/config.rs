@@ -36,8 +36,8 @@ pub struct EmbedderConfig {
 impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
-            model: "BAAI/bge-small-en-v1.5".to_string(),
-            dims: 384,
+            model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1".to_string(),
+            dims: 1024,
         }
     }
 }
