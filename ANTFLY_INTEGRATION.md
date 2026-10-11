@@ -43,8 +43,10 @@ implementation differs and why.
     fields point at a file that is never created, so a missed path fails
     loudly. Logs are a no-op sink.
 - **Backends.** `Embedded` runs `libantfly` in-process: document calls on
-  8 MiB-stack executor threads, SQL through the Antfly SQLx driver on its own
-  connections to the same file (libantfly queues writers across handles).
+  8 MiB-stack executor threads, SQL through the Antfly SQLx driver on the
+  same `Database` handle (`with_database`). Independent handles on one file
+  also work and, since antflydb/antfly#1080, share one storage owner without
+  lease-handoff overhead (#1075) or spurious `FileBusy` (#1076).
   `Remote` uses HTTP for document tables (`/db/v1/tables/{t}/batch`,
   `/documents`, `/query`, `/indexes/{name}`) and the server's PostgreSQL wire
   listener (`sql_url`, through `sqlx-postgres`) for relational tables, with
@@ -155,7 +157,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `22eebec31a` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `1258e8cfcb` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -163,7 +165,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `22eebec31a` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `1258e8cfcb` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
