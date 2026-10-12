@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `1258e8cfcb` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `d1182ab89d` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `1258e8cfcb` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `d1182ab89d` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -404,8 +404,9 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 ## Knowledge graph
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
-tool are implemented; see "Not built yet" for the rest. Findings are against
-Antfly 1258e8cfcb (main adds nothing graph-related beyond it).
+tool are implemented; see "Not built yet" for the rest. Findings were made
+against Antfly 1258e8cfcb; the pin is now `d1182ab89d`, which includes
+antflydb/antfly#1096 (fixes for #1089 and #1084).
 
 ### Goal
 
@@ -476,11 +477,17 @@ test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly supersedes
    bytes) and map entities to concept keys. Add the concepts of the query's
    direct hybrid-search hits among claims.
 2. **Expand.** Traverse `about` edges inward from the seeds, in both the claims
-   and memory-notes tables (`graph_queries` through the normal search path, so
-   embedded and remote behave the same).
-3. **Rank.** Score by the number of shared concepts plus direct-hit rank.
-   Superseded claims are dropped unless history is requested; superseded claims
-   carry `superseded_by`.
+   and memory-notes tables. `deduplicate_nodes: false` returns one path per
+   (concept, document), so each result's shared concepts come from the same
+   query. Everything goes through the normal search path, so embedded and
+   remote behave the same.
+3. **Rank.** Personalized PageRank on the concept index (`metrics: {"ppr":
+   {"kind": "pagerank"}}`), seeded at the query's concepts with `direction:
+   "both"` and `metric_freshness: "fresh"`. Mass flows concept → document →
+   concept, so documents more than one hop away surface too. Direct search
+   hits get a small boost. If the metric query fails, ranking falls back to
+   the count of shared concepts. Superseded claims are dropped unless history
+   is requested; superseded claims carry `superseded_by`.
 
 `codex-antfly-extension` contributes the tool `knowledge.search(query,
 max_results, include_history)` whenever the thread store is Antfly and the
@@ -553,10 +560,23 @@ approval prompt (up to 3,000 characters) does not.
   - reverse traversal from concept keys with documents;
   - search plus `result_ref:"$query_results"` expansion in one request;
   - matching concepts across tables by key.
-- A combined `$query_results` + `direction:"both"` + `max_depth:2` traversal is
-  rejected as invalid, so retrieval runs two single-hop queries.
-- A traversal reports each reached document once, with one path. Shared
-  concepts are therefore computed from each document's own `about` edges.
+- At 1258e8cfcb, a combined `$query_results` + `direction:"both"` +
+  `max_depth:2` traversal was rejected as invalid. It works at `d1182ab89d`
+  (cause unexplained upstream); retrieval still uses single-hop queries plus
+  PageRank.
+- At 1258e8cfcb, a traversal reported each reached document once, with one
+  path. `deduplicate_nodes: false` (antflydb/antfly#1096) now returns every
+  path.
+- Since `d1182ab89d`, Lite **promotes** resolved concepts into the resolver's
+  `table`. Codex creates `codex_concepts` for this (one document per
+  `concept/<slug>`, with `canonical_name`, `entity_type` and `aliases`).
+  Without it, `run_until_idle` fails with `UndefinedTable`, resolution stalls
+  and no `about` edges land. `promote: false` (antflydb/antfly#1111) would
+  make the table optional.
+- Since `d1182ab89d`, enrichments load models from the configured
+  `models_dir` (`OpenOptions::models_dir`), the same directory as the decide
+  runtime. Native errors carry their detail (`Error::Native`), which our
+  `AntflyError::Embedded` messages include.
 - **Extraction quality.** In the probe, GLiNER missed "EmbeddingGemma 2" in one
   claim and produced both `concept/qwen3` and `concept/qwen3_embedding`. That is
   the synonym problem below.
@@ -572,17 +592,21 @@ approval prompt (up to 3,000 characters) does not.
   ANN candidate search (`candidate_search:"ann"`) and a Fellegi–Sunter scorer,
   but per `zig/RESOLUTION.md` the mention `name_embedding` is not generated yet,
   and ANN candidates come from promoted entity documents, which Lite never
-  writes (#1084). Blocked upstream: antflydb/antfly#1089.
+  writes (#1084). antflydb/antfly#1096 now generates mention embeddings,
+  promotes entities in Lite and honours alias redirects, but using them needs
+  an entity table and name-embedding index; see antflydb/antfly#1109.
 - **Turn attribution.** Inject turn markers into stage-1 input and have claims
   cite them.
 - **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
-- **Seeded personalized PageRank** for ranking instead of shared-concept counts.
-  Graph metrics work in Lite (`metrics: {"ppr": {"kind": "pagerank"}}` and
-  `graph_metric` with `seed_nodes` and `metric_freshness: "fresh"`; the embedded
-  search needs a trigger key such as `full_text_search` alongside). But they
-  are directed-only: seeded at a concept, all mass stays on the seed, and
-  seeded at a claim, it never reaches other claims sharing those concepts.
-  Blocked on an undirected option (antflydb/antfly#1089).
+- **Unicode concept keys (`uslug`).** Query-time seeds must produce exactly the
+  resolver's keys; reimplementing Unicode 16 NFKC and case folding in Rust risks
+  silent misses. Waiting on query-time key resolution from Antfly
+  (antflydb/antfly#1109) and the combining-mark fix.
+- **Aliases, promotion and an entity table.** These need concepts promoted into
+  entity documents, which is worth doing together with ANN synonym merging
+  (antflydb/antfly#1109).
+- **Label descriptions** in windowed extraction, now qualified for FP32 base.
+  Evaluate their effect on extraction first (antflydb/antfly#1109).
 - **Triage classification** of user messages (short-input profile only).
 - **Concept extraction on history items.** This is left off because of
   per-item cost; claims carry thread provenance instead.

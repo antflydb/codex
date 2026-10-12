@@ -336,6 +336,34 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
             related.notes.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(),
             vec!["notes/embedder.md"]
         );
+        // Ranking runs on seeded PageRank in both directions: mass seeded
+        // at the claim's concepts must flow back to the claim itself.
+        let ppr = antfly
+            .documents(schema::KNOWLEDGE)
+            .query(json!({
+                "graph_metric": {
+                    "index": codex_antfly::knowledge::concept_graph_name(
+                        codex_antfly::DEFAULT_EXTRACT_MODEL,
+                    ),
+                    "metric": codex_antfly::knowledge::PPR_METRIC,
+                    "metric_freshness": "fresh",
+                    "seed_nodes": &current.concepts,
+                    "direction": "both",
+                    "top_k": 20,
+                },
+                "limit": 1,
+            }))
+            .await?;
+        let scores = ppr["responses"][0]["graph_metric_results"]
+            [codex_antfly::knowledge::PPR_METRIC]["scores"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            scores.iter().any(|entry| entry["node"] == "v2:thread-b:0000"
+                && entry["score"].as_f64().unwrap_or_default() > 0.0),
+            "{ppr:#}"
+        );
         // History keeps the superseded decision, pointing at its replacement.
         let with_history = knowledge
             .related("Which embedder does Codex semantic search use?", 5, true)

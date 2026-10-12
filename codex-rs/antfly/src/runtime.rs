@@ -98,9 +98,11 @@ fn api_key(api_key_env: Option<&String>) -> AntflyResult<Option<String>> {
     }
 }
 
-fn open_backend(config: &BackendConfig) -> AntflyResult<Arc<dyn Backend>> {
-    Ok(match config {
-        BackendConfig::Embedded { path } => Arc::new(EmbeddedBackend::open(path)?),
+fn open_backend(config: &AntflyConfig) -> AntflyResult<Arc<dyn Backend>> {
+    Ok(match &config.backend {
+        BackendConfig::Embedded { path } => {
+            Arc::new(EmbeddedBackend::open(path, config.models_dir.as_deref())?)
+        }
         BackendConfig::Remote {
             url, api_key_env, ..
         } => Arc::new(RemoteBackend::new(url, api_key(api_key_env.as_ref())?)?),
@@ -121,7 +123,7 @@ impl Antfly {
 
     /// Opens the backend now, reporting configuration errors immediately.
     pub fn open(config: AntflyConfig) -> AntflyResult<Self> {
-        let backend = open_backend(&config.backend)?;
+        let backend = open_backend(&config)?;
         Ok(Self::with_backend(config, backend))
     }
 
@@ -136,7 +138,7 @@ impl Antfly {
     pub async fn backend(&self) -> AntflyResult<&Arc<dyn Backend>> {
         self.backend
             .get_or_try_init(|| async {
-                let config = self.config.backend.clone();
+                let config = self.config.clone();
                 // Opening an embedded database blocks briefly.
                 tokio::task::spawn_blocking(move || open_backend(&config))
                     .await

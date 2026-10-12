@@ -39,6 +39,9 @@ pub const APPROVALS: &str = "codex_approvals";
 pub const MEMORY_NOTES: &str = "codex_memory_notes";
 /// Claims distilled from sessions (see `crate::knowledge`).
 pub const KNOWLEDGE: &str = "codex_knowledge";
+/// Canonical concepts promoted by the concept resolver, one document per
+/// `concept/<slug>` key. Antfly writes these; Codex only reads them.
+pub const CONCEPTS: &str = "codex_concepts";
 
 /// Graph indexes a document table carries when the knowledge graph is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +108,13 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("generated_at_ms", "integer"),
         ],
         graphs: &[TableGraph::Concepts, TableGraph::ClaimLinks],
+    },
+    // Promotion target of the concept resolver. It must exist before any
+    // extraction runs: Lite promotion aborts the batch on a missing table.
+    DocumentTable {
+        name: CONCEPTS,
+        fields: &[("canonical_name", "string"), ("entity_type", "string")],
+        graphs: &[],
     },
 ];
 

@@ -68,8 +68,12 @@ const CONCEPT_RELATIONS: &[&str] = &[
     "replaces",
     "causes",
 ];
-/// Bump when the labels, relations or resolver settings change.
-const CONCEPT_SCHEMA_VERSION: u32 = 1;
+/// Bump when the labels, relations, resolver or metric settings change.
+const CONCEPT_SCHEMA_VERSION: u32 = 2;
+/// Personalized PageRank over the concept graph, seeded per query.
+pub const PPR_METRIC: &str = "ppr";
+/// `graph_metric` accepts at most this many seed nodes.
+const MAX_PPR_SEEDS: usize = 128;
 /// GLiNER's single-window extraction profile is measured up to 610 bytes.
 const QUERY_EXTRACT_MAX_BYTES: usize = 600;
 /// Laya rejects over-long inputs; keep each statement well inside them.
@@ -131,9 +135,12 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
             }},
         },
         "edge_types": edge_types,
+        // Seeded per query with `direction: both`, so mass flows from
+        // concepts back to the documents about them.
+        "metrics": {PPR_METRIC: {"kind": "pagerank"}},
         "resolvers": [{
             "name": "concepts",
-            "table": "codex_concepts",
+            "table": schema::CONCEPTS,
             "source_artifact": artifact,
             "resolution_artifact": format!("{name}_resolution"),
             // Label-free keys: a per-mention label guess in the key would
@@ -644,9 +651,9 @@ impl Knowledge<'_> {
         out
     }
 
-    /// Documents in `table` that are `about` any of `concepts`, with the
-    /// concepts each shares. A traversal reports each document once, so the
-    /// shared set comes from each document's own concepts.
+    /// Documents in `table` that are `about` any of `concepts`, with every
+    /// concept each shares: `deduplicate_nodes: false` returns one path per
+    /// (concept, document) pair.
     async fn about_any(
         &self,
         table: &'static str,
@@ -660,7 +667,8 @@ impl Knowledge<'_> {
             "graph_queries": {"docs": {"index": self.graph_name(), "traverse": {
                 "start": {"keys": concepts},
                 "direction": "in", "edge_types": [ABOUT_EDGE], "max_depth": 1,
-                "include_documents": true, "include_paths": true, "limit": limit,
+                "include_documents": true, "include_paths": true,
+                "deduplicate_nodes": false, "limit": limit,
             }}},
             "limit": 1,
         });
@@ -671,28 +679,63 @@ impl Knowledge<'_> {
                 return Vec::new();
             }
         };
-        let found: BTreeMap<String, Value> = reached_nodes(&response, "docs")
-            .into_iter()
-            .filter_map(|node| Some((node.key, node.doc?)))
-            .collect();
-        let keys: Vec<String> = found.keys().cloned().collect();
-        let own = self.concepts_of(table, &keys).await;
-        let seeds: BTreeSet<&String> = concepts.iter().collect();
+        let mut found: BTreeMap<String, (Option<Value>, BTreeSet<String>)> = BTreeMap::new();
+        for node in reached_nodes(&response, "docs") {
+            let entry = found.entry(node.key).or_default();
+            if entry.0.is_none() {
+                entry.0 = node.doc;
+            }
+            entry.1.insert(node.from);
+        }
         found
             .into_iter()
-            .map(|(key, doc)| {
-                let shared = own
-                    .get(&key)
-                    .map(|own| {
-                        own.iter()
-                            .filter(|concept| seeds.contains(concept))
-                            .cloned()
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (key, doc, shared)
+            .filter_map(|(key, (doc, shared))| Some((key, doc?, shared.into_iter().collect())))
+            .collect()
+    }
+
+    /// Personalized PageRank scores in `table`, seeded at `seeds` and
+    /// walking edges both ways. Empty when the metric is unavailable.
+    async fn ppr_scores(
+        &self,
+        table: &'static str,
+        seeds: &[String],
+        top_k: usize,
+    ) -> HashMap<String, f64> {
+        if seeds.is_empty() {
+            return HashMap::new();
+        }
+        let request = json!({
+            "graph_metric": {
+                "index": self.graph_name(),
+                "metric": PPR_METRIC,
+                "metric_freshness": "fresh",
+                "seed_nodes": &seeds[..seeds.len().min(MAX_PPR_SEEDS)],
+                "direction": "both",
+                "top_k": top_k,
+            },
+            "limit": 1,
+        });
+        let response = match self.antfly.documents(table).query(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("antfly: personalized PageRank failed: {err}");
+                return HashMap::new();
+            }
+        };
+        response
+            .get("responses")
+            .and_then(Value::as_array)
+            .and_then(|responses| responses.first())
+            .unwrap_or(&response)
+            .pointer(&format!("/graph_metric_results/{PPR_METRIC}/scores"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let node = entry.get("node")?.as_str()?;
+                let score = entry.get("score")?.as_f64()?;
+                (!node.starts_with(CONCEPT_PREFIX) && score > 0.0)
+                    .then(|| (node.to_string(), score))
             })
             .collect()
     }
@@ -709,15 +752,11 @@ impl Knowledge<'_> {
     ) -> AntflyResult<Related> {
         let claims_table = self.antfly.documents(schema::KNOWLEDGE);
         let mut seeds: BTreeSet<String> = self.extract_concepts(query).await.into_iter().collect();
-        let mut direct: HashMap<String, f64> = HashMap::new();
         let filter = (!include_superseded).then(|| json!({"term": {"status": "current"}}));
         let hits = claims_table
             .search_text(query, filter, limit, limit)
             .await?;
         let hit_keys: Vec<String> = hits.iter().map(|hit| hit.key.clone()).collect();
-        for (rank, hit) in hits.iter().enumerate() {
-            direct.insert(hit.key.clone(), 1.0 / (rank as f64 + 1.0));
-        }
         for concepts in self
             .concepts_of(schema::KNOWLEDGE, &hit_keys)
             .await
@@ -726,38 +765,49 @@ impl Knowledge<'_> {
             seeds.extend(concepts);
         }
         let seeds: Vec<String> = seeds.into_iter().collect();
+        let keep = |claim: &Claim| include_superseded || claim.status == ClaimStatus::Current;
 
-        let mut claims: HashMap<String, RelatedClaim> = HashMap::new();
-        for hit in hits {
+        // Candidates: direct hits, documents one `about` hop from a seed, and
+        // anything personalized PageRank reaches further out.
+        let mut candidates: HashMap<String, (Claim, Vec<String>, f64)> = HashMap::new();
+        for (rank, hit) in hits.into_iter().enumerate() {
             let Some(claim) = hit.doc.and_then(|doc| Claim::from_doc(&hit.key, doc)) else {
                 continue;
             };
-            let score = direct.get(&claim.id).copied().unwrap_or_default();
-            claims.insert(
-                claim.id.clone(),
-                RelatedClaim {
-                    claim,
-                    concepts: Vec::new(),
-                    score,
-                },
-            );
+            if keep(&claim) {
+                candidates.insert(hit.key, (claim, Vec::new(), 1.0 / (rank as f64 + 1.0)));
+            }
         }
         for (key, doc, shared) in self.about_any(schema::KNOWLEDGE, &seeds, limit * 4).await {
             let Some(claim) = Claim::from_doc(&key, doc) else {
                 continue;
             };
-            if !include_superseded && claim.status == ClaimStatus::Superseded {
+            if keep(&claim) {
+                candidates
+                    .entry(key)
+                    .or_insert_with(|| (claim, Vec::new(), 0.0))
+                    .1 = shared;
+            }
+        }
+        let ppr = self.ppr_scores(schema::KNOWLEDGE, &seeds, limit * 8).await;
+        for key in ppr.keys() {
+            if candidates.contains_key(key) {
                 continue;
             }
-            let entry = claims.entry(key).or_insert_with(|| RelatedClaim {
-                claim,
-                concepts: Vec::new(),
-                score: 0.0,
-            });
-            entry.score += shared.len() as f64;
-            entry.concepts = shared;
+            if let Some(claim) = self.get(key).await?
+                && keep(&claim)
+            {
+                candidates.insert(key.clone(), (claim, Vec::new(), 0.0));
+            }
         }
-        let mut claims: Vec<RelatedClaim> = claims.into_values().collect();
+        let mut claims: Vec<RelatedClaim> = candidates
+            .into_iter()
+            .map(|(key, (claim, concepts, direct))| RelatedClaim {
+                score: rank_score(&ppr, &key, concepts.len(), direct),
+                claim,
+                concepts,
+            })
+            .collect();
         claims.sort_by(|a, b| {
             b.score.total_cmp(&a.score).then(
                 b.claim
@@ -767,15 +817,18 @@ impl Knowledge<'_> {
         });
         claims.truncate(limit);
 
+        let note_ppr = self
+            .ppr_scores(schema::MEMORY_NOTES, &seeds, limit * 8)
+            .await;
         let mut notes: Vec<RelatedNote> = self
             .about_any(schema::MEMORY_NOTES, &seeds, limit * 4)
             .await
             .into_iter()
-            .filter_map(|(_, doc, shared)| {
+            .filter_map(|(key, doc, shared)| {
                 Some(RelatedNote {
                     namespace: doc.get("namespace")?.as_str()?.to_string(),
                     path: doc.get("path")?.as_str()?.to_string(),
-                    score: shared.len() as f64,
+                    score: rank_score(&note_ppr, &key, shared.len(), 0.0),
                     concepts: shared,
                 })
             })
@@ -788,6 +841,17 @@ impl Knowledge<'_> {
             notes,
         })
     }
+}
+
+/// Personalized PageRank when it ran, else the count of shared concepts;
+/// direct search hits get a small boost either way.
+fn rank_score(ppr: &HashMap<String, f64>, key: &str, shared: usize, direct: f64) -> f64 {
+    let graph = if ppr.is_empty() {
+        shared as f64
+    } else {
+        ppr.get(key).copied().unwrap_or_default()
+    };
+    graph + 0.1 * direct
 }
 
 #[cfg(test)]

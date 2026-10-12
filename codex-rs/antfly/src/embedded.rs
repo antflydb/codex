@@ -97,7 +97,9 @@ pub struct EmbeddedBackend {
 
 impl EmbeddedBackend {
     /// Opens `path`, creating it when missing. Blocks; call during startup.
-    pub fn open(path: &Path) -> AntflyResult<Self> {
+    /// Enrichments load models from `models_dir`, or Antfly's default
+    /// (`~/.antfly/inference/models`) when unset.
+    pub fn open(path: &Path, models_dir: Option<&Path>) -> AntflyResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| AntflyError::Embedded(format!("create {parent:?}: {err}")))?;
@@ -107,13 +109,17 @@ impl EmbeddedBackend {
         // Opening also needs a large stack, so do it on an executor thread.
         let (tx, rx) = mpsc::channel();
         let open_path = path.clone();
+        let models_dir = models_dir.map(Path::to_path_buf);
         std::thread::Builder::new()
             .name("antfly-open".to_string())
             .stack_size(MIN_THREAD_STACK_SIZE)
             .spawn(move || {
-                let options = OpenOptions::new()
+                let mut options = OpenOptions::new()
                     .local_runtime_configured(true)
                     .busy_timeout(BUSY_TIMEOUT);
+                if let Some(dir) = &models_dir {
+                    options = options.models_dir(dir);
+                }
                 let result = if open_path.exists() {
                     Database::open(&open_path, &options)
                 } else {
@@ -312,7 +318,8 @@ impl Backend for EmbeddedBackend {
         Box::pin(async move {
             self.call_in(table, move |db| match db.lookup_json(key.as_bytes()) {
                 Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-                Err(antfly_embedded::Error::NotFound) => Ok(None),
+                // Native errors carry owned detail; classify by code.
+                Err(err) if err.kind() == antfly_embedded::Error::NotFound => Ok(None),
                 Err(err) => Err(AntflyError::Embedded(format!("lookup: {err}"))),
             })
             .await
