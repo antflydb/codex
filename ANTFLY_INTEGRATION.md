@@ -568,13 +568,21 @@ approval prompt (up to 3,000 characters) does not.
 
 ### Not built yet
 
-- **Synonym resolution.** Merge "Qwen3" and "Qwen3 Embedding" with the
-  resolver's ANN candidate search (`candidate_search:"ann"`, `name_embedding`
-  with EmbeddingGemma 2) and its scorer. Embedded ANN resolution is unverified.
+- **Synonym resolution.** Merge "Qwen3" and "Qwen3 Embedding". The resolver has
+  ANN candidate search (`candidate_search:"ann"`) and a Fellegi–Sunter scorer,
+  but per `zig/RESOLUTION.md` the mention `name_embedding` is not generated yet,
+  and ANN candidates come from promoted entity documents, which Lite never
+  writes (#1084). Blocked upstream: antflydb/antfly#1089.
 - **Turn attribution.** Inject turn markers into stage-1 input and have claims
   cite them.
 - **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
 - **Seeded personalized PageRank** for ranking instead of shared-concept counts.
+  Graph metrics work in Lite (`metrics: {"ppr": {"kind": "pagerank"}}` and
+  `graph_metric` with `seed_nodes` and `metric_freshness: "fresh"`; the embedded
+  search needs a trigger key such as `full_text_search` alongside). But they
+  are directed-only: seeded at a concept, all mass stays on the seed, and
+  seeded at a claim, it never reaches other claims sharing those concepts.
+  Blocked on an undirected option (antflydb/antfly#1089).
 - **Triage classification** of user messages (short-input profile only).
 - **Concept extraction on history items.** This is left off because of
   per-item cost; claims carry thread provenance instead.
