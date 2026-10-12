@@ -192,12 +192,40 @@ impl Antfly {
                             name: table.name.to_string(),
                             schema: table.schema_json(),
                             dense: self.dense_index(),
+                            graphs: self.graphs(table),
                         })
                         .await?;
                 }
                 Ok::<_, AntflyError>(sql)
             })
             .await
+    }
+
+    fn graphs(&self, table: &schema::DocumentTable) -> Vec<crate::backend::GraphIndex> {
+        let Some(knowledge) = &self.config.knowledge else {
+            return Vec::new();
+        };
+        table
+            .graphs
+            .iter()
+            .map(|graph| match graph {
+                schema::TableGraph::Concepts => {
+                    crate::knowledge::concept_graph_index(&knowledge.extract_model)
+                }
+                schema::TableGraph::ClaimLinks => crate::knowledge::claim_links_index(),
+            })
+            .collect()
+    }
+
+    /// The knowledge graph, or `None` when it is disabled.
+    pub fn knowledge(&self) -> Option<crate::knowledge::Knowledge<'_>> {
+        self.config
+            .knowledge
+            .as_ref()
+            .map(|config| crate::knowledge::Knowledge {
+                antfly: self,
+                config,
+            })
     }
 
     /// A document table from [`schema::DOCUMENT_TABLES`].
@@ -242,6 +270,11 @@ impl Antfly {
     /// Answers a typed-decision `DecideRequest` with the local runtime.
     pub async fn decide(&self, request: &Value) -> AntflyResult<Value> {
         self.decider()?.decide(request).await
+    }
+
+    /// Answers an `ExtractRequest` with the local runtime.
+    pub async fn extract(&self, request: &Value) -> AntflyResult<Value> {
+        self.decider()?.extract(request).await
     }
 }
 
@@ -298,6 +331,15 @@ impl Documents<'_> {
         self.backend()
             .await?
             .search(self.table.to_string(), request)
+            .await
+    }
+
+    /// Executes an Antfly `QueryRequest` and returns the raw response,
+    /// including `graph_results`.
+    pub async fn query(&self, request: Value) -> AntflyResult<Value> {
+        self.backend()
+            .await?
+            .query(self.table.to_string(), request)
             .await
     }
 

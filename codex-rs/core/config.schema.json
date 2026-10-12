@@ -4449,6 +4449,14 @@
               "description": "Embedding model for semantic search; `false` in `semantic_search` disables dense indexing.",
               "type": "string"
             },
+            "extract_model": {
+              "description": "GLiNER model that extracts concepts (default `fastino/gliner2.5-base-v1`).",
+              "type": "string"
+            },
+            "knowledge_graph": {
+              "description": "Link claims and memory notes to the concepts they are about (default `true`); `false` skips concept extraction entirely.",
+              "type": "boolean"
+            },
             "models_dir": {
               "description": "Antfly inference models directory.",
               "type": "string"
@@ -4463,6 +4471,11 @@
             "sql_url": {
               "description": "PostgreSQL connection URL for the remote instance's SQL listener, which holds Codex's relational tables.",
               "type": "string"
+            },
+            "supersede_threshold": {
+              "description": "Minimum decide-model probability before a new claim supersedes an earlier one (default 0.8).",
+              "format": "double",
+              "type": "number"
             },
             "type": {
               "enum": [

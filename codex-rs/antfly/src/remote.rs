@@ -9,11 +9,10 @@ use serde_json::json;
 use crate::backend::Backend;
 use crate::backend::BackendFuture;
 use crate::backend::Document;
+use crate::backend::GraphIndex;
 use crate::backend::ScanRequest;
-use crate::backend::SearchHit;
 use crate::backend::TableSpec;
 use crate::backend::Write;
-use crate::backend::parse_search_hits;
 use crate::error::AntflyError;
 use crate::error::AntflyResult;
 
@@ -105,6 +104,30 @@ impl RemoteBackend {
         }
         if let Ok(mut ready) = self.ready_tables.lock() {
             ready.insert(table.to_string());
+        }
+        Ok(())
+    }
+
+    /// Creates a graph index when missing. Stale versions are left for the
+    /// operator: dropping server indexes is not this client's call.
+    async fn ensure_graph(&self, table: &str, graph: &GraphIndex) -> AntflyResult<()> {
+        let url = self.table_url(
+            table,
+            &format!("/indexes/{}", encode_path_segment(&graph.name)),
+        );
+        let existing = self
+            .send(self.request(reqwest::Method::GET, url.clone()))
+            .await?;
+        if existing.status().is_success() {
+            return Ok(());
+        }
+        let mut body = graph.config.clone();
+        body["type"] = json!("graph");
+        let response = self
+            .send(self.request(reqwest::Method::POST, url).json(&body))
+            .await?;
+        if response.status() != StatusCode::CONFLICT {
+            Self::checked(response).await?;
         }
         Ok(())
     }
@@ -212,7 +235,7 @@ impl Backend for RemoteBackend {
         })
     }
 
-    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
+    fn query(&self, table: String, request: Value) -> BackendFuture<'_, Value> {
         Box::pin(async move {
             let response = self
                 .send(
@@ -220,12 +243,11 @@ impl Backend for RemoteBackend {
                         .json(&request),
                 )
                 .await?;
-            let body = Self::checked(response)
+            Self::checked(response)
                 .await?
                 .json::<Value>()
                 .await
-                .map_err(|err| AntflyError::Malformed(err.to_string()))?;
-            Ok(parse_search_hits(&body))
+                .map_err(|err| AntflyError::Malformed(err.to_string()))
         })
     }
 
@@ -233,6 +255,9 @@ impl Backend for RemoteBackend {
         Box::pin(async move {
             let table = spec.name.clone();
             self.ensure_table_exists(&table, &spec.schema).await?;
+            for graph in &spec.graphs {
+                self.ensure_graph(&table, graph).await?;
+            }
             let Some(dense) = spec.dense else {
                 return Ok(());
             };

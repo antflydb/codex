@@ -15,7 +15,6 @@ use crate::backend::AddAdHocMemoryNoteRequest;
 use crate::backend::ListMemoriesRequest;
 use crate::backend::MemoriesBackend;
 use crate::backend::MemoriesBackendError;
-use crate::backend::ReadMemoryRequest;
 use crate::backend::SearchMatchMode;
 use crate::backend::SearchMemoriesRequest;
 
@@ -110,41 +109,45 @@ async fn add_ad_hoc_note_writes_the_file_and_becomes_searchable() -> TestResult 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reading_a_pipeline_written_file_indexes_it_for_later_search() -> TestResult {
+async fn pipeline_written_files_are_reconciled_into_search() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (backend, antfly) = backend(&dir);
 
-    // Simulate the memories write pipeline writing a file directly to disk,
+    // Simulate the memories write pipeline writing files directly to disk,
     // bypassing this backend entirely.
     let summaries_dir = dir.path().join("memories/rollout_summaries");
     tokio::fs::create_dir_all(&summaries_dir).await?;
+    tokio::fs::create_dir_all(dir.path().join("memories/.git")).await?;
     tokio::fs::write(
         summaries_dir.join("thread-1.md"),
         "The user prefers tabs over spaces in generated code.",
     )
     .await?;
+    tokio::fs::write(
+        dir.path().join("memories/.git/HEAD"),
+        "tabs ref: refs/heads/main",
+    )
+    .await?;
 
-    // Not indexed yet: search finds nothing.
-    let before = backend.search(search_request(&["tabs"])).await?;
-    assert!(before.matches.is_empty());
-
-    // Reading the file (as the memory `read` tool would) indexes it.
-    let read = backend
-        .read(ReadMemoryRequest {
-            path: "rollout_summaries/thread-1.md".to_string(),
-            line_offset: 1,
-            max_lines: None,
-            max_tokens: 0,
-        })
-        .await?;
+    // Search reconciles first, so no read is needed; hidden entries stay out.
+    let found = search_eventually(&backend, search_request(&["tabs"]), 1).await?;
     assert_eq!(
-        read.content,
-        "The user prefers tabs over spaces in generated code."
+        found
+            .matches
+            .iter()
+            .map(|found| found.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rollout_summaries/thread-1.md"]
     );
 
-    let after = search_eventually(&backend, search_request(&["tabs"]), 1).await?;
-    assert_eq!(after.matches.len(), 1);
-    assert_eq!(after.matches[0].path, "rollout_summaries/thread-1.md");
+    // A deleted file leaves the index on the next reconcile.
+    tokio::fs::remove_file(summaries_dir.join("thread-1.md")).await?;
+    backend.reconcile().await;
+    let documents = antfly
+        .documents(codex_antfly::schema::MEMORY_NOTES)
+        .get("memories:rollout_summaries/thread-1.md")
+        .await?;
+    assert!(documents.is_none());
 
     settle(antfly, dir).await;
     Ok(())

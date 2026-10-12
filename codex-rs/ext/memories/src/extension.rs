@@ -120,9 +120,23 @@ impl ThreadLifecycleContributor<Config> for MemoriesExtension {
         input: ThreadStartInput<'a, Config>,
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            input
-                .thread_store
-                .insert(MemoriesExtensionConfig::from_config(input.config));
+            let config = MemoriesExtensionConfig::from_config(input.config);
+            // Index notes the write pipeline produced since the last thread,
+            // without delaying this one.
+            if config.enabled
+                && let Some(antfly) = &config.antfly
+            {
+                let backend = AntflyMemoriesBackend::new(
+                    config
+                        .codex_home
+                        .join(config.version.directory_name())
+                        .to_path_buf(),
+                    Arc::clone(antfly),
+                    config.version.directory_name(),
+                );
+                tokio::spawn(async move { backend.reconcile_if_stale().await });
+            }
+            input.thread_store.insert(config);
         })
     }
 }

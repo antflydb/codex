@@ -240,17 +240,28 @@ mod job {
             };
         }
 
-        JobResult {
-            outcome: result::success(
+        let outcome = result::success(
+            context,
+            claimed_thread.id,
+            &claim.ownership_token,
+            claimed_thread.updated_at.timestamp(),
+            stage_one_output.raw_memory.as_deref().unwrap_or_default(),
+            &stage_one_output.rollout_summary,
+            stage_one_output.rollout_slug.as_deref(),
+        )
+        .await;
+        if matches!(outcome, JobOutcome::SucceededWithOutput) {
+            result::record_claims(
                 context,
                 claimed_thread.id,
-                &claim.ownership_token,
                 claimed_thread.updated_at.timestamp(),
-                stage_one_output.raw_memory.as_deref().unwrap_or_default(),
-                &stage_one_output.rollout_summary,
-                stage_one_output.rollout_slug.as_deref(),
+                &claimed_thread.cwd,
+                &stage_one_output.claims,
             )
-            .await,
+            .await;
+        }
+        JobResult {
+            outcome,
             token_usage,
         }
     }
@@ -363,6 +374,27 @@ mod job {
             }
         }
 
+        /// Best effort: claims feed the knowledge graph and never change
+        /// the job's outcome.
+        pub(crate) async fn record_claims(
+            context: &MemoryStartupContext,
+            thread_id: codex_protocol::ThreadId,
+            source_updated_at: i64,
+            cwd: &std::path::Path,
+            claims: &[codex_state::MemoryClaim],
+        ) {
+            let Some(state_db) = context.memory_store().await else {
+                return;
+            };
+            let cwd = cwd.to_string_lossy();
+            if let Err(err) = state_db
+                .record_stage1_claims(thread_id, source_updated_at, Some(&cwd), claims)
+                .await
+            {
+                tracing::warn!("failed to record memory claims for {thread_id}: {err}");
+            }
+        }
+
         pub(crate) async fn success(
             context: &MemoryStartupContext,
             thread_id: codex_protocol::ThreadId,
@@ -466,7 +498,7 @@ mod job {
 
             assert_eq!(
                 required_keys,
-                vec!["raw_memory", "rollout_slug", "rollout_summary"]
+                vec!["claims", "raw_memory", "rollout_slug", "rollout_summary"]
             );
             assert_eq!(rollout_slug_types, vec!["null", "string"]);
         }

@@ -266,3 +266,89 @@ fn switching_embedders_reindexes_existing_documents() -> Result<(), Box<dyn std:
     })?;
     Ok(())
 }
+
+#[test]
+fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::knowledge::ClaimKind;
+    use codex_antfly::knowledge::ClaimSource;
+    use codex_antfly::knowledge::NewClaim;
+    if !has_models("fastino") || !has_models("convaiinnovations") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let source = |thread: &str, at: i64| ClaimSource {
+            version: "v2".to_string(),
+            thread_id: thread.to_string(),
+            cwd: None,
+            source_updated_at_ms: at,
+        };
+        knowledge
+            .record_thread_claims(
+                &source("thread-a", 1),
+                vec![
+                    NewClaim {
+                        kind: ClaimKind::Decision,
+                        statement: "Use Qwen3 Embedding as the embedder for Codex semantic search in Antfly.".to_string(),
+                    },
+                    NewClaim {
+                        kind: ClaimKind::Preference,
+                        statement: "Pin Antfly by git revision rather than tracking a branch.".to_string(),
+                    },
+                ],
+            )
+            .await?;
+        let later = knowledge
+            .record_thread_claims(
+                &source("thread-b", 2),
+                vec![NewClaim {
+                    kind: ClaimKind::Decision,
+                    statement: "Use EmbeddingGemma 2 instead of Qwen3 Embedding as the Codex semantic search embedder; Antfly detects the dimensions.".to_string(),
+                }],
+            )
+            .await?;
+        assert_eq!(later[0].supersedes, vec!["v2:thread-a:0000".to_string()]);
+        antfly
+            .documents(schema::MEMORY_NOTES)
+            .write(vec![Write::put(
+                "memories:notes/embedder.md",
+                json!({"namespace": "memories", "path": "notes/embedder.md", "updated_at_ms": 3,
+                       "search_text": "Codex semantic search embeds with EmbeddingGemma 2 through Antfly; approvals use Laya."}),
+            )])
+            .await?;
+        let mut related = Default::default();
+        for _ in 0..150 {
+            related = knowledge.related("Which embedder does Codex semantic search use?", 5, false).await?;
+            if !related.notes.is_empty() && related.claims.iter().any(|c| !c.concepts.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // Only the current decision is surfaced, linked through shared concepts.
+        let ids: Vec<&str> = related.claims.iter().map(|c| c.claim.id.as_str()).collect();
+        assert!(ids.contains(&"v2:thread-b:0000"), "{related:#?}");
+        assert!(!ids.contains(&"v2:thread-a:0000"), "{related:#?}");
+        let current = &related.claims[0];
+        assert!(current.concepts.len() > 1, "{related:#?}");
+        assert_eq!(
+            related.notes.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes/embedder.md"]
+        );
+        // History keeps the superseded decision, pointing at its replacement.
+        let with_history = knowledge
+            .related("Which embedder does Codex semantic search use?", 5, true)
+            .await?;
+        let earlier = with_history
+            .claims
+            .iter()
+            .find(|c| c.claim.id == "v2:thread-a:0000")
+            .ok_or("superseded claim missing from history")?;
+        assert_eq!(earlier.claim.status, codex_antfly::knowledge::ClaimStatus::Superseded);
+        assert_eq!(earlier.claim.superseded_by.as_deref(), Some("v2:thread-b:0000"));
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

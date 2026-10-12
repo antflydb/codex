@@ -19,6 +19,15 @@ pub struct Stage1Output {
     pub generated_at: DateTime<Utc>,
 }
 
+/// A typed proposition distilled from a thread by stage-1 extraction. `kind`
+/// is one of `decision`, `rationale`, `preference`, `lesson`, `constraint`
+/// or `open_question`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryClaim {
+    pub kind: String,
+    pub statement: String,
+}
+
 /// Result of trying to claim a stage-1 memory extraction job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage1JobClaimOutcome {

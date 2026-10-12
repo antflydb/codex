@@ -76,7 +76,13 @@ pub trait Backend: Send + Sync {
     fn scan(&self, table: String, request: ScanRequest) -> BackendFuture<'_, Vec<Document>>;
 
     /// Executes an Antfly `QueryRequest` and returns the merged hits.
-    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>>;
+    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
+        Box::pin(async move { Ok(parse_search_hits(&self.query(table, request).await?)) })
+    }
+
+    /// Executes an Antfly `QueryRequest` and returns the raw response,
+    /// including `graph_results`.
+    fn query(&self, table: String, request: Value) -> BackendFuture<'_, Value>;
 
     /// Creates the table, its indexes, and its enrichments when missing.
     fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()>;
@@ -105,6 +111,17 @@ pub struct DenseIndex {
     pub dims: Option<u32>,
 }
 
+/// A graph index: `config` is Antfly's `GraphIndexConfig` (sources,
+/// artifact producers, edge types and resolvers).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphIndex {
+    pub name: String,
+    pub config: Value,
+    /// Indexes with this prefix and another name are stale versions of this
+    /// one and are dropped. Empty keeps every other index.
+    pub replaces_prefix: &'static str,
+}
+
 /// A document table and the indexes Codex needs on it. Full-text search over
 /// every field is always available.
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +130,7 @@ pub struct TableSpec {
     /// `document_schemas` for a new table.
     pub schema: Value,
     pub dense: Option<DenseIndex>,
+    pub graphs: Vec<GraphIndex>,
 }
 
 /// Extracts hits from a `QueryResponses` or single `QueryResult` body.

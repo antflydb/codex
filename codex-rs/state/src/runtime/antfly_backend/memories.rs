@@ -189,7 +189,58 @@ fn stage1_output_from_joined_row(row: &SqlRow) -> anyhow::Result<Stage1Output> {
     })
 }
 
+/// Claims live in the knowledge graph, outside the SQL transactions here:
+/// cleanup is best effort and never fails the memory operation.
+async fn delete_claims(antfly: &Antfly, version: &str, thread_id: Option<&str>) {
+    let Some(knowledge) = antfly.knowledge() else {
+        return;
+    };
+    let result = match thread_id {
+        Some(thread_id) => knowledge.delete_thread_claims(version, thread_id).await,
+        None => knowledge.clear(version).await,
+    };
+    if let Err(err) = result {
+        tracing::warn!("antfly: failed to delete memory claims: {err}");
+    }
+}
+
+pub(crate) async fn record_stage1_claims(
+    antfly: &Arc<Antfly>,
+    version: &str,
+    thread_id: ThreadId,
+    source_updated_at: i64,
+    cwd: Option<&str>,
+    claims: &[crate::MemoryClaim],
+) -> anyhow::Result<usize> {
+    use codex_antfly::knowledge::ClaimKind;
+    let Some(knowledge) = antfly.knowledge() else {
+        return Ok(0);
+    };
+    let claims: Vec<codex_antfly::knowledge::NewClaim> = claims
+        .iter()
+        .filter_map(|claim| {
+            let kind: ClaimKind =
+                serde_json::from_value(serde_json::Value::String(claim.kind.clone())).ok()?;
+            Some(codex_antfly::knowledge::NewClaim {
+                kind,
+                statement: claim.statement.clone(),
+            })
+        })
+        .collect();
+    let source = codex_antfly::knowledge::ClaimSource {
+        version: version.to_string(),
+        thread_id: thread_id.to_string(),
+        cwd: cwd.map(str::to_string),
+        source_updated_at_ms: source_updated_at.saturating_mul(1000),
+    };
+    let recorded = Box::pin(knowledge.record_thread_claims(&source, claims))
+        .await
+        .map_err(internal)?;
+    Ok(recorded.len())
+}
+
 pub(crate) async fn clear_memory_data(antfly: &Arc<Antfly>, version: &str) -> anyhow::Result<()> {
+    delete_claims(antfly, version, None).await;
     let sql = antfly.sql().await.map_err(internal)?;
     let version = version.to_string();
     with_retry(sql, move |tx| {
@@ -470,6 +521,7 @@ pub(crate) async fn delete_thread_memory(
     version: &str,
     thread_id: ThreadId,
 ) -> anyhow::Result<()> {
+    delete_claims(antfly, version, Some(&thread_id.to_string())).await;
     let sql = antfly.sql().await.map_err(internal)?;
     let now = Utc::now().timestamp();
     let version = version.to_string();
@@ -922,13 +974,14 @@ pub(crate) async fn mark_stage1_job_succeeded_no_output(
     thread_id: ThreadId,
     ownership_token: &str,
 ) -> anyhow::Result<bool> {
+    let claims_version = version;
     let sql = antfly.sql().await.map_err(internal)?;
     let now = Utc::now().timestamp();
     let version = version.to_string();
     let thread_id_str = thread_id.to_string();
     let ownership_token = ownership_token.to_string();
 
-    with_retry(sql, move |tx| {
+    let succeeded = with_retry(sql, move |tx| {
         let version = version.clone();
         let thread_id_str = thread_id_str.clone();
         let ownership_token = ownership_token.clone();
@@ -968,7 +1021,12 @@ pub(crate) async fn mark_stage1_job_succeeded_no_output(
         })
     })
     .await
-    .map_err(internal)
+    .map_err(internal)?;
+    // Nothing worth remembering remains, so neither do its claims.
+    if succeeded {
+        delete_claims(antfly, claims_version, Some(&thread_id.to_string())).await;
+    }
+    Ok(succeeded)
 }
 
 pub(crate) async fn mark_stage1_job_failed(
@@ -1535,6 +1593,51 @@ mod tests {
 
     fn new_thread_id() -> ThreadId {
         ThreadId::new()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage1_claims_follow_the_thread_memory_lifecycle() {
+        let (store, antfly, dir) = test_store().await;
+        let knowledge = antfly.knowledge().expect("knowledge graph enabled");
+        let thread_id = new_thread_id();
+        let claim_id = format!("v1:{thread_id}:0000");
+        let claims = [
+            crate::MemoryClaim {
+                kind: "decision".to_string(),
+                statement: "Codex pins Antfly by git revision.".to_string(),
+            },
+            crate::MemoryClaim {
+                kind: "not_a_kind".to_string(),
+                statement: "Dropped.".to_string(),
+            },
+        ];
+        let recorded = store
+            .record_stage1_claims(thread_id, 1_700_000_000, Some("/repo"), &claims)
+            .await
+            .expect("record claims");
+        assert_eq!(recorded, 1);
+        let claim = knowledge
+            .get(&claim_id)
+            .await
+            .expect("get claim")
+            .expect("claim stored");
+        assert_eq!(claim.statement, "Codex pins Antfly by git revision.");
+        assert_eq!(claim.cwd.as_deref(), Some("/repo"));
+        assert_eq!(claim.source_updated_at_ms, 1_700_000_000_000);
+
+        store
+            .delete_thread_memory(thread_id)
+            .await
+            .expect("delete thread memory");
+        assert!(knowledge.get(&claim_id).await.expect("get claim").is_none());
+
+        store
+            .record_stage1_claims(thread_id, 1_700_000_001, None, &claims)
+            .await
+            .expect("record claims");
+        store.clear_memory_data().await.expect("clear memory data");
+        assert!(knowledge.get(&claim_id).await.expect("get claim").is_none());
+        cleanup(&antfly, dir).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

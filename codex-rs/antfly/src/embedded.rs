@@ -21,11 +21,10 @@ use tokio::sync::oneshot;
 use crate::backend::Backend;
 use crate::backend::BackendFuture;
 use crate::backend::Document;
+use crate::backend::GraphIndex;
 use crate::backend::ScanRequest;
-use crate::backend::SearchHit;
 use crate::backend::TableSpec;
 use crate::backend::Write;
-use crate::backend::parse_search_hits;
 use crate::error::AntflyError;
 use crate::error::AntflyResult;
 
@@ -229,6 +228,51 @@ fn names(listing: &[u8]) -> HashSet<String> {
         .collect()
 }
 
+impl EmbeddedBackend {
+    /// Adds a graph index when missing, dropping stale versions of it. Its
+    /// inline artifact producers and resolvers register with the index.
+    async fn ensure_graph(&self, table: &str, graph: GraphIndex) -> AntflyResult<()> {
+        let marker = format!("graph:{table}:{}", graph.name);
+        if self
+            .known_indexes
+            .lock()
+            .map(|known| known.contains(&marker))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let envelope = serde_json::to_vec(&json!({
+            "name": graph.name,
+            "kind": "graph",
+            "config_json": graph.config.to_string(),
+        }))?;
+        let name = graph.name.clone();
+        let prefix = graph.replaces_prefix;
+        self.call_in(table.to_string(), move |db| {
+            let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
+            if !prefix.is_empty() {
+                for stale in indexes
+                    .iter()
+                    .filter(|index| index.starts_with(prefix) && **index != name)
+                {
+                    db.delete_index(stale)
+                        .map_err(embedded("delete stale graph index"))?;
+                }
+            }
+            if !indexes.contains(&name) {
+                db.add_index_json(&envelope)
+                    .map_err(embedded("add graph index"))?;
+            }
+            Ok(())
+        })
+        .await?;
+        if let Ok(mut known) = self.known_indexes.lock() {
+            known.insert(marker);
+        }
+        Ok(())
+    }
+}
+
 impl Backend for EmbeddedBackend {
     fn write(&self, table: String, writes: Vec<Write>) -> BackendFuture<'_, ()> {
         Box::pin(async move {
@@ -308,7 +352,7 @@ impl Backend for EmbeddedBackend {
         })
     }
 
-    fn search(&self, table: String, request: Value) -> BackendFuture<'_, Vec<SearchHit>> {
+    fn query(&self, table: String, request: Value) -> BackendFuture<'_, Value> {
         Box::pin(async move {
             let bytes = serde_json::to_vec(&request)?;
             let raw = self
@@ -316,8 +360,7 @@ impl Backend for EmbeddedBackend {
                     db.search_json(&bytes).map_err(embedded("search"))
                 })
                 .await?;
-            let body: Value = serde_json::from_slice(&raw)?;
-            Ok(parse_search_hits(&body))
+            Ok(serde_json::from_slice(&raw)?)
         })
     }
 
@@ -345,6 +388,9 @@ impl Backend for EmbeddedBackend {
                 if let Ok(mut known) = self.known_indexes.lock() {
                     known.insert(marker);
                 }
+            }
+            for graph in spec.graphs {
+                self.ensure_graph(&table, graph).await?;
             }
             let Some(dense) = spec.dense else {
                 return Ok(());
@@ -479,6 +525,24 @@ impl LocalDecider {
                     .map_err(|err| AntflyError::Embedded(format!("close inference: {err}")))
             })
             .await
+    }
+
+    /// Answers an `ExtractRequest` (GLiNER entities, relations,
+    /// classifications).
+    pub async fn extract(&self, request: &Value) -> AntflyResult<Value> {
+        let slot = Arc::clone(&self.slot);
+        let models_dir = self.models_dir.clone();
+        let bytes = serde_json::to_vec(request)?;
+        let raw = self
+            .executor
+            .run(move || {
+                let inference = inference_handle(&slot, models_dir.as_deref())?;
+                inference
+                    .extract(&bytes)
+                    .map_err(|err| AntflyError::Embedded(format!("extract: {err}")))
+            })
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
     }
 
     /// Answers a `DecideRequest`.

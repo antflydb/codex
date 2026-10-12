@@ -43,6 +43,30 @@ impl Default for EmbedderConfig {
     }
 }
 
+/// Default GLiNER extractor that links knowledge to concepts.
+pub const DEFAULT_EXTRACT_MODEL: &str = "fastino/gliner2.5-base-v1";
+
+/// The knowledge graph: claims and memory notes linked to the concepts
+/// they are about (see `crate::knowledge`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeConfig {
+    /// GLiNER model that extracts concepts, run by Antfly enrichments and
+    /// at query time.
+    pub extract_model: String,
+    /// A new claim supersedes an earlier one when the decide model is at
+    /// least this confident, in basis points.
+    pub supersede_threshold_bp: u32,
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            extract_model: DEFAULT_EXTRACT_MODEL.to_string(),
+            supersede_threshold_bp: 8_000,
+        }
+    }
+}
+
 /// Default typed-decision model for approval review: a prepared Laya
 /// checkpoint under `<models dir>/convaiinnovations/laya`.
 pub const DEFAULT_DECIDE_MODEL: &str = "convaiinnovations/laya";
@@ -57,9 +81,11 @@ pub struct AntflyConfig {
     /// Embedder for semantic search. `None` disables dense indexing and
     /// search falls back to full text only.
     pub embedder: Option<EmbedderConfig>,
-    /// Typed-decision model used for approvals.
+    /// Typed-decision model used for approvals and claim supersession.
     pub decide_model: String,
     pub approvals: ApprovalSettings,
+    /// `None` disables concept extraction and the knowledge graph indexes.
+    pub knowledge: Option<KnowledgeConfig>,
 }
 
 /// How approval requests are reviewed with typed decisions.
@@ -113,6 +139,9 @@ pub struct AntflyTomlSettings {
     pub approvals_mode: Option<String>,
     pub allow_threshold: Option<f64>,
     pub deny_threshold: Option<f64>,
+    pub knowledge_graph: Option<bool>,
+    pub extract_model: Option<String>,
+    pub supersede_threshold: Option<f64>,
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -144,6 +173,7 @@ impl AntflyConfig {
             embedder: Some(EmbedderConfig::default()),
             decide_model: DEFAULT_DECIDE_MODEL.to_string(),
             approvals: ApprovalSettings::default(),
+            knowledge: Some(KnowledgeConfig::default()),
         }
     }
 
@@ -187,8 +217,22 @@ impl AntflyConfig {
                 )));
             }
         };
+        let knowledge = if settings.knowledge_graph == Some(false) {
+            None
+        } else {
+            let default = KnowledgeConfig::default();
+            Some(KnowledgeConfig {
+                extract_model: settings.extract_model.unwrap_or(default.extract_model),
+                supersede_threshold_bp: basis_points(
+                    "supersede_threshold",
+                    settings.supersede_threshold,
+                    default.supersede_threshold_bp,
+                )?,
+            })
+        };
         Ok(Self {
             backend,
+            knowledge,
             models_dir: settings.models_dir.map(expand_home),
             embedder,
             decide_model: settings

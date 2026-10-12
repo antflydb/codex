@@ -60,6 +60,7 @@ pub use model::BackfillStats;
 pub use model::BackfillStatus;
 pub use model::DirectionalThreadSpawnEdgeStatus;
 pub use model::ExtractionOutcome;
+pub use model::MemoryClaim;
 pub use model::RemoveThreadAttachmentOutcome;
 pub use model::SortDirection;
 pub use model::SortKey;

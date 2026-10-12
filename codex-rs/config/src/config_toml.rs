@@ -604,6 +604,15 @@ pub struct AntflyStoreToml {
     /// `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).
     pub decide_model: Option<String>,
     pub approvals: Option<AntflyApprovalsToml>,
+    /// Link claims and memory notes to the concepts they are about
+    /// (default `true`); `false` skips concept extraction entirely.
+    pub knowledge_graph: Option<bool>,
+    /// GLiNER model that extracts concepts (default
+    /// `fastino/gliner2.5-base-v1`).
+    pub extract_model: Option<String>,
+    /// Minimum decide-model probability before a new claim supersedes an
+    /// earlier one (default 0.8).
+    pub supersede_threshold: Option<f64>,
 }
 
 /// Local typed-decision review of approval requests.

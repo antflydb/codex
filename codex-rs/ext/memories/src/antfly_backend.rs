@@ -24,20 +24,31 @@
 //! path order.
 //!
 //! The memories write pipeline (`codex-rs/memories/write`) writes files
-//! directly to disk and does not go through this backend, so pipeline
-//! output (rollout summaries, consolidated notes) is only indexed lazily,
-//! the next time an agent reads it through the `read` tool.
+//! directly to disk and does not go through this backend. [`reconcile`]
+//! brings the index up to date with the files on disk: it runs when a thread
+//! starts and, rate-limited, before each search, so pipeline output
+//! (rollout summaries, consolidated notes) reaches search and the knowledge
+//! graph without waiting for an agent to read it.
+//!
+//! [`reconcile`]: AntflyMemoriesBackend::reconcile
 
 mod search;
 
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use codex_antfly::Antfly;
 use codex_antfly::SEARCH_TEXT_FIELD;
+use codex_antfly::ScanRequest;
 use codex_antfly::Write as AntflyWrite;
 use codex_antfly::schema;
 
@@ -100,12 +111,13 @@ impl AntflyMemoriesBackend {
     /// Best-effort: a failed index never fails the caller's read or write,
     /// since the filesystem (not Antfly) is the source of truth.
     async fn index_note(&self, path: &str, content: &str) {
-        let doc = serde_json::json!({
-            "namespace": self.namespace,
-            "path": path,
-            "updated_at_ms": now_ms(),
-            SEARCH_TEXT_FIELD: content,
-        });
+        let modified_ms = tokio::fs::metadata(self.root.join(path))
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_millis() as i64);
+        let doc = self.note_doc(path, content, modified_ms);
         if let Err(err) = self
             .antfly
             .documents(schema::MEMORY_NOTES)
@@ -114,6 +126,24 @@ impl AntflyMemoriesBackend {
         {
             tracing::warn!(path, %err, "failed to index memory note into Antfly");
         }
+    }
+
+    fn note_doc(
+        &self,
+        path: &str,
+        content: &str,
+        file_modified_ms: Option<i64>,
+    ) -> serde_json::Value {
+        let mut doc = serde_json::json!({
+            "namespace": self.namespace,
+            "path": path,
+            "updated_at_ms": now_ms(),
+            SEARCH_TEXT_FIELD: content,
+        });
+        if let Some(modified) = file_modified_ms {
+            doc["file_modified_ms"] = serde_json::json!(modified);
+        }
+        doc
     }
 
     /// Re-reads `relative_path` from disk and indexes it, best-effort. Used
@@ -134,6 +164,137 @@ impl AntflyMemoriesBackend {
                 );
             }
         }
+    }
+}
+
+/// Searches reconcile at most this often per memory root.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// Larger files are left out of the index rather than read whole.
+const MAX_INDEXED_FILE_BYTES: u64 = 512 * 1024;
+
+static LAST_RECONCILE: LazyLock<Mutex<HashMap<PathBuf, Instant>>> = LazyLock::new(Mutex::default);
+
+/// Every regular file under `root` with its modification time, as
+/// `/`-separated relative paths. Hidden entries (such as `.git`) are skipped.
+fn note_files(root: &Path) -> Vec<(String, i64)> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let path = entry.path();
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() || metadata.len() > MAX_INDEXED_FILE_BYTES {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_millis() as i64)
+                .unwrap_or_default();
+            files.push((relative, modified_ms));
+        }
+    }
+    files
+}
+
+impl AntflyMemoriesBackend {
+    /// Indexes notes whose files changed since they were indexed and drops
+    /// notes whose files are gone. Best effort, like every index write here.
+    pub(crate) async fn reconcile(&self) {
+        let root = self.root.clone();
+        let files = match tokio::task::spawn_blocking(move || note_files(&root)).await {
+            Ok(files) => files,
+            Err(err) => {
+                tracing::warn!(%err, "failed to walk memory notes");
+                return;
+            }
+        };
+        let documents = self.antfly.documents(schema::MEMORY_NOTES);
+        let prefix = format!("{}:", self.namespace);
+        let indexed: HashMap<String, Option<i64>> =
+            match documents.scan(ScanRequest::prefix(&prefix)).await {
+                Ok(documents) => documents
+                    .into_iter()
+                    .filter_map(|document| {
+                        let path = document.doc.get("path")?.as_str()?.to_string();
+                        let modified = document
+                            .doc
+                            .get("file_modified_ms")
+                            .and_then(serde_json::Value::as_i64);
+                        Some((path, modified))
+                    })
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!(%err, "failed to list indexed memory notes");
+                    return;
+                }
+            };
+        let mut writes = Vec::new();
+        for (path, modified_ms) in &files {
+            if indexed.get(path) == Some(&Some(*modified_ms)) {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(self.root.join(path)).await else {
+                continue;
+            };
+            writes.push(AntflyWrite::put(
+                self.doc_id(path),
+                self.note_doc(path, &content, Some(*modified_ms)),
+            ));
+        }
+        let present: std::collections::HashSet<&str> =
+            files.iter().map(|(path, _)| path.as_str()).collect();
+        for path in indexed
+            .keys()
+            .filter(|path| !present.contains(path.as_str()))
+        {
+            writes.push(AntflyWrite::delete(self.doc_id(path)));
+        }
+        if writes.is_empty() {
+            return;
+        }
+        if let Err(err) = documents.write(writes).await {
+            tracing::warn!(%err, "failed to reconcile memory notes into Antfly");
+        }
+    }
+
+    /// [`Self::reconcile`], unless this memory root was reconciled recently.
+    pub(crate) async fn reconcile_if_stale(&self) {
+        let now = Instant::now();
+        {
+            let Ok(mut last) = LAST_RECONCILE.lock() else {
+                return;
+            };
+            if last
+                .get(&self.root)
+                .is_some_and(|at| now.duration_since(*at) < RECONCILE_INTERVAL)
+            {
+                return;
+            }
+            last.insert(self.root.clone(), now);
+        }
+        self.reconcile().await;
     }
 }
 
@@ -175,6 +336,7 @@ impl MemoriesBackend for AntflyMemoriesBackend {
         &self,
         request: SearchMemoriesRequest,
     ) -> Result<SearchMemoriesResponse, MemoriesBackendError> {
+        self.reconcile_if_stale().await;
         search::search(self, request).await
     }
 }

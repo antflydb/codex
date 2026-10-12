@@ -37,6 +37,17 @@ pub const HISTORY_ITEMS: &str = "codex_history_items";
 pub const APPROVALS: &str = "codex_approvals";
 /// Memory notes mirrored from the memories filesystem.
 pub const MEMORY_NOTES: &str = "codex_memory_notes";
+/// Claims distilled from sessions (see `crate::knowledge`).
+pub const KNOWLEDGE: &str = "codex_knowledge";
+
+/// Graph indexes a document table carries when the knowledge graph is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableGraph {
+    /// GLiNER concepts: `about` edges to `concept/<slug>` nodes.
+    Concepts,
+    /// `supersedes` edges from each claim's `supersedes` field.
+    ClaimLinks,
+}
 
 /// A document table with the declared fields SQL can filter and join on.
 /// Every document also carries `search_text`, which the full-text index
@@ -45,6 +56,7 @@ pub struct DocumentTable {
     pub name: &'static str,
     /// `document_schemas` properties, as JSON Schema property definitions.
     pub fields: &'static [(&'static str, &'static str)],
+    pub graphs: &'static [TableGraph],
 }
 
 pub const DOCUMENT_TABLES: &[DocumentTable] = &[
@@ -57,6 +69,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("speaker", "string"),
             ("created_at_ms", "integer"),
         ],
+        graphs: &[],
     },
     DocumentTable {
         name: APPROVALS,
@@ -70,6 +83,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("applied", "boolean"),
             ("decided_at_ms", "integer"),
         ],
+        graphs: &[],
     },
     DocumentTable {
         name: MEMORY_NOTES,
@@ -78,6 +92,19 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("path", "string"),
             ("updated_at_ms", "integer"),
         ],
+        graphs: &[TableGraph::Concepts],
+    },
+    DocumentTable {
+        name: KNOWLEDGE,
+        fields: &[
+            ("kind", "string"),
+            ("status", "string"),
+            ("thread_id", "string"),
+            ("version", "string"),
+            ("source_updated_at_ms", "integer"),
+            ("generated_at_ms", "integer"),
+        ],
+        graphs: &[TableGraph::Concepts, TableGraph::ClaimLinks],
     },
 ];
 

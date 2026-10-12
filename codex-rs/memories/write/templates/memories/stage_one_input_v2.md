@@ -1,4 +1,4 @@
-Analyze this rollout and produce JSON with `rollout_summary` and `rollout_slug`.
+Analyze this rollout and produce JSON with `rollout_summary`, `rollout_slug`, and `claims`.
 
 rollout_context:
 

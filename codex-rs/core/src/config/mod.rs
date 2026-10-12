@@ -2584,6 +2584,9 @@ fn thread_store_config(
                 approvals_mode: antfly.approvals.as_ref().and_then(|a| a.mode.clone()),
                 allow_threshold: antfly.approvals.as_ref().and_then(|a| a.allow_threshold),
                 deny_threshold: antfly.approvals.as_ref().and_then(|a| a.deny_threshold),
+                knowledge_graph: antfly.knowledge_graph,
+                extract_model: antfly.extract_model,
+                supersede_threshold: antfly.supersede_threshold,
             })
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())

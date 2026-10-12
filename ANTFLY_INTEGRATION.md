@@ -367,6 +367,9 @@ decide_model = "convaiinnovations/laya"
 # embedder_model = "google/embeddinggemma-2"  # default
 # embedder_dims = 256                 # optional Matryoshka truncation; omit for native size
 # semantic_search = false            # full text only, no embedder needed
+# knowledge_graph = false            # skip concept extraction and the knowledge graph
+# extract_model = "fastino/gliner2.5-base-v1"  # default
+# supersede_threshold = 0.8          # decide-model confidence before a claim supersedes another
 
 [experimental_thread_store.approvals]
 mode = "shadow"                      # off | shadow | enforce
@@ -398,122 +401,135 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 `thread-store/src/live_thread.rs:188`, `:395`. Audit each when implementing
 `resume_thread` and session init.
 
-## Knowledge graph (proposed)
+## Knowledge graph
 
-Status: design only; nothing below is implemented. Findings are against
+Status: claims, concepts, supersession, retrieval and the `knowledge.search`
+tool are implemented; see "Not built yet" for the rest. Findings are against
 Antfly 1258e8cfcb (main adds nothing graph-related beyond it).
 
 ### Goal
 
 Capture ideas and knowledge across sessions and how they relate, not code
-structure (ASTs and language servers already cover that). The graph should
-answer "what did we decide about X, why, and is that still true?": decisions,
-rationale, preferences, lessons, constraints, rejected alternatives and open
-questions, and how they evolve. For example, this fork's embedder went
-bge-small → Qwen3 → EmbeddingGemma 2. The graph should return the current
-choice and the chain of reasons.
+structure (ASTs and language servers already cover that). The graph answers
+"what did we decide about X, why, and is that still true?": decisions,
+rationale, preferences, lessons, constraints and open questions, and how they
+evolve. For example, this fork's embedder went bge-small → Qwen3 →
+EmbeddingGemma 2. The graph returns the current choice and the chain of
+replacements.
 
 ### Model
 
-Two layers of nodes:
+- **Claims** (`codex_knowledge`, `codex_antfly::knowledge`). Typed
+  propositions: `decision`, `rationale`, `preference`, `lesson`, `constraint`,
+  `open_question`. Each holds one self-contained statement, its thread, memory
+  version, `cwd`, `source_updated_at_ms`, a status (`current` / `superseded`),
+  `supersedes` and `superseded_by`. Ids are `<version>:<thread>:<index>`, and a
+  thread's claims are replaced as a whole when it is re-extracted.
+- **Concepts.** Canonical `concept/<slug>` nodes minted by an Antfly resolver.
+  Codex's `knowledge::concept_key` reproduces Antfly's `slug` exactly, so
+  query-time concepts land on the same keys.
+- **Memory notes** (`codex_memory_notes`) link to the same concepts.
 
-- **Claims.** Typed propositions: `decision`, `rationale`, `preference`,
-  `lesson`, `constraint`, `open_question`. Each has a statement, provenance
-  (thread, turn, source item), `observed_at`, and a status
-  (`current` / `superseded` / `retracted`). Claims are clause-level, so they are
-  written by an LLM, not span extraction.
-- **Concepts.** Canonical `concept/<slug>` nodes for the ideas, technologies,
-  projects, people, goals and problems that claims are about.
+Each knowledge table carries two graph indexes:
 
-Edges:
-
-| Edge | Between | Produced by |
+| Index | Edges | Source |
 |---|---|---|
-| `about` | claim → concept | GLiNER extraction + resolver (mention edges) |
-| `from` | claim → thread / history item | Codex, at write time |
-| `supersedes`, `contradicts`, `refines` | claim → claim | decide model, at write time |
-| `motivated_by`, `rejected_in_favor_of` | claim → claim | the distilling LLM |
-| `part_of`, `alternative_to`, `uses` | concept → concept | GLiNER relation extraction |
+| `codex_concepts_<hash>` | `about` (doc → concept); `part_of`, `alternative_to`, `uses`, `depends_on`, `replaces`, `causes` | GLiNER `extractor` enrichment over `search_text`, plus a resolver |
+| `codex_claim_links` | `supersedes` (claim → claim) | the claim's `supersedes` field (`edge_types[].field`) |
 
-Supersession is the core of the design. Every edge carries validity times, so
-Antfly's bitemporal `edge_filter` (`valid_at`, `known_at`) can return the
-current state and still walk the history.
+The concept index name hashes the extraction model and label schema, so
+changing either rebuilds it; the embedded backend drops the stale version. The
+split is required: Antfly rejects a field-derived edge type on an index that
+also has an artifact source. It also means a concept rebuild never loses
+supersession history.
 
 ### Where claims come from
 
-- **The memories pipeline.** Codex already has a model distill each session
-  (stage 1 rollout summaries, then consolidation). Extend that pass to also
-  emit structured claims and claim→claim relations. This needs no new
-  inference pass and gives better quality than extracting from raw history.
-  To do first: check how structured stage-1 output is today.
-- **Sources.** User messages (preferences, corrections, goals), final agent
-  answers, and memory notes. Skip tool output and reasoning, which are mostly
-  noise for this graph.
+Stage-1 memory extraction (`memories/write`). Its strict output schema now
+includes `claims` (`phase1_output.rs`), and both prompt versions ask for
+self-contained single-sentence claims that name their subject and attribute
+preferences to the user's own words. After a successful stage 1,
+`MemoryStore::record_stage1_claims` writes them to the knowledge graph. SQLite
+stores ignore claims. Claims are removed with their thread's memory: on a
+no-output re-extraction, on `delete_thread_memory`, and on
+`clear_memory_data`. Retention pruning of stage-1 outputs keeps claims.
+
+Stage 1 sees no turn ids, so claims are attributed to threads, not turns.
+
+### Supersession
+
+When a thread's claims are written, each new claim is compared with up to three
+similar `current` claims of the same kind from other threads (hybrid search).
+The decide model answers the predicate "the later statement replaces, reverses
+or updates the earlier statement about the same subject". At or above
+`supersede_threshold` (default 0.8) the new claim lists the earlier one in
+`supersedes`, and the earlier one becomes `superseded` with `superseded_by`
+set. Failures are logged and never fail the write. With Laya, the integration
+test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly supersedes
+"use Qwen3" and leaves an unrelated preference alone.
+
+### Retrieval: `knowledge.search`
+
+`Knowledge::related(query, limit, include_superseded)`:
+
+1. **Seeds.** Run GLiNER on the query (single-window profile, truncated to 600
+   bytes) and map entities to concept keys. Add the concepts of the query's
+   direct hybrid-search hits among claims.
+2. **Expand.** Traverse `about` edges inward from the seeds, in both the claims
+   and memory-notes tables (`graph_queries` through the normal search path, so
+   embedded and remote behave the same).
+3. **Rank.** Score by the number of shared concepts plus direct-hit rank.
+   Superseded claims are dropped unless history is requested; superseded claims
+   carry `superseded_by`.
+
+`codex-antfly-extension` contributes the tool `knowledge.search(query,
+max_results, include_history)` whenever the thread store is Antfly and the
+knowledge graph is on. It returns current claims (with thread, `cwd`,
+`supersedes` and shared concepts) and related memory notes.
+
+### Memory notes
+
+`AntflyMemoriesBackend::reconcile` indexes notes whose files changed (by
+modification time) and drops notes whose files are gone. Hidden entries and
+files over 512 KiB are skipped. It runs in the background when a thread starts
+and, at most every 30 s, before `memories.search`. Pipeline-written notes
+therefore reach search and the concept graph without an agent reading them
+first.
 
 ### What GLiNER does
 
-GLiNER does not write claims. It does the cheap linking work:
+GLiNER does not write claims. It links them:
 
-1. **Concept linking at write time.** An `extractor` asset enrichment on the
-   claims table, memory notes and history `search_text`. Labels are given
-   zero-shot at request time and describe ideas, not code:
-   ```json
-   {"type":"extractor","config":{"provider":"antfly","model":"fastino/gliner2.5-base-v1",
-     "schema":{"entities":["concept","technology","project","person","goal","problem"],
-       "entity_definitions":{"concept":"an idea, technique or design notion",
-                             "problem":"a bug, limitation or failure mode"},
-       "relations":[{"type":"part_of"},{"type":"alternative_to"},{"type":"uses"}]},
-     "options":{"include_confidence":true,"long_document":{"mode":"window"}}}}
-   ```
-   A graph index sources the resulting artifact (`format:"extraction_relation"`,
-   `mention_edge_type:"about"`). A resolver with `key_template:
-   "concept/{{ slug _entity.text }}"` mints the canonical concept keys.
-2. **Concept→concept relations.** Stable facts only. Relations between claims
-   are judgments and come from the decide model or the LLM.
-3. **Seed concepts at query time.** Run `Inference::extract` with the same labels
-   on the user's message (about 100 ms locally). Resolve the hits to concept
-   keys and use them as graph seeds.
-4. **Triage.** GLiNER2 classification over user messages (`correction`,
-   `preference`, `decision`, `question`, `chit-chat`) chooses which turns to
-   distill, and flags corrections so the distiller looks for a claim to
-   supersede.
+1. **Concept extraction at write time,** as an Antfly enrichment on claims and
+   memory notes.
+2. **Concept→concept relations,** stable facts only. Relations between claims
+   are judgments made by the decide model.
+3. **Seed concepts at query time.**
 
-Antfly includes GLiNER fine-tuning. Once a labeled set from real sessions
-exists, tune the concept labels on it instead of relying on zero-shot prompts.
+Labels (`knowledge.rs`): `concept`, `technology`, `tool`, `project`,
+`organization`, `person`, `goal`, `problem`, `practice`, `constraint`,
+`metric`; relations: `part_of`, `alternative_to`, `uses`, `depends_on`,
+`replaces`, `causes`.
 
-### Synonyms
-
-"Laya reviewer", "approval reviewer" and "the decider" must resolve to one
-concept. Slug matching cannot do that. Use the resolver's embedding candidate
-search (`candidate_search:"ann"`, `name_embedding` with EmbeddingGemma 2) and
-its scorer. Embedded ANN resolution is unverified and needs a prototype.
-
-### Retrieval
-
-At the start of a turn:
-
-1. Extract seed concepts from the user message.
-2. Run seeded personalized PageRank (`graph_metric` with `seed_nodes`), or a
-   bounded traversal, over `about` edges.
-3. Surface `current` decisions, preferences, lessons and constraints about
-   those concepts, each linked back to its source sessions.
-4. Follow `supersedes` and `motivated_by` edges only when asked "why".
-
-Expose this as a model-facing tool (a new `ToolContributor`, built like the
-memories one). There is no model-facing session search today. Also use it to
-expand `search_threads` and memory search through shared concepts.
+The label set must be this wide. Antfly serves windowed GLiNER2.5 extraction
+only inside its measured long-document profile, whose minimum padded sequence
+(103 tokens) was measured with an 11-entity, 6-relation schema. A 6-entity,
+3-relation schema made short claims fall below it, and every extraction failed
+with `GlinerBoundaryPaddedSequenceLimitExceeded`. The long-document profile
+also excludes `entity_definitions` and classification, so the enrichment uses
+bare labels. Classification is only qualified on short (≤610-byte) inputs.
 
 ### Model roles
 
 Model roles are separate settings, so collapsing them into one model later is
 a configuration change, not a code change:
 
-| Role | Default | Notes |
+| Role | Setting | Default |
 |---|---|---|
-| Embeddings | `google/embeddinggemma-2` | Already the default; also feeds the synonym resolver |
-| Extraction | `fastino/gliner2.5-base-v1` | Installed; qualified for long documents with `window` mode |
-| Decide (approvals, supersession) | `convaiinnovations/laya` | To be benchmarked against the GLiNER2.5 Decide models |
-| Claim distillation | the session's LLM via the memories pipeline | No local model |
+| Embeddings | `embedder_model` | `google/embeddinggemma-2` |
+| Extraction | `extract_model` | `fastino/gliner2.5-base-v1` (long-document qualified) |
+| Decide (approvals, supersession) | `decide_model` | `convaiinnovations/laya` |
+| Claim distillation | `memories.extract_model` | the memories pipeline's model |
 
 **Why not one GLiNER2.5 Decide model for both, yet.** Antfly gates every
 extraction request against the profiles it was measured on, and fails closed
@@ -521,51 +537,50 @@ outside them (`gliner_boundary_qualification.zig`):
 
 - `fastino/GLiNER2.5-multi-Decide` serves extraction and Decide, but only
   through short single-window profiles. The measured entity row is 663 bytes /
-  114 words, and there is no long-document profile. Most memory notes and many
-  messages would be refused.
+  114 words, and there is no long-document profile.
 - `fastino/GLiNER2.5-Decide-1B` serves Decide only. Its entity and relation
-  heads are not implemented (antflydb/antfly#1083). Decide calls are limited to
-  one item and at most 198 prepared tokens.
+  heads are not implemented, and Decide is limited to one item and at most 198
+  prepared tokens (antflydb/antfly#1083 and its follow-up comment).
 
-Benchmark both against Laya on the approval and supersession questions before
-switching. The typed-decisions community benchmark scores Decide-1B at 0.470
-zero-shot and the released Laya at 0.361. Short claim-vs-claim predicates fit
-both models' limits. The approval prompt (up to 3,000 characters) would need to
-shrink to about the action plus a one-line intent.
+Supersession predicates are short, so they fit both models' Decide limits; the
+approval prompt (up to 3,000 characters) does not.
 
-### Antfly mapping and limits
+### Antfly findings (from the embedded probe)
 
-- **Embedded support.** These all work in embedded libantfly:
-  - graph indexes (`antfly_db_add_index_json`, kind `graph`, with inline
-    `resolvers`);
-  - extractor enrichments with in-process inference;
-  - traversal, shortest paths and pattern matching through the C ABI;
-  - `graph_queries` inside `antfly_search` JSON.
-- **Unverified in embedded:**
-  - search plus `result_ref:"$query_results"` graph expansion in one request;
-  - seeded PageRank;
-  - ANN resolution;
-  - cross-table traversal through shared concept keys.
-- **No entity documents in Lite.** Resolution produces concept *nodes*, but
-  promotion into entity *rows* is server-only (antflydb/antfly#1084), and so is
-  AutoSchemaKG. Codex therefore writes claim records into its own table, with
-  explicit `_edges` for claim→claim and claim→thread edges. GLiNER is used only
-  for concept linking, so the design does not depend on #1084.
-- **Per-table opt-in.** `TableSpec` (`antfly/src/backend.rs`) gains optional
-  extraction and graph specs. The dense index is currently applied to every
-  document table; graph and extraction should be opt-in per table, implemented
-  in both `ensure_table` backends.
-- **Remote.** The same graph index JSON goes to `POST /tables/{t}/indexes/{name}`.
+- These work in embedded libantfly:
+  - graph indexes with inline extractor artifacts and resolvers;
+  - field-derived edges in a separate graph index;
+  - reverse traversal from concept keys with documents;
+  - search plus `result_ref:"$query_results"` expansion in one request;
+  - matching concepts across tables by key.
+- A combined `$query_results` + `direction:"both"` + `max_depth:2` traversal is
+  rejected as invalid, so retrieval runs two single-hop queries.
+- A traversal reports each reached document once, with one path. Shared
+  concepts are therefore computed from each document's own `about` edges.
+- **Extraction quality.** In the probe, GLiNER missed "EmbeddingGemma 2" in one
+  claim and produced both `concept/qwen3` and `concept/qwen3_embedding`. That is
+  the synonym problem below.
+- **No entity documents in Lite.** Promotion into entity rows is server-only
+  (antflydb/antfly#1084), and so is AutoSchemaKG. Claims are Codex's own
+  documents, so this design does not depend on #1084.
+- **Remote.** Graph indexes are created with `POST /tables/{t}/indexes/{name}`
+  (`"type":"graph"`). Stale remote versions are not dropped automatically.
 
-### Risks
+### Not built yet
 
-- **Noisy claims.** Build a labeled set from real sessions, this one included.
-  Measure claim and supersession precision before surfacing anything to the
-  model automatically.
-- **Cost.** Extraction is asynchronous (enrichments), but every history write
-  adds GLiNER work. Limit it to the sources above.
-- **Memory notes are indexed lazily.** Notes written by the memories pipeline
-  are only indexed when first read. Index them on write first.
+- **Synonym resolution.** Merge "Qwen3" and "Qwen3 Embedding" with the
+  resolver's ANN candidate search (`candidate_search:"ann"`, `name_embedding`
+  with EmbeddingGemma 2) and its scorer. Embedded ANN resolution is unverified.
+- **Turn attribution.** Inject turn markers into stage-1 input and have claims
+  cite them.
+- **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
+- **Seeded personalized PageRank** for ranking instead of shared-concept counts.
+- **Triage classification** of user messages (short-input profile only).
+- **Concept extraction on history items.** This is left off because of
+  per-item cost; claims carry thread provenance instead.
+- **Evaluation.** A labeled set from real sessions with claim and supersession
+  precision, before anything is injected into context automatically; today
+  knowledge is only reached through the tool.
 
 ## Plan
 
@@ -634,27 +649,18 @@ shrink to about the action plus a one-line intent.
 
 ### Phase 7: Knowledge graph
 
-See [Knowledge graph (proposed)](#knowledge-graph-proposed).
+See [Knowledge graph](#knowledge-graph).
 
-1. **Prototype (embedded test).** A graph index with a GLiNER extractor and a
-   concept resolver on a scratch table. Verify each of these in libantfly:
-   - concept nodes and `about` edges;
-   - `graph_queries` with `$query_results`;
-   - seeded PageRank;
-   - ANN synonym resolution.
-2. **Claims.** Read the memories stage-1 prompt and output, define the claim
-   schema, and have distillation emit claims into a `codex_knowledge` table
-   with explicit edges.
-3. **Supersession.** At write time, compare each new claim with its top-k
-   similar claims using a decide predicate, and add `supersedes` /
-   `contradicts` edges.
-4. **Retrieval.** Query-time seed extraction, a model-facing knowledge tool,
-   and concept expansion for `search_threads` and memory search.
-5. **Memory notes.** Index on write, and link notes to the same concepts.
-6. **Decide models.** Benchmark Laya, GLiNER2.5-multi-Decide and
+1. ✅ Embedded probe of graph indexes, extraction, resolvers and traversal.
+2. ✅ Claims from stage-1 extraction into `codex_knowledge`.
+3. ✅ Supersession with a decide predicate at write time.
+4. ✅ Retrieval and the `knowledge.search` tool.
+5. ✅ Memory notes reconciled from disk and linked to the same concepts.
+6. Synonym resolution, turn attribution and seeded PageRank.
+7. Decide models: benchmark Laya, GLiNER2.5-multi-Decide and
    GLiNER2.5-Decide-1B on the approval and supersession questions.
    Gate: a labeled set from real sessions, and precision targets met, before
-   anything is surfaced to the model automatically.
+   anything is injected into context automatically.
 
 ## Operational constraints
 

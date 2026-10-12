@@ -7,7 +7,12 @@
 //! actions and denies confident destructive ones; everything else continues
 //! to Guardian or the user. Decisions and their observed outcomes are stored
 //! in Antfly for calibration and as context for later requests.
+//!
+//! When the knowledge graph is enabled it also contributes `knowledge.search`,
+//! which surfaces claims distilled from earlier sessions and related memory
+//! notes (see [`knowledge`]).
 
+pub mod knowledge;
 mod outcomes;
 mod request;
 mod reviewer;
@@ -37,4 +42,8 @@ pub fn install(
         &reviewer,
     ))));
     registry.approval_review_contributor(reviewer);
+    let knowledge = Arc::new(knowledge::KnowledgeExtension);
+    registry.thread_lifecycle_contributor(Arc::clone(&knowledge) as _);
+    registry.config_contributor(Arc::clone(&knowledge) as _);
+    registry.tool_contributor(knowledge);
 }

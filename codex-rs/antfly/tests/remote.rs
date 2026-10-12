@@ -28,6 +28,7 @@ fn remote() -> Option<Antfly> {
         embedder: Some(EmbedderConfig::default()),
         decide_model: codex_antfly::DEFAULT_DECIDE_MODEL.to_string(),
         approvals: Default::default(),
+        knowledge: Some(Default::default()),
     }))
 }
 

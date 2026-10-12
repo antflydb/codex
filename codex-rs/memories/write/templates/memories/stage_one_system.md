@@ -42,7 +42,7 @@ If NO — i.e., this was mostly:
 - no preference/constraint likely to help on similar future runs,
 
 then return all-empty fields exactly:
-`{"rollout_summary":"","rollout_slug":"","raw_memory":""}`
+`{"rollout_summary":"","rollout_slug":"","raw_memory":"","claims":[]}`
 
 ============================================================
 WHAT COUNTS AS HIGH-SIGNAL MEMORY
@@ -224,15 +224,30 @@ Return exactly one JSON object with required keys:
 - `rollout_summary` (string)
 - `rollout_slug` (string)
 - `raw_memory` (string)
+- `claims` (array of `{"kind": string, "statement": string}`)
 
 `rollout_summary` and `raw_memory` formats are below. `rollout_slug` is a
 filesystem-safe stable slug to best describe the rollout (lowercase, hyphen/underscore, <= 80 chars).
 
 Rules:
 
-- Empty-field no-op must use empty strings for all three fields.
+- Empty-field no-op must use empty strings for all three string fields and an
+  empty `claims` array.
 - No additional keys.
 - No prose outside JSON.
+
+Also return `claims`: standalone propositions a future agent should know, each
+an object with `kind` and `statement`. `kind` is one of `decision` (a choice
+made for the work), `rationale` (why a decision was made), `preference` (how
+the user said they want to work), `lesson` (something learned from a failure or
+surprise), `constraint` (a limit that applies) or `open_question` (left
+unresolved). Write each statement as one self-contained sentence that names its
+subject, so it reads correctly without the rollout: "Codex's Antfly integration
+uses EmbeddingGemma 2 as its default embedder", not "Use that model instead".
+Include only claims the evidence supports, word preferences as described above,
+and state the final position when a decision changed during the rollout. Omit
+routine progress. Return at most 12 claims; an empty array is fine.
+
 
 ============================================================
 `rollout_summary` FORMAT
@@ -562,7 +577,7 @@ WORKFLOW
    - If this rollout fails the gate, return either all-empty fields or unchanged prior values.
 1. Triage outcome using the common rules.
 2. Read the rollout carefully (do not miss user messages/tool calls/outputs).
-3. Return `rollout_summary`, `rollout_slug`, and `raw_memory`, valid JSON only.
+3. Return `rollout_summary`, `rollout_slug`, `raw_memory`, and `claims`, valid JSON only.
    No markdown wrapper, no prose outside JSON.
 
 - Do not be terse in task sections. Include validation signal, failure mode, reusable procedure,
