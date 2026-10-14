@@ -161,3 +161,46 @@ fn migrations_create_every_table_and_rerun_cleanly() -> Result<(), Box<dyn std::
         Ok::<_, Box<dyn std::error::Error>>(())
     })
 }
+
+#[test]
+fn nul_characters_are_stored_as_replacement_characters() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("codex.aflite");
+    runtime().block_on(async {
+        let mut config = AntflyConfig::embedded(&path);
+        config.embedder = None;
+        let antfly = Antfly::open(config)?;
+        let sql =
+            Sql::connect_embedded(&path, true, antfly.backend().await?.embedded_database()).await?;
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS codex_nul (id TEXT PRIMARY KEY, body JSONB NOT NULL, note TEXT)",
+            vec![],
+        )
+        .await?;
+        // Command output can contain NUL; JSONB and SQL text cannot store it.
+        sql.execute(
+            "INSERT INTO codex_nul (id, body, note) VALUES ($1, $2, $3)",
+            sql_params![
+                "a",
+                json!({"aggregatedOutput": "before\u{0}after", "k\u{0}ey": ["x\u{0}"]}),
+                "note\u{0}"
+            ],
+        )
+        .await?;
+        let rows = sql
+            .fetch_all("SELECT body, note FROM codex_nul WHERE id = $1", sql_params!["a"])
+            .await?;
+        assert_eq!(rows[0].string("note")?, "note\u{FFFD}");
+        let SqlValue::Json(body) = rows[0].get("body")? else {
+            panic!("body is JSONB");
+        };
+        assert_eq!(
+            body,
+            &json!({"aggregatedOutput": "before\u{FFFD}after", "k\u{FFFD}ey": ["x\u{FFFD}"]})
+        );
+        sql.close().await;
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

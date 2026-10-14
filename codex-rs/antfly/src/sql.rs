@@ -221,6 +221,50 @@ fn sql_error(error: sqlx::Error) -> AntflyError {
     }
 }
 
+/// Adds the failing statement to remote database errors so a SQLSTATE says
+/// which query raised it.
+fn with_statement(error: AntflyError, statement: &str) -> AntflyError {
+    match error {
+        AntflyError::Sql {
+            code: Some(code),
+            message,
+        } => {
+            let compact = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+            let shown: String = compact.chars().take(240).collect();
+            AntflyError::Sql {
+                code: Some(code),
+                message: format!("{message} [statement: {shown}]"),
+            }
+        }
+        other => other,
+    }
+}
+
+/// NUL cannot be stored in SQL text or in JSONB strings (Antfly follows
+/// PostgreSQL here and rejects the whole row with SQLSTATE 22P05). Command
+/// output and other captured text can contain it, so it is replaced with
+/// U+FFFD before binding; every other character is stored unchanged.
+fn without_nul(text: String) -> String {
+    if text.contains('\0') {
+        text.replace('\0', "\u{FFFD}")
+    } else {
+        text
+    }
+}
+
+fn json_without_nul(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(without_nul(text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(json_without_nul).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (without_nul(key), json_without_nul(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn antfly_arguments(params: Vec<SqlValue>) -> AntflyResult<AntflyArguments> {
     let mut arguments = AntflyArguments::default();
     for value in params {
@@ -229,8 +273,8 @@ fn antfly_arguments(params: Vec<SqlValue>) -> AntflyResult<AntflyArguments> {
             SqlValue::Bool(value) => arguments.add(value),
             SqlValue::Int(value) => arguments.add(value),
             SqlValue::Float(value) => arguments.add(value),
-            SqlValue::Text(value) => arguments.add(value),
-            SqlValue::Json(value) => arguments.add(value),
+            SqlValue::Text(value) => arguments.add(without_nul(value)),
+            SqlValue::Json(value) => arguments.add(json_without_nul(value)),
         };
         added.map_err(|err| AntflyError::Malformed(err.to_string()))?;
     }
@@ -245,8 +289,8 @@ fn pg_arguments(params: Vec<SqlValue>) -> AntflyResult<PgArguments> {
             SqlValue::Bool(value) => arguments.add(value),
             SqlValue::Int(value) => arguments.add(value),
             SqlValue::Float(value) => arguments.add(value),
-            SqlValue::Text(value) => arguments.add(value),
-            SqlValue::Json(value) => arguments.add(sqlx::types::Json(value)),
+            SqlValue::Text(value) => arguments.add(without_nul(value)),
+            SqlValue::Json(value) => arguments.add(sqlx::types::Json(json_without_nul(value))),
         };
         added.map_err(|err| AntflyError::Malformed(err.to_string()))?;
     }
@@ -368,8 +412,11 @@ impl Sql {
         if let Some(database) = database {
             options = options.with_database(database);
         }
+        // In-process connections cannot go stale, and `ping` queues behind
+        // the engine's handle lock (antflydb/antfly#1130).
         let pool = sqlx::pool::PoolOptions::<AntflyDb>::new()
             .max_connections(4)
+            .test_before_acquire(false)
             .connect_with(options)
             .await
             .map_err(sql_error)?;
@@ -407,8 +454,9 @@ impl Sql {
         params: Vec<SqlValue>,
     ) -> BoxFuture<'a, AntflyResult<u64>> {
         Box::pin(async move {
+            let sql_text = statement;
             let statement = AssertSqlSafe(statement.to_string());
-            match &self.pool {
+            let result: AntflyResult<_> = match &self.pool {
                 Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
                     .execute(pool)
                     .await
@@ -419,6 +467,12 @@ impl Sql {
                     .await
                     .map(|result| result.rows_affected())
                     .map_err(sql_error),
+            };
+            match &self.pool {
+                // Embedded errors already carry the statement
+                // (antflydb/antfly#1127).
+                Pool::Embedded(_) => result,
+                Pool::Remote(_) => result.map_err(|err| with_statement(err, sql_text)),
             }
         })
     }
@@ -429,8 +483,9 @@ impl Sql {
         params: Vec<SqlValue>,
     ) -> BoxFuture<'a, AntflyResult<Vec<SqlRow>>> {
         Box::pin(async move {
+            let sql_text = statement;
             let statement = AssertSqlSafe(statement.to_string());
-            match &self.pool {
+            let result: AntflyResult<_> = match &self.pool {
                 Pool::Embedded(pool) => sqlx::query_with(statement, antfly_arguments(params)?)
                     .fetch_all(pool)
                     .await
@@ -445,6 +500,12 @@ impl Sql {
                     .iter()
                     .map(pg_row)
                     .collect(),
+            };
+            match &self.pool {
+                // Embedded errors already carry the statement
+                // (antflydb/antfly#1127).
+                Pool::Embedded(_) => result,
+                Pool::Remote(_) => result.map_err(|err| with_statement(err, sql_text)),
             }
         })
     }
@@ -495,8 +556,9 @@ impl SqlTx {
         params: Vec<SqlValue>,
     ) -> BoxFuture<'a, AntflyResult<u64>> {
         Box::pin(async move {
+            let sql_text = statement;
             let statement = AssertSqlSafe(statement.to_string());
-            match &mut self.inner {
+            let result: AntflyResult<_> = match &mut self.inner {
                 Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
                     .execute(&mut **tx)
                     .await
@@ -507,6 +569,12 @@ impl SqlTx {
                     .await
                     .map(|result| result.rows_affected())
                     .map_err(sql_error),
+            };
+            match &self.inner {
+                // Embedded errors already carry the statement
+                // (antflydb/antfly#1127).
+                Tx::Embedded(_) => result,
+                Tx::Remote(_) => result.map_err(|err| with_statement(err, sql_text)),
             }
         })
     }
@@ -517,8 +585,9 @@ impl SqlTx {
         params: Vec<SqlValue>,
     ) -> BoxFuture<'a, AntflyResult<Vec<SqlRow>>> {
         Box::pin(async move {
+            let sql_text = statement;
             let statement = AssertSqlSafe(statement.to_string());
-            match &mut self.inner {
+            let result: AntflyResult<_> = match &mut self.inner {
                 Tx::Embedded(tx) => sqlx::query_with(statement, antfly_arguments(params)?)
                     .fetch_all(&mut **tx)
                     .await
@@ -533,6 +602,12 @@ impl SqlTx {
                     .iter()
                     .map(pg_row)
                     .collect(),
+            };
+            match &self.inner {
+                // Embedded errors already carry the statement
+                // (antflydb/antfly#1127).
+                Tx::Embedded(_) => result,
+                Tx::Remote(_) => result.map_err(|err| with_statement(err, sql_text)),
             }
         })
     }
