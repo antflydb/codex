@@ -109,6 +109,22 @@ impl ThreadPlan {
             meta.subagent_history_start_ordinal = None;
         }
         let created = create_params(&meta);
+        // The state database normally supplies timestamps. Threads missing
+        // from it (or homes without one) fall back to the rollout itself, so
+        // imported history keeps its original age instead of looking brand
+        // new to listings, `--since` and the memories idle window.
+        let mut patch = self.overlay.patch.clone();
+        if patch.created_at.is_none() {
+            patch.created_at = DateTime::parse_from_rfc3339(&meta.timestamp)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc));
+        }
+        if patch.updated_at.is_none() {
+            patch.updated_at = self.updated_at();
+        }
+        if patch.advance_recency_at.is_none() {
+            patch.advance_recency_at = patch.updated_at;
+        }
         items.insert(
             0,
             RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
@@ -123,7 +139,7 @@ impl ThreadPlan {
                 id,
                 position: overlay.section_position,
             }),
-            patch: overlay.patch,
+            patch,
             legacy_rollout_path: tip.path.clone(),
         })
     }

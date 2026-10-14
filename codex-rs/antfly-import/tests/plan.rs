@@ -106,3 +106,45 @@ async fn reverted_thread_flattens_visible_history() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn threads_without_state_metadata_keep_their_rollout_age()
+-> Result<(), Box<dyn std::error::Error>> {
+    use chrono::TimeZone;
+    let home = tempfile::tempdir()?;
+    let day = home.path().join("sessions/2026/10/01");
+    std::fs::create_dir_all(&day)?;
+    let thread = ThreadId::new();
+    let RolloutItem::SessionMeta(mut session) = meta(thread, None) else {
+        unreachable!("meta() builds a SessionMeta");
+    };
+    session.meta.timestamp = "2026-10-01T08:00:00Z".to_string();
+    let path = day.join(format!("rollout-2026-10-01T08-00-00-{thread}.jsonl"));
+    std::fs::write(
+        &path,
+        [
+            line(0, &RolloutItem::SessionMeta(session)),
+            line(1, &user("hello")),
+        ]
+        .join("\n"),
+    )?;
+    let last_activity = chrono::Utc
+        .with_ymd_and_hms(2026, 10, 2, 9, 30, 0)
+        .single()
+        .ok_or("time")?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(last_activity.into())?;
+
+    // No state database: timestamps come from the rollout, not import time.
+    let plan = codex_antfly_import::load(home.path()).await?;
+    let imported = plan.threads[0].materialize().await?;
+    assert_eq!(
+        imported.patch.created_at,
+        chrono::Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).single()
+    );
+    assert_eq!(imported.patch.updated_at, Some(last_activity));
+    assert_eq!(imported.patch.advance_recency_at, Some(last_activity));
+    Ok(())
+}

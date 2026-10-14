@@ -24,7 +24,7 @@ use crate::ThreadMetadataPatch;
 use crate::ThreadStoreResult;
 
 /// Items written per batch.
-const IMPORT_CHUNK: usize = 256;
+const IMPORT_CHUNK: usize = 1024;
 
 /// A complete thread to import.
 #[derive(Debug)]
@@ -93,6 +93,9 @@ impl AntflyThreadStore {
         let paginated = params.created.history_mode == ThreadHistoryMode::Paginated;
         let imported_at = Utc::now();
         let mut ordinal = 0u64;
+        // Any previous projection was deleted above, so lookups only need
+        // the rows this import has written.
+        let mut cache = projection::ProjectionCache::fresh();
         for chunk in params.items.chunks(IMPORT_CHUNK) {
             let mut writes = Vec::with_capacity(chunk.len());
             for (offset, item) in chunk.iter().enumerate() {
@@ -104,8 +107,9 @@ impl AntflyThreadStore {
                 .await
                 .map_err(internal)?;
             if paginated {
-                projection::apply_batch(
+                projection::apply_batch_with(
                     self,
+                    &mut cache,
                     thread_id,
                     params.created.subagent_history_start_ordinal,
                     ordinal,

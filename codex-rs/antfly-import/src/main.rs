@@ -18,6 +18,9 @@ struct Args {
     /// Import at most this many threads, newest first.
     #[arg(long)]
     limit: Option<usize>,
+    /// Only these threads (repeatable).
+    #[arg(long = "thread")]
+    threads: Vec<String>,
     /// Report what would be imported without writing anything.
     #[arg(long)]
     dry_run: bool,
@@ -43,6 +46,9 @@ struct Args {
     /// After importing, search the destination and print matching threads.
     #[arg(long)]
     search: Option<String>,
+    /// Print each thread's import time.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -62,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|thread| {
             since.is_none_or(|since| thread.updated_at().is_some_and(|updated| updated >= since))
+                && (args.threads.is_empty()
+                    || args.threads.contains(&thread.thread_id().to_string()))
         })
         .collect();
     threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at()));
@@ -119,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
     let total = threads.len();
     let (mut imported, mut present, mut failed) = (0usize, 0usize, 0usize);
     for (index, thread) in threads.iter().enumerate() {
+        let started = std::time::Instant::now();
         let result = async {
             let thread = thread.materialize().await?;
             let outcome = store
@@ -141,6 +150,9 @@ async fn main() -> anyhow::Result<()> {
             anyhow::Ok(outcome)
         }
         .await;
+        if args.verbose {
+            println!("  {} {:.1?}", thread.thread_id(), started.elapsed());
+        }
         match result {
             Ok(codex_thread_store::ImportOutcome::Imported) => imported += 1,
             Ok(codex_thread_store::ImportOutcome::AlreadyPresent) => present += 1,
