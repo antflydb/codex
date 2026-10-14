@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `b77cb634d5` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `2c8240e703` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `b77cb634d5` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `2c8240e703` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -309,6 +309,70 @@ Embeddings run in-process with `local_runtime_configured`.
 `append_items` writes items and the thread's recency/preview in one
 transaction.
 
+### End-to-end run (2026-10-13)
+
+A release `codex` was run against a scratch `CODEX_HOME` on the embedded
+backend. The run covered the importer, `codex exec`, and the app-server
+(`thread/list`, `thread/search`, an approval turn, memories). Antfly-side
+findings are tracked in antflydb/antfly#1126 (fixed by #1127).
+
+Fixed in Codex during the run:
+
+- **NUL in captured output.** Command output with `U+0000`, stored inside a
+  JSONB item, failed every write of that item (and so the whole thread
+  import). Antfly rejects NUL in `TEXT`/`JSONB` by design (SQLSTATE `22P05`
+  since #1127). `codex_antfly::sql` now replaces NUL with `U+FFFD` in text and
+  JSON parameters, including object keys.
+- **Importer timestamps.** Threads without SQLite metadata took the import
+  time as `updated_at`, so memories treated old sessions as active. The
+  importer now falls back to the rollout's `SessionMeta` timestamp for
+  `created_at` and the file's mtime for `updated_at`.
+- **Importer linking.** `codex-antfly-import` embeds the `libantfly` rpath
+  (`build.rs`), like the CLI.
+- **Shadow reviews of escalated commands.** These set
+  `require_fresh_review`, so the reviewer skipped them and
+  `codex_approvals` stayed empty. See the reviewer section below.
+- **Memories stage 1 on Antfly-native threads.** Stage 1 read rollout files,
+  which Antfly threads don't have. When no rollout file exists, it now loads
+  history from the thread store (`ThreadManager::load_thread_history`). That
+  path can't use `load_history`, which upstream rejects for Paginated
+  threads; resume uses the latest model context instead. A defaulted
+  `ThreadStore::load_full_history` returns every raw item in either mode. The
+  Antfly store serves it from `codex_history_items`; other stores fall back
+  to `load_history`, and their Paginated threads keep rollout files.
+
+- **Approval outcomes.** A declined approval ends the tool call normally,
+  so `on_tool_finish` couldn't tell it from a failed command. Command items
+  don't help either: for unified exec, the app-server synthesizes the
+  `declined` item from the client's answer, and core never emits one. A new
+  defaulted `ToolLifecycleContributor::on_approval_resolved` hook reports
+  every resolution (hook, reviewer or user) with the call id and
+  `ReviewDecision`. Core calls it from `Session::request_approval`. The
+  recorder stores `decision` and `decided_by`, and labels outcomes
+  `executed`, `executed_failed`, `declined`, `blocked`, `failed` or
+  `not_executed`.
+- **Import speed.** The projection read each turn and item before writing
+  it, one statement at a time: about 4 SQL statements per rollout item.
+  `ProjectionCache` reads each row at most once per batch. Imports skip
+  reads entirely, because the thread's projection starts empty. Rows are
+  written as 64-row upserts. The embedded pool no longer pings on acquire.
+  A 3,586-item thread went from 61.8 s to 16.2 s, or 6.6 s without the dense
+  index. The rest is Antfly: SQL recovery on every statement, and background
+  enrichment holding the connection gate while it embeds
+  (antflydb/antfly#1130).
+
+Remaining gaps:
+
+- **V8 for release builds.** A plain `cargo build --release` leaves out
+  `codex-code-mode-host`, and shell tools then fail closed. Its `v8` build
+  falls back to a download URL that 404s. Build packages with
+  `just assemble-codex-package`, which fetches and verifies the matching
+  `rusty-v8-v<version>` artifacts from openai/codex. Alternatively, set
+  `RUSTY_V8_ARCHIVE` and `RUSTY_V8_SRC_BINDING_PATH` yourself, as
+  `.github/actions/setup-rusty-v8` does.
+- **Stage 1 eligibility.** `memories.min_rollout_idle_hours` is clamped to at
+  least 1, so stage 1 never processes a thread active within the last hour.
+
 ### Approval reviewer (`codex_antfly_extension`)
 
 `LayaApprovalReviewer` implements `ApprovalReviewContributor`
@@ -319,7 +383,10 @@ is registered before `codex_guardian_v2::install`
 - Apply Guardian V2's guards first (`ext/guardian-v2/src/async_scorer/approval.rs`):
   allow on `full_access`; return `AskUser` when the reviewer is `User` or the
   policy is not `OnRequest`/`Granular` unless `require_guardian`; never fast
-  allow when `require_fresh_review`.
+  allow when `require_fresh_review`. Escalated shell commands always set
+  `require_fresh_review`, so the reviewer still runs and records these
+  (`fresh_review_required: true`). Only a `Deny` is applied in enforce mode;
+  an `Allow` is left to Guardian and the user.
 - Build `state` from `action`, `permissions`, `category` (`GuardianScope`),
   cwd, the latest user request (via `Weak<ThreadManager>`), and similar past
   approvals from the store.
@@ -392,6 +459,9 @@ Keep changes here minimal; delegate to the new crates.
 | `app-server/src/extensions.rs` | Install `codex_antfly_extension` before Guardian V2; Antfly message board and memories backend |
 | `state/src/runtime.rs` (and `runtime/*.rs`) | Swap SQLite internals for the Antfly backend behind the existing method signatures |
 | `Cargo.toml` (workspace) | New members; `antfly-embedded` and `antfly-sdk` dependencies |
+| `thread-store/src/store.rs` | Defaulted `ThreadStore::load_full_history` (raw items in either history mode) |
+| `ext/extension-api/src/contributors.rs`, `contributors/tool_lifecycle.rs`; `core/src/tools/approvals.rs` (`notify_approval_resolved`) | Defaulted `ToolLifecycleContributor::on_approval_resolved`, called for every approval resolution |
+| `core/src/thread_manager.rs` (`load_thread_history`), `memories/write/src/phase1.rs`, `memories/write/src/runtime.rs` | Stage 1 reads history from the store when a thread has no rollout file |
 
 `LocalThreadStore` downcasts that become irrelevant once `state_db` is always
 Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
@@ -405,10 +475,10 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `b77cb634d5`, which includes
+against Antfly 1258e8cfcb; the pin is now `2c8240e703`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges) and #1114 (resolver ownership, shadow index
-replacement).
+replacement), and #1127 (NUL diagnostics, statement context in errors).
 
 ### Goal
 
