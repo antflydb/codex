@@ -45,6 +45,8 @@ pub use thread_lifecycle::ThreadReadyInput;
 pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
+pub use tool_lifecycle::ApprovalResolutionSource;
+pub use tool_lifecycle::ApprovalResolvedInput;
 pub use tool_lifecycle::CommandStartInput;
 pub use tool_lifecycle::McpToolContext;
 pub use tool_lifecycle::McpToolResultInput;
@@ -402,6 +404,10 @@ pub trait ToolLifecycleContributor: Send + Sync {
     fn on_tool_finish<'a>(&'a self, _input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
     }
+
+    /// Observe how an approval request for a tool call was resolved. Called for
+    /// every resolution source; observers must return promptly.
+    fn on_approval_resolved(&self, _input: ApprovalResolvedInput<'_>) {}
 
     /// Observe handler or remote host duration as defined by `ToolTimingBoundary`.
     /// Handler timing includes cancellation. Observers must return promptly.

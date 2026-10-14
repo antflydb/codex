@@ -485,6 +485,7 @@ impl Session {
         if !is_network_approval {
             record_resolution(&ctx, &resolution);
         }
+        self.notify_approval_resolved(&ctx, &resolution);
         if is_mcp_tool_call && resolution.decision == ReviewDecision::ApprovedMcpPolicyAmendment {
             return Ok(resolution.decision);
         }
@@ -507,6 +508,27 @@ impl Session {
             }
         }
         resolution.into_tool_result(ctx.review_context.turn().model_info())
+    }
+
+    fn notify_approval_resolved(&self, ctx: &ApprovalContext, resolution: &ApprovalResolution) {
+        let turn = ctx.review_context.turn();
+        let source = match resolution.source {
+            ApprovalResolutionSource::Hook => codex_extension_api::ApprovalResolutionSource::Hook,
+            ApprovalResolutionSource::Guardian => {
+                codex_extension_api::ApprovalResolutionSource::Reviewer
+            }
+            ApprovalResolutionSource::User => codex_extension_api::ApprovalResolutionSource::User,
+        };
+        for contributor in self.services.extensions.tool_lifecycle_contributors() {
+            contributor.on_approval_resolved(codex_extension_api::ApprovalResolvedInput {
+                thread_store: &self.services.thread_extension_data,
+                turn_store: turn.extension_data.as_ref(),
+                turn_id: turn.sub_id.as_str(),
+                call_id: &ctx.call_id,
+                decision: &resolution.decision,
+                source,
+            });
+        }
     }
 
     async fn request_reviewer_approval(

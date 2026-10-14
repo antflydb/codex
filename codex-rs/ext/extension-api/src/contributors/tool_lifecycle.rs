@@ -214,6 +214,32 @@ pub struct ToolFinishInput<'a> {
     pub outcome: ToolCallOutcome,
 }
 
+/// Who resolved an approval request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalResolutionSource {
+    /// A permission-request hook.
+    Hook,
+    /// An automatic reviewer (an approval review contributor or Guardian).
+    Reviewer,
+    /// The user, through the client.
+    User,
+}
+
+/// Input supplied when an approval request for a tool call resolves, before
+/// the call proceeds or is rejected.
+pub struct ApprovalResolvedInput<'a> {
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+    /// Current turn submission id.
+    pub turn_id: &'a str,
+    /// Tool call the approval was requested for.
+    pub call_id: &'a str,
+    pub decision: &'a codex_protocol::protocol::ReviewDecision,
+    pub source: ApprovalResolutionSource,
+}
+
 /// The execution interval represented by a tool timing observation.
 #[derive(Clone, Copy, Debug)]
 pub enum ToolTimingBoundary {

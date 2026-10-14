@@ -40,6 +40,8 @@ pub(crate) struct PendingOutcome {
     /// Document id in [`schema::APPROVALS`]; the approval's own id.
     pub(crate) id: String,
     pub(crate) doc: Value,
+    /// Whether the approval was granted, once it has resolved.
+    pub(crate) approved: Option<bool>,
 }
 
 pub(crate) struct LayaApprovalReviewer {
@@ -100,9 +102,10 @@ impl LayaApprovalReviewer {
     }
 
     async fn review(&self, input: &ApprovalDecisionInput<'_>) -> Option<ApprovalDecision> {
-        // Guardian's guards: full access needs no review, and fresh reviews
-        // must not be short-circuited by a cached or fast decision.
-        if input.full_access || input.require_fresh_review {
+        // Full access needs no review. Requests that require a fresh review
+        // (escalated commands, retries) are still assessed and recorded; only
+        // what may be applied changes (see `applied_decision`).
+        if input.full_access {
             return None;
         }
         let antfly = self.antfly_for(input.thread_id).await?;
@@ -149,15 +152,7 @@ impl LayaApprovalReviewer {
             "local approval review"
         );
 
-        let applied = match (&settings.mode, &decided) {
-            (ApprovalMode::Enforce, Verdict::Allow) => Some(ApprovalDecision::Allow),
-            (ApprovalMode::Enforce, Verdict::Deny { reason }) => {
-                Some(ApprovalDecision::Reviewed(ReviewDecision::Denied {
-                    rejection: reason.clone(),
-                }))
-            }
-            _ => None,
-        };
+        let applied = applied_decision(settings.mode, &decided, input.require_fresh_review);
         self.record(
             &antfly,
             input,
@@ -197,6 +192,7 @@ impl LayaApprovalReviewer {
             "approval_id": input.approval_id,
             "tool_call_id": input.tool_call_id,
             "category": format!("{:?}", input.category),
+            "fresh_review_required": input.require_fresh_review,
             "search_text": state,
             "action": input.action,
             "answers": {
@@ -220,6 +216,7 @@ impl LayaApprovalReviewer {
                 PendingOutcome {
                     id: id.clone(),
                     doc: doc.clone(),
+                    approved: None,
                 },
             );
         }
@@ -273,5 +270,53 @@ impl TurnInputContributor for LayaApprovalReviewer {
             }
             Vec::new()
         })
+    }
+}
+
+/// What a verdict may change. Shadow mode only records. In enforce mode a
+/// confident denial is applied, and a confident allow is applied unless the
+/// host requires a fresh review (escalated commands, retries): the host does
+/// not trust a fast allow there, so the request goes to the user (or the
+/// configured reviewer) instead of an implicit model review.
+pub(crate) fn applied_decision(
+    mode: ApprovalMode,
+    verdict: &Verdict,
+    require_fresh_review: bool,
+) -> Option<ApprovalDecision> {
+    match (mode, verdict) {
+        (ApprovalMode::Enforce, Verdict::Allow) if !require_fresh_review => {
+            Some(ApprovalDecision::Allow)
+        }
+        (ApprovalMode::Enforce, Verdict::Deny { reason }) => {
+            Some(ApprovalDecision::Reviewed(ReviewDecision::Denied {
+                rejection: reason.clone(),
+            }))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod applied_decision_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_reviews_keep_denials_but_never_fast_allow() {
+        let deny = Verdict::Deny {
+            reason: "destructive".to_string(),
+        };
+        assert!(matches!(
+            applied_decision(ApprovalMode::Enforce, &Verdict::Allow, false),
+            Some(ApprovalDecision::Allow)
+        ));
+        assert!(applied_decision(ApprovalMode::Enforce, &Verdict::Allow, true).is_none());
+        for fresh in [false, true] {
+            assert!(matches!(
+                applied_decision(ApprovalMode::Enforce, &deny, fresh),
+                Some(ApprovalDecision::Reviewed(ReviewDecision::Denied { .. }))
+            ));
+            assert!(applied_decision(ApprovalMode::Shadow, &deny, fresh).is_none());
+            assert!(applied_decision(ApprovalMode::Shadow, &Verdict::Allow, fresh).is_none());
+        }
     }
 }
