@@ -972,6 +972,50 @@ async fn load_history_rejects_paginated_threads_use_model_context_instead() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_history_serves_paginated_threads_for_memories() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let store = store(&dir);
+    let thread_id = ThreadId::new();
+    store.create_thread(paginated_params(thread_id)).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1", 1_000),
+                item_completed(
+                    thread_id,
+                    "turn-1",
+                    user_message_item("u1", "remember the DNS fix"),
+                    1_000_000,
+                    1_000_001,
+                ),
+                turn_complete("turn-1", 1_000, 1_005),
+            ],
+        })
+        .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+
+    let history = store
+        .load_full_history(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        })
+        .await?;
+    assert!(matches!(history.items[0], RolloutItem::SessionMeta(_)));
+    assert!(history.items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if matches!(&event.item, TurnItem::UserMessage(message) if message.id == "u1")
+    )));
+
+    store.shutdown_thread(thread_id).await?;
+    settle(store, dir).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_paginated_thread_returns_latest_model_context() -> TestResult {
     let dir = tempfile::tempdir()?;
     let store = store(&dir);

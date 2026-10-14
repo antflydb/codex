@@ -204,6 +204,7 @@ mod job {
         let (stage_one_output, token_usage) = match sample(
             context,
             config,
+            claimed_thread.id,
             &claimed_thread.rollout_path,
             &claimed_thread.cwd,
             claimed_thread.git_branch.as_deref(),
@@ -270,12 +271,19 @@ mod job {
     async fn sample(
         context: &MemoryStartupContext,
         config: &Config,
+        thread_id: codex_protocol::ThreadId,
         rollout_path: &Path,
         rollout_cwd: &Path,
         rollout_git_branch: Option<&str>,
         stage_one_context: &StageOneRequestContext,
     ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
+        // Local stores keep a rollout file; stores without files (Antfly,
+        // in-memory) serve the same history from the thread store.
+        let rollout_items = if tokio::fs::try_exists(rollout_path).await.unwrap_or(false) {
+            RolloutRecorder::load_rollout_items(rollout_path).await?.0
+        } else {
+            context.load_thread_history(thread_id).await?
+        };
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,
             MemoryVersion::V2 => crate::rollout_input::serialize_tiered_input(

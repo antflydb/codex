@@ -616,6 +616,20 @@ impl AntflyThreadStore {
         })
     }
 
+    async fn load_full_history_impl(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreResult<StoredThreadHistory> {
+        self.require_record(params.thread_id, params.include_archived)
+            .await?;
+        // Raw items are stored for both history modes.
+        Ok(StoredThreadHistory {
+            revision: None,
+            thread_id: params.thread_id,
+            items: self.load_items(params.thread_id).await?,
+        })
+    }
+
     async fn load_latest_model_context_impl(
         &self,
         params: LoadThreadHistoryParams,
@@ -966,6 +980,13 @@ impl ThreadStore for AntflyThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(self.load_history_impl(params))
+    }
+
+    fn load_full_history(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
+        Box::pin(self.load_full_history_impl(params))
     }
 
     fn load_latest_model_context(

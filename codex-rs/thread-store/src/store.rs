@@ -206,6 +206,18 @@ pub trait ThreadStore: Any + Send + Sync {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
 
+    /// Loads every persisted rollout item of a thread in either history mode,
+    /// for consumers that read whole transcripts (memory extraction).
+    ///
+    /// Stores whose Paginated threads keep a rollout file can retain this
+    /// default, which only serves Legacy threads.
+    fn load_full_history(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
+        self.load_history(params)
+    }
+
     /// Loads the persisted rollout items needed to reconstruct the latest model-visible context.
     ///
     /// Implementations that cannot perform a targeted read may return the full persisted history.

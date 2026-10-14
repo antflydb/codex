@@ -135,6 +135,15 @@ fn build_session_telemetry(
 }
 
 impl MemoryStartupContext {
+    /// History of `thread_id` from the configured thread store, for threads
+    /// whose store keeps no rollout file (Antfly, in-memory).
+    pub(crate) async fn load_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<codex_rollout::RolloutItem>> {
+        Ok(self.thread_manager.load_thread_history(thread_id).await?)
+    }
+
     pub(crate) fn new(
         thread_manager: Arc<ThreadManager>,
         auth_manager: Arc<AuthManager>,

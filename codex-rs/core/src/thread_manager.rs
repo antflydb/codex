@@ -562,6 +562,13 @@ pub fn local_agent_graph_store_from_state_db(
 }
 
 impl ThreadManager {
+    /// Persisted history of `thread_id` from the configured thread store, in
+    /// replay order. Unlike reading a rollout file, this works for stores
+    /// that keep no files (Antfly, in-memory). Archived threads included.
+    pub async fn load_thread_history(&self, thread_id: ThreadId) -> CodexResult<Vec<RolloutItem>> {
+        self.state.load_thread_history(thread_id).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,
@@ -1775,6 +1782,27 @@ impl ThreadManagerState {
                     }
                 }
                 err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
+            })
+    }
+
+    pub(crate) async fn load_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        self.thread_store
+            .load_full_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .map(|history| history.items)
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                err => CodexErr::Fatal(format!(
+                    "failed to load history for thread {thread_id}: {err}"
+                )),
             })
     }
 
