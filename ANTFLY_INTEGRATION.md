@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `d1182ab89d` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `b77cb634d5` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `d1182ab89d` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `b77cb634d5` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -405,8 +405,10 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `d1182ab89d`, which includes
-antflydb/antfly#1096 (fixes for #1089 and #1084).
+against Antfly 1258e8cfcb; the pin is now `b77cb634d5`, which includes
+antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
+resolution, durable merges) and #1114 (resolver ownership, shadow index
+replacement).
 
 ### Goal
 
@@ -439,7 +441,16 @@ Each knowledge table carries two graph indexes:
 | `codex_claim_links` | `supersedes` (claim → claim) | the claim's `supersedes` field (`edge_types[].field`) |
 
 The concept index name hashes the extraction model and label schema, so
-changing either rebuilds it; the embedded backend drops the stale version. The
+changing either builds a new version. On embedded databases the new version
+replaces the old one atomically (`add_index` with `replaces` and a 250 ms
+`wait`): the old index keeps serving, and `Backend::serving_graph` routes
+queries to it, until the replacement swaps in. A wait that times out leaves the
+build to background maintenance and the next open re-sends the identical
+request. A failed build is cancelled and retried on the next open; a
+`REPLACEMENT_CONFIGURATION_MISMATCH` cancels the stale pending build and
+retries once. The `concepts` resolver keeps its name across versions, so its
+merges and fences carry over. Remote backends create the new version and leave
+stale ones in place. The
 split is required: Antfly rejects a field-derived edge type on an index that
 also has an artifact source. It also means a concept rebuild never loses
 supersession history.
@@ -473,9 +484,12 @@ test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly supersedes
 
 `Knowledge::related(query, limit, include_superseded)`:
 
-1. **Seeds.** Run GLiNER on the query (single-window profile, truncated to 600
-   bytes) and map entities to concept keys. Add the concepts of the query's
-   direct hybrid-search hits among claims.
+1. **Seeds.** Resolve the query with Antfly's query-time resolution
+   (`resolve_query_json` on the claims table's `concepts` resolver). It runs
+   the graph's own extractor and resolver, aliases and merges included,
+   without writing, so seed keys match write-time keys exactly. Backends
+   without it (remote) fall back to local GLiNER extraction plus `concept_key`.
+   Add the concepts of the query's direct hybrid-search hits among claims.
 2. **Expand.** Traverse `about` edges inward from the seeds, in both the claims
    and memory-notes tables. `deduplicate_nodes: false` returns one path per
    (concept, document), so each result's shared concepts come from the same
@@ -598,10 +612,9 @@ approval prompt (up to 3,000 characters) does not.
 - **Turn attribution.** Inject turn markers into stage-1 input and have claims
   cite them.
 - **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
-- **Unicode concept keys (`uslug`).** Query-time seeds must produce exactly the
-  resolver's keys; reimplementing Unicode 16 NFKC and case folding in Rust risks
-  silent misses. Waiting on query-time key resolution from Antfly
-  (antflydb/antfly#1109) and the combining-mark fix.
+- **Unicode concept keys (`uslug`).** Query seeds now come from Antfly's own
+  resolver, so switching the key template to `uslug` is safe; it changes every
+  key, so do it with a namespace migration (`set_resolver_namespace`).
 - **Aliases, promotion and an entity table.** These need concepts promoted into
   entity documents, which is worth doing together with ANN synonym merging
   (antflydb/antfly#1109).

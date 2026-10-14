@@ -300,6 +300,18 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
                 ],
             )
             .await?;
+        // Supersession compares against claims that are already searchable;
+        // indexing is asynchronous, so wait for thread A's decision to land.
+        for _ in 0..100 {
+            let hits = antfly
+                .documents(schema::KNOWLEDGE)
+                .search_text("Qwen3 Embedding embedder", None, 5, 0)
+                .await?;
+            if hits.iter().any(|hit| hit.key == "v2:thread-a:0000") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let later = knowledge
             .record_thread_claims(
                 &source("thread-b", 2),
@@ -335,6 +347,29 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
         assert_eq!(
             related.notes.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(),
             vec!["notes/embedder.md"]
+        );
+        // Query seeds come from Antfly's own resolver, not local slugging.
+        let resolved = antfly
+            .documents(schema::KNOWLEDGE)
+            .resolve_query(
+                codex_antfly::knowledge::CONCEPT_RESOLVER,
+                json!({"text": "Which embedder does Codex semantic search use?"}),
+            )
+            .await?
+            .ok_or("embedded backend resolves queries")?;
+        let keys: Vec<&str> = resolved["resolution"]["entities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entity| entity["doc_ref"]["key"].as_str())
+            .collect();
+        assert!(
+            !keys.is_empty() && keys.iter().all(|key| key.starts_with("concept/")),
+            "{resolved:#}"
+        );
+        assert!(
+            related.seeds.iter().any(|seed| keys.contains(&seed.as_str())),
+            "{related:#?} vs {keys:?}"
         );
         // Ranking runs on seeded PageRank in both directions: mass seeded
         // at the claim's concepts must flow back to the claim itself.
@@ -376,6 +411,86 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
         assert_eq!(earlier.claim.status, codex_antfly::knowledge::ClaimStatus::Superseded);
         assert_eq!(earlier.claim.superseded_by.as_deref(), Some("v2:thread-b:0000"));
         antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn graph_upgrades_replace_the_old_version_without_a_gap() -> Result<(), Box<dyn std::error::Error>>
+{
+    use codex_antfly::Backend;
+    use codex_antfly::EmbeddedBackend;
+    use codex_antfly::GraphIndex;
+    use codex_antfly::TableSpec;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("codex.aflite");
+    let spec = |name: &str| TableSpec {
+        name: "graphs".to_string(),
+        schema: json!({
+            "default_type": "doc",
+            "document_schemas": {"doc": {"schema": {"type": "object", "additionalProperties": true}}},
+        }),
+        dense: None,
+        graphs: vec![GraphIndex {
+            name: name.to_string(),
+            config: json!({"edge_types": [{"name": "links", "field": "links"}]}),
+            replaces_prefix: "links_graph_",
+        }],
+    };
+    let traverse = |index: &str| {
+        json!({
+            "graph_queries": {"q": {"index": index, "traverse": {
+                "start": {"keys": ["a"]}, "direction": "out", "edge_types": ["links"],
+                "max_depth": 1, "limit": 10}}},
+            "limit": 1,
+        })
+    };
+    runtime().block_on(async {
+        let backend = EmbeddedBackend::open(&path, None)?;
+        backend.ensure_table(spec("links_graph_v1")).await?;
+        backend
+            .write(
+                "graphs".to_string(),
+                vec![
+                    Write::put("a", json!({"links": ["b"]})),
+                    Write::put("b", json!({})),
+                ],
+            )
+            .await?;
+        backend.close().await?;
+
+        // A new version on reopen replaces v1; v1 serves until the swap.
+        let backend = EmbeddedBackend::open(&path, None)?;
+        backend.ensure_table(spec("links_graph_v2")).await?;
+        let mut serving = String::new();
+        for _ in 0..200 {
+            serving = backend
+                .serving_graph("graphs".to_string(), "links_graph_v2".to_string())
+                .await?;
+            assert!(
+                serving == "links_graph_v1" || serving == "links_graph_v2",
+                "{serving}"
+            );
+            let hits = backend
+                .query("graphs".to_string(), traverse(&serving))
+                .await?;
+            assert!(hits.to_string().contains("\"b\""), "{serving}: {hits}");
+            if serving == "links_graph_v2" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(serving, "links_graph_v2");
+        // Reopening with the same version is a no-op and v1 is gone.
+        backend.close().await?;
+        let backend = EmbeddedBackend::open(&path, None)?;
+        backend.ensure_table(spec("links_graph_v2")).await?;
+        let old = backend
+            .query("graphs".to_string(), traverse("links_graph_v1"))
+            .await;
+        assert!(old.is_err() || !old?.to_string().contains("\"b\""));
+        backend.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
     Ok(())

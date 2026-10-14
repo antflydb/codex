@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -93,6 +94,115 @@ pub struct EmbeddedBackend {
     db: Option<Arc<Database>>,
     executor: Executor,
     known_indexes: Mutex<HashSet<String>>,
+    /// `table:desired graph name` → the graph index actually serving it.
+    /// Differs while a replacement of an older version is still building.
+    serving: Mutex<HashMap<String, String>>,
+}
+
+/// How long opening waits for a graph replacement before letting it finish
+/// in the background (the old index keeps serving meanwhile).
+const REPLACE_WAIT_MS: u64 = 250;
+/// Bounded retries for schema calls that return `ANTFLY_BUSY` while replay or
+/// promotion is mid-batch.
+const SCHEMA_BUSY_RETRIES: u32 = 20;
+
+fn is_kind(err: &antfly_embedded::Error, kind: antfly_embedded::Error) -> bool {
+    err.kind() == kind
+}
+
+/// Runs a schema call, retrying `ANTFLY_BUSY` with a short backoff.
+fn retry_busy<T>(
+    mut call: impl FnMut() -> antfly_embedded::Result<T>,
+) -> antfly_embedded::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match call() {
+            Err(err)
+                if is_kind(&err, antfly_embedded::Error::Busy) && attempt < SCHEMA_BUSY_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    5 * u64::from(attempt.min(20)),
+                ));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Outcome of reconciling one graph index.
+enum GraphState {
+    /// The desired index serves.
+    Ready,
+    /// `old` keeps serving while the replacement builds in the background.
+    Replacing { old: String },
+}
+
+/// Adds `name` (replacing `stale` when given) and reports which index serves.
+fn reconcile_graph(
+    db: &Database,
+    name: &str,
+    stale: Option<&str>,
+    config: &Value,
+) -> AntflyResult<GraphState> {
+    let Some(old) = stale else {
+        let envelope = serde_json::to_vec(&json!({
+            "name": name, "kind": "graph", "config_json": config.to_string(),
+        }))?;
+        retry_busy(|| db.add_index_json(&envelope)).map_err(embedded("add graph index"))?;
+        return Ok(GraphState::Ready);
+    };
+    // Atomic replacement: the old index serves until the new one is built
+    // and swapped in; on timeout the build continues in background
+    // maintenance and the next open re-sends the identical request.
+    let envelope = serde_json::to_vec(&json!({
+        "name": name, "kind": "graph", "config_json": config.to_string(),
+        "replaces": old, "wait": {"timeout_ms": REPLACE_WAIT_MS},
+    }))?;
+    let pending = || GraphState::Replacing {
+        old: old.to_string(),
+    };
+    for attempt in 0..2 {
+        match db.add_index_json(&envelope) {
+            Ok(()) => return Ok(GraphState::Ready),
+            Err(err) if is_kind(&err, antfly_embedded::Error::Busy) => return Ok(pending()),
+            Err(err)
+                if is_kind(&err, antfly_embedded::Error::Cancelled)
+                    || is_kind(&err, antfly_embedded::Error::ReplacementPending) =>
+            {
+                // Completion can race an interrupted wait; trust the catalog.
+                let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
+                return Ok(if indexes.contains(name) {
+                    GraphState::Ready
+                } else {
+                    pending()
+                });
+            }
+            Err(err)
+                if attempt == 0
+                    && is_kind(
+                        &err,
+                        antfly_embedded::Error::ReplacementConfigurationMismatch,
+                    ) =>
+            {
+                // An earlier build of a different config holds the name.
+                tracing::info!("antfly: replacing stale pending graph build {name}: {err}");
+                db.cancel_replacement(name)
+                    .map_err(embedded("cancel stale replacement"))?;
+                let _ = db.run_until_idle();
+            }
+            Err(err) if is_kind(&err, antfly_embedded::Error::ReplacementFailed) => {
+                // Keep serving the old index; clear the failed build so the
+                // next open starts a fresh one.
+                tracing::warn!("antfly: graph replacement {old} -> {name} failed: {err}");
+                db.cancel_replacement(name)
+                    .map_err(embedded("cancel failed replacement"))?;
+                return Ok(pending());
+            }
+            Err(err) => return Err(embedded("replace graph index")(err)),
+        }
+    }
+    Ok(pending())
 }
 
 impl EmbeddedBackend {
@@ -136,6 +246,7 @@ impl EmbeddedBackend {
             db: Some(Arc::new(db)),
             executor,
             known_indexes: Mutex::new(HashSet::new()),
+            serving: Mutex::new(HashMap::new()),
         })
     }
 
@@ -247,33 +358,53 @@ impl EmbeddedBackend {
         {
             return Ok(());
         }
-        let envelope = serde_json::to_vec(&json!({
-            "name": graph.name,
-            "kind": "graph",
-            "config_json": graph.config.to_string(),
-        }))?;
         let name = graph.name.clone();
         let prefix = graph.replaces_prefix;
-        self.call_in(table.to_string(), move |db| {
-            let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
-            if !prefix.is_empty() {
-                for stale in indexes
-                    .iter()
-                    .filter(|index| index.starts_with(prefix) && **index != name)
-                {
-                    db.delete_index(stale)
-                        .map_err(embedded("delete stale graph index"))?;
+        let config = graph.config;
+        let state = self
+            .call_in(table.to_string(), move |db| {
+                let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
+                let mut stale: Vec<&String> = if prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    indexes
+                        .iter()
+                        .filter(|index| index.starts_with(prefix) && **index != name)
+                        .collect()
+                };
+                stale.sort();
+                if indexes.contains(&name) {
+                    // Swapped (or added) already; older leftovers retire.
+                    for old in stale {
+                        retry_busy(|| db.delete_index(old))
+                            .map_err(embedded("delete stale graph index"))?;
+                    }
+                    return Ok(GraphState::Ready);
+                }
+                // Replace the newest older version; any others are dropped
+                // once the replacement has swapped in.
+                reconcile_graph(db, &name, stale.last().map(|old| old.as_str()), &config)
+            })
+            .await?;
+        let serving_key = format!("{table}:{}", graph.name);
+        match state {
+            GraphState::Ready => {
+                if let Ok(mut serving) = self.serving.lock() {
+                    serving.insert(serving_key, graph.name.clone());
+                }
+                if let Ok(mut known) = self.known_indexes.lock() {
+                    known.insert(marker);
                 }
             }
-            if !indexes.contains(&name) {
-                db.add_index_json(&envelope)
-                    .map_err(embedded("add graph index"))?;
+            GraphState::Replacing { old } => {
+                tracing::info!(
+                    "antfly: graph index {} on {table} is building; {old} serves until it swaps in",
+                    graph.name
+                );
+                if let Ok(mut serving) = self.serving.lock() {
+                    serving.insert(serving_key, old);
+                }
             }
-            Ok(())
-        })
-        .await?;
-        if let Ok(mut known) = self.known_indexes.lock() {
-            known.insert(marker);
         }
         Ok(())
     }
@@ -470,6 +601,55 @@ impl Backend for EmbeddedBackend {
                 known.insert(marker);
             }
             Ok(())
+        })
+    }
+
+    fn serving_graph(&self, table: String, name: String) -> BackendFuture<'_, String> {
+        Box::pin(async move {
+            let key = format!("{table}:{name}");
+            let current = self
+                .serving
+                .lock()
+                .ok()
+                .and_then(|serving| serving.get(&key).cloned());
+            let Some(old) = current.filter(|serving| *serving != name) else {
+                return Ok(name);
+            };
+            // A background replacement may have swapped in since open.
+            let wanted = name.clone();
+            let swapped = self
+                .call_in(table, move |db| {
+                    Ok(names(&db.indexes_json().map_err(embedded("list indexes"))?)
+                        .contains(&wanted))
+                })
+                .await?;
+            if !swapped {
+                return Ok(old);
+            }
+            if let Ok(mut serving) = self.serving.lock() {
+                serving.insert(key, name.clone());
+            }
+            Ok(name)
+        })
+    }
+
+    fn resolve_query(
+        &self,
+        table: String,
+        resolver: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call_in(table, move |db| {
+                    // Busy means a concurrent config change; the whole query
+                    // is retried, as Antfly's contract asks.
+                    retry_busy(|| db.resolve_query_json(&resolver, &bytes))
+                        .map_err(embedded("resolve query"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
         })
     }
 

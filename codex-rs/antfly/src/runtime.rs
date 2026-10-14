@@ -345,6 +345,28 @@ impl Documents<'_> {
             .await
     }
 
+    /// The graph index currently serving `name` (see
+    /// [`crate::Backend::serving_graph`]).
+    pub async fn serving_graph(&self, name: &str) -> AntflyResult<String> {
+        self.backend()
+            .await?
+            .serving_graph(self.table.to_string(), name.to_string())
+            .await
+    }
+
+    /// Query-time extraction and resolution through `resolver` (see
+    /// [`crate::Backend::resolve_query`]).
+    pub async fn resolve_query(
+        &self,
+        resolver: &str,
+        request: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.backend()
+            .await?
+            .resolve_query(self.table.to_string(), resolver.to_string(), request)
+            .await
+    }
+
     /// Full-text matches followed by semantic neighbors not already matched,
     /// optionally restricted by an Antfly filter query. Semantic failures
     /// degrade to full text only.

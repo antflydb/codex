@@ -87,6 +87,24 @@ pub trait Backend: Send + Sync {
     /// Creates the table, its indexes, and its enrichments when missing.
     fn ensure_table(&self, spec: TableSpec) -> BackendFuture<'_, ()>;
 
+    /// The graph index serving `name` in `table`: `name` itself, or the
+    /// older version it is replacing until the replacement swaps in.
+    fn serving_graph(&self, _table: String, name: String) -> BackendFuture<'_, String> {
+        Box::pin(async move { Ok(name) })
+    }
+
+    /// Runs `resolver`'s configured extraction and resolution on ad-hoc
+    /// query text without writing anything. `None` when the backend has no
+    /// query resolution; callers fall back to their own extraction.
+    fn resolve_query(
+        &self,
+        _table: String,
+        _resolver: String,
+        _request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// The in-process database handle, when there is one. Relational SQL
     /// shares it so its connections never contend with this backend for the
     /// file's writer lease.

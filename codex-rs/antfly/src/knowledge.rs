@@ -39,6 +39,11 @@ pub const CONCEPT_GRAPH_PREFIX: &str = "codex_concepts";
 pub const CLAIM_LINKS_INDEX: &str = "codex_claim_links";
 pub const ABOUT_EDGE: &str = "about";
 pub const SUPERSEDES_EDGE: &str = "supersedes";
+/// Name of the concept resolver declared inline by every concept graph.
+pub const CONCEPT_RESOLVER: &str = "concepts";
+/// Query text sent to query-time resolution; the configured extractor
+/// windows long input, so this only bounds the request.
+const QUERY_RESOLVE_MAX_BYTES: usize = 8 * 1024;
 /// Key prefix of concept nodes minted by the resolver.
 pub const CONCEPT_PREFIX: &str = "concept/";
 
@@ -139,7 +144,7 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
         // concepts back to the documents about them.
         "metrics": {PPR_METRIC: {"kind": "pagerank"}},
         "resolvers": [{
-            "name": "concepts",
+            "name": CONCEPT_RESOLVER,
             "table": schema::CONCEPTS,
             "source_artifact": artifact,
             "resolution_artifact": format!("{name}_resolution"),
@@ -351,6 +356,24 @@ fn claim_prefix(version: &str, thread_id: &str) -> String {
     )
 }
 
+/// Canonical keys from a `resolve_query` response, in mention order.
+fn resolved_keys(response: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for entity in response
+        .pointer("/resolution/entities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(key) = entity.pointer("/doc_ref/key").and_then(Value::as_str)
+            && !keys.iter().any(|seen: &String| seen == key)
+        {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
 /// One node of a traversal, with the start node of its path.
 struct Reached {
     key: String,
@@ -395,8 +418,17 @@ pub struct Knowledge<'a> {
 }
 
 impl Knowledge<'_> {
-    fn graph_name(&self) -> String {
-        concept_graph_name(&self.config.extract_model)
+    /// The concept graph serving `table`: the configured version, or the
+    /// older one it is replacing until the replacement swaps in.
+    async fn graph_for(&self, table: &'static str) -> String {
+        let wanted = concept_graph_name(&self.config.extract_model);
+        match self.antfly.documents(table).serving_graph(&wanted).await {
+            Ok(name) => name,
+            Err(err) => {
+                tracing::warn!("antfly: serving graph lookup failed: {err}");
+                wanted
+            }
+        }
     }
 
     /// Replaces `source`'s claims with `claims`. Each new claim is checked
@@ -577,9 +609,31 @@ impl Knowledge<'_> {
         Ok(probability * 10_000.0 >= f64::from(self.config.supersede_threshold_bp))
     }
 
-    /// Concept keys GLiNER finds in `text` (truncated to the single-window
-    /// profile). Empty when extraction is unavailable.
+    /// Canonical concept keys for the mentions in `text`. Antfly's
+    /// query-time resolution runs the concept graph's own extractor and
+    /// resolver (aliases, merges), so keys match write time exactly; backends
+    /// without it fall back to local GLiNER extraction plus `concept_key`.
     pub async fn extract_concepts(&self, text: &str) -> Vec<String> {
+        let request = json!({"text": truncate_bytes(text, QUERY_RESOLVE_MAX_BYTES)});
+        match self
+            .antfly
+            .documents(schema::KNOWLEDGE)
+            .resolve_query(CONCEPT_RESOLVER, request)
+            .await
+        {
+            Ok(Some(response)) => return resolved_keys(&response),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!("antfly: query resolution failed, extracting locally: {err}")
+            }
+        }
+        self.extract_concepts_locally(text).await
+    }
+
+    /// Local GLiNER extraction (truncated to the single-window profile) with
+    /// keys slugged like the resolver's `key_template`. Empty when extraction
+    /// is unavailable.
+    async fn extract_concepts_locally(&self, text: &str) -> Vec<String> {
         let request = json!({
             "model": self.config.extract_model,
             "schema": {"entities": CONCEPT_ENTITIES},
@@ -632,8 +686,9 @@ impl Knowledge<'_> {
         if keys.is_empty() {
             return out;
         }
+        let index = self.graph_for(table).await;
         let request = json!({
-            "graph_queries": {"about": {"index": self.graph_name(), "traverse": {
+            "graph_queries": {"about": {"index": index, "traverse": {
                 "start": {"keys": keys},
                 "direction": "out", "edge_types": [ABOUT_EDGE], "max_depth": 1,
                 "include_paths": true, "limit": 1000,
@@ -663,8 +718,9 @@ impl Knowledge<'_> {
         if concepts.is_empty() {
             return Vec::new();
         }
+        let index = self.graph_for(table).await;
         let request = json!({
-            "graph_queries": {"docs": {"index": self.graph_name(), "traverse": {
+            "graph_queries": {"docs": {"index": index, "traverse": {
                 "start": {"keys": concepts},
                 "direction": "in", "edge_types": [ABOUT_EDGE], "max_depth": 1,
                 "include_documents": true, "include_paths": true,
@@ -704,9 +760,10 @@ impl Knowledge<'_> {
         if seeds.is_empty() {
             return HashMap::new();
         }
+        let index = self.graph_for(table).await;
         let request = json!({
             "graph_metric": {
-                "index": self.graph_name(),
+                "index": index,
                 "metric": PPR_METRIC,
                 "metric_freshness": "fresh",
                 "seed_nodes": &seeds[..seeds.len().min(MAX_PPR_SEEDS)],
@@ -879,6 +936,21 @@ mod tests {
             Some("concept/rock_n_roll")
         );
         assert_eq!(concept_key("—"), None);
+    }
+
+    #[test]
+    fn resolved_keys_follow_canonical_doc_refs() {
+        let response = json!({"resolution": {"entities": [
+            {"local_id": "0", "doc_ref": {"table": "codex_concepts", "key": "concept/qwen3_embedding"}, "decision": "match"},
+            {"local_id": "1", "doc_ref": {"table": "codex_concepts", "key": "concept/antfly"}, "decision": "new"},
+            {"local_id": "2", "doc_ref": {"table": "codex_concepts", "key": "concept/antfly"}, "decision": "new"},
+            {"local_id": "3"},
+        ]}});
+        assert_eq!(
+            resolved_keys(&response),
+            vec!["concept/qwen3_embedding", "concept/antfly"]
+        );
+        assert!(resolved_keys(&json!({})).is_empty());
     }
 
     #[test]
