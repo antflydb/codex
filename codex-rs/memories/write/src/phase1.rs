@@ -10,7 +10,6 @@ use crate::runtime::MemoryStartupContext;
 use crate::runtime::StageOneRequestContext;
 use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
-use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_protocol::MemoryVersion;
 use codex_protocol::ResponseItemId;
@@ -280,9 +279,11 @@ mod job {
         // Local stores keep a rollout file; stores without files (Antfly,
         // in-memory) serve the same history from the thread store.
         let rollout_items = if tokio::fs::try_exists(rollout_path).await.unwrap_or(false) {
-            RolloutRecorder::load_rollout_items(rollout_path).await?.0
+            crate::rollout_input::read_recent_rollout_items(rollout_path).await?
         } else {
-            context.load_thread_history(thread_id).await?
+            crate::rollout_input::select_recent_rollout_items(
+                context.load_thread_history(thread_id).await?,
+            )?
         };
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,

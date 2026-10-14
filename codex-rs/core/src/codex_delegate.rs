@@ -124,7 +124,6 @@ pub(crate) async fn run_codex_thread_interactive(
         history_initialization,
         disabled_plugin_ids: (isolation == codex_extension_api::SessionIsolation::Inherit)
             .then(|| parent_ctx.disabled_plugin_ids.clone()),
-        persisted_permission_profile: None,
         requested_history_mode: None,
         fork_persistence: ForkPersistence::Copied,
         session_source,

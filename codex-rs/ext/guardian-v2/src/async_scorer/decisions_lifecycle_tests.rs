@@ -17,7 +17,7 @@ async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -
     ] {
         let server = responses::start_mock_server().await;
         let fixture = GuardianFailureFixture::with_config(&format!(
-            "[features]\nguardianv2_decisions_comparison = {enabled}\n"
+            "[features]\nguardianv2_decisions_comparison = {enabled}\n[features.guardianv2]\nasync_classifier_mode = \"snapshot\"\n"
         ))
         .await?;
         let test = &fixture.test;
@@ -181,7 +181,11 @@ async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -
 #[tokio::test]
 async fn guardian_budget_rejects_both_backends_before_sending() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    let fixture = GuardianFailureFixture::new().await?;
+    // This test replaces the snapshot sampler to force the Responses budget failure.
+    let fixture = GuardianFailureFixture::with_config(
+        "[features.guardianv2]\nenabled = true\nasync_classifier_mode = \"snapshot\"\n",
+    )
+    .await?;
     let server = responses::start_mock_server().await;
     let store = fixture.test.codex.thread_extension_data();
     let mut config = fixture.test.config.clone();

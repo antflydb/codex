@@ -62,15 +62,19 @@ impl ReviewAuthorization {
             authorization_changed || self.user_message_revision != history.user_message_revision();
         let review_context_changed = root_review_changed
             || self.review_context_revision != history.guardian_review_context_revision();
-        // An actual stop or history reset wins over a concurrent authorization change.
+        // An actual stop or history reset wins over a concurrent evidence change.
         if self.history_reset.is_cancelled()
             || cancellation.is_some_and(CancellationToken::is_cancelled)
             || root_history_changed
-            || review_context_changed
         {
             Some(GuardianReviewSessionOutcome::Aborted)
-        } else if authorization_changed {
-            tracing::info!(thread_id = %session.thread_id, "Guardian approval invalidated by an authorization change");
+        } else if authorization_changed || review_context_changed {
+            tracing::info!(
+                thread_id = %session.thread_id,
+                authorization_changed,
+                review_context_changed,
+                "Guardian approval invalidated by changed review evidence"
+            );
             Some(GuardianReviewSessionOutcome::StaleAuthorization)
         } else {
             None

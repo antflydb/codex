@@ -1,5 +1,114 @@
 use super::*;
 use pretty_assertions::assert_eq;
+use std::io::Write;
+
+#[tokio::test]
+async fn recent_rollout_items_bound_history_and_preserve_newest_records() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join("rollout.jsonl");
+    let mut file = std::fs::File::create(&path)?;
+    let metadata = serde_json::json!({
+        "timestamp": "2026-10-12T00:00:00Z",
+        "type": "session_meta",
+        "payload": codex_rollout::SessionMeta::default()
+    });
+    writeln!(file, "{metadata}")?;
+    let old = serde_json::json!({
+        "timestamp": "2026-10-12T00:00:00Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "older evidence".repeat(/*n*/ 20_000)}
+        ]}
+    });
+    let old = serde_json::to_string(&old)?;
+    for _ in 0..(MAX_ROLLOUT_BYTES / old.len() + 2) {
+        writeln!(file, "{old}")?;
+    }
+    let mut newest = Vec::new();
+    for text in ["recent question", "latest correction 🦀"] {
+        // Neither an oversized nor a malformed record may hide the newest valid evidence.
+        writeln!(file, "{}", "x".repeat(MAX_RECORD_BYTES + 1))?;
+        file.write_all(b"\xff\n")?;
+        let line = serde_json::json!({
+            "timestamp": "2026-10-12T00:00:00Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": text}
+            ]}
+        });
+        writeln!(file, "{line}")?;
+        newest.push(codex_rollout::decode_rollout_line(line)?.item);
+    }
+    drop(file);
+
+    let items = read_recent_rollout_items(&path).await?;
+    assert_eq!(
+        serde_json::to_value(&items[items.len() - newest.len()..])?,
+        serde_json::to_value(&newest)?
+    );
+    let retained_bytes = items.iter().try_fold(/*init*/ 0, |bytes, item| {
+        serde_json::to_vec(item).map(|json| bytes + json.len())
+    })?;
+    assert!(retained_bytes <= MAX_ROLLOUT_BYTES);
+    let older_item_bytes =
+        serde_json::to_vec(&codex_rollout::parse_rollout_line(&old)?.item)?.len();
+    assert!(retained_bytes + older_item_bytes > MAX_ROLLOUT_BYTES);
+
+    let mut metadata = metadata;
+    metadata["payload"]["history_mode"] = serde_json::json!("future");
+    std::fs::write(&path, format!("{metadata}\n{old}\n"))?;
+    assert!(read_recent_rollout_items(&path).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_memory_history_selects_the_same_items_as_the_rollout_reader() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join("rollout.jsonl");
+    let mut lines = vec![serde_json::json!({
+        "timestamp": "2026-10-12T00:00:00Z",
+        "type": "session_meta",
+        "payload": codex_rollout::SessionMeta::default()
+    })];
+    let old = serde_json::json!({
+        "timestamp": "2026-10-12T00:00:00Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "older evidence".repeat(/*n*/ 20_000)}
+        ]}
+    });
+    let copies = MAX_ROLLOUT_BYTES / serde_json::to_string(&old)?.len() + 2;
+    lines.extend(std::iter::repeat_n(old, copies));
+    for text in ["recent question", "latest correction 🦀"] {
+        lines.push(serde_json::json!({
+            "timestamp": "2026-10-12T00:00:00Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "developer instructions are not evidence"}
+            ]}
+        }));
+        lines.push(serde_json::json!({
+            "timestamp": "2026-10-12T00:00:00Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": text}
+            ]}
+        }));
+    }
+    let mut file = std::fs::File::create(&path)?;
+    let mut history = Vec::new();
+    for line in &lines {
+        writeln!(file, "{line}")?;
+        history.push(codex_rollout::decode_rollout_line(line.clone())?.item);
+    }
+    drop(file);
+
+    assert_eq!(
+        serde_json::to_value(select_recent_rollout_items(history)?)?,
+        serde_json::to_value(read_recent_rollout_items(&path).await?)?
+    );
+    Ok(())
+}
 
 #[test]
 fn extraction_chunks_preserve_unicode_evidence_with_bounded_messages() {

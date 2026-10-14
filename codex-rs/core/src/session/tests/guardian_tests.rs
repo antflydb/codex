@@ -1305,7 +1305,6 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         conversation_history: InitialHistory::New,
         history_initialization: HistoryInitialization::New,
         disabled_plugin_ids: None,
-        persisted_permission_profile: None,
         requested_history_mode: None,
         fork_persistence: ForkPersistence::Copied,
         session_source: SessionSource::SubAgent(SubAgentSource::Other(

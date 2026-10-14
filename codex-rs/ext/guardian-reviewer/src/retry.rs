@@ -1,5 +1,6 @@
 //! Applies one review's attempt budget, deadline and cancellation to host-owned sessions.
 //! Resubmissions are independent; this layer keeps no state between approval requests.
+//! Changed local evidence retries cooperatively without service backoff, under the same limits.
 
 use crate::GuardianReviewError;
 use crate::GuardianReviewOutcome;
@@ -80,6 +81,21 @@ async fn wait_before_guardian_retry(
     deadline: Instant,
     external_cancel: Option<&CancellationToken>,
 ) -> Option<GuardianReviewError> {
+    if matches!(
+        outcome,
+        GuardianReviewOutcome::Error(GuardianReviewError::StaleAuthorization)
+    ) {
+        // This is a local evidence refresh, not a failed service request. Yield so
+        // cancellation and queued context updates can run before capturing it again.
+        tokio::task::yield_now().await;
+        return if external_cancel.is_some_and(CancellationToken::is_cancelled) {
+            Some(GuardianReviewError::Cancelled)
+        } else if Instant::now() >= deadline {
+            Some(GuardianReviewError::Timeout)
+        } else {
+            None
+        };
+    }
     let exponential_delay = 200.0 * 2.0_f64.powi(attempt_count.saturating_sub(1) as i32);
     let jitter = rand::rng().random_range(0.9..1.1);
     let retry_delay = Duration::from_millis((exponential_delay * jitter) as u64);
