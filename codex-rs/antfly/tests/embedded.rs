@@ -654,3 +654,53 @@ fn turn_claims_replace_retract_and_track_progress() -> Result<(), Box<dyn std::e
     })?;
     Ok(())
 }
+
+#[test]
+fn supersession_collapses_restatements_but_keeps_distinct_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !has_models("convaiinnovations") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let cases = [
+            (
+                "The Codex Antfly importer writes 1,024 history items per import batch.",
+                "The Codex Antfly importer writes 1,024 history items per batch now that Antfly lifted its 2 MiB transaction limit.",
+                true,
+            ),
+            (
+                "Use Qwen3 Embedding as the embedder for Codex semantic search in Antfly.",
+                "Use EmbeddingGemma 2 instead of Qwen3 Embedding as the Codex semantic search embedder.",
+                true,
+            ),
+            (
+                "Creating hello.txt failed because the elevated-permission request was declined.",
+                "The requested elevated permission to create hello.txt was declined, so hello.txt was not created.",
+                true,
+            ),
+            (
+                "The Codex Antfly importer writes 1,024 history items per import batch.",
+                "The Codex Antfly importer keeps threads of every age.",
+                false,
+            ),
+            (
+                "Pin Antfly by git revision rather than tracking a branch.",
+                "Use EmbeddingGemma 2 as the Codex semantic search embedder.",
+                false,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (earlier, later, expected) in cases {
+            if knowledge.supersedes(earlier, later).await? != expected {
+                wrong.push((earlier, later, expected));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

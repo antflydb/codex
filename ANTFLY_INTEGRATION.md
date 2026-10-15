@@ -373,7 +373,7 @@ Fixed in Codex during the run:
   #1135 imports 3.3× faster than its base. The resulting rows are identical
   and search works. Background enrichment now defers while writes continue
   and catches up afterwards: 11 s of index work remains when the import
-  exits.
+  exits. Bounding that lag under steady writes is antflydb/antfly#1139.
 
 Remaining gaps:
 
@@ -503,8 +503,8 @@ Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
 against Antfly 1258e8cfcb; the pin is now `2c8240e703`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
-resolution, durable merges) and #1114 (resolver ownership, shadow index
-replacement), and #1127 (NUL diagnostics, statement context in errors).
+resolution, durable merges), #1114 (resolver ownership, shadow index
+replacement) and #1127 (NUL diagnostics, statement context in errors).
 
 ### Goal
 
@@ -656,15 +656,34 @@ Supersession happens when a thread's claims settle, not when they are written.
 A provisional claim from a session still in progress never displaces
 established knowledge. Each current claim being settled is compared with up
 to three similar `current`, settled claims of the same kind from other threads
-(hybrid search). The decide model answers the predicate "the later statement
-replaces, reverses or updates the earlier statement about the same subject".
-At or above `supersede_threshold` (default 0.8), the new claim lists the
-earlier one in `supersedes`, and the earlier one becomes `superseded` with
-`superseded_by` set. Failures are logged and never fail settling. With Laya,
-the integration test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly
-supersedes "use Qwen3" after settling, and leaves an unrelated preference
-alone. Within a thread, the extractor's `replaces` and `retracts` take effect
-immediately.
+(hybrid search). A later claim replaces an earlier one when it restates it,
+or replaces, reverses or updates it:
+
+- Statements identical after normalizing case, spacing and a final period
+  are restatements; no model is asked.
+- Otherwise one decide call asks two questions, and either is enough at
+  `supersede_threshold` (default 0.8):
+  - the predicate "the later statement replaces, reverses or updates the
+    earlier statement about the same subject";
+  - a relation choice (`same`, `updates`, `different`, `unrelated`), where
+    `same` plus `updates` must reach the threshold and one of them must be
+    the most likely.
+
+Laya needs both questions. The predicate catches a changed choice, which the
+choice question reads as a different fact: "use EmbeddingGemma 2 instead of
+Qwen3" scores `different` 0.94 but predicate 0.88. The choice question catches
+restatements, which the predicate misses: a reworded "1,024 items per batch"
+scores predicate 0.08 but `same` + `updates` 0.81. A different fact about the
+same subject ("the importer keeps threads of every age") stays below both, at
+0.36 and 0.63. `supersession_collapses_restatements_but_keeps_distinct_facts`
+pins these cases.
+
+When a claim is replaced, the new claim lists the earlier one in
+`supersedes`, and the earlier one becomes `superseded` with `superseded_by`
+set. Failures are logged and never fail settling. The integration test's
+"use EmbeddingGemma 2 instead of Qwen3" claim supersedes "use Qwen3" after
+settling and leaves an unrelated preference alone. Within a thread, the
+extractor's `replaces` and `retracts` take effect immediately.
 
 **Ranking.** `knowledge.search` ranks provisional claims at half their score
 and returns them with `provisional: true` and their `turn_id`, so the model can
@@ -799,12 +818,6 @@ approval prompt (up to 3,000 characters) does not.
   writes (#1084). antflydb/antfly#1096 now generates mention embeddings,
   promotes entities in Lite and honours alias redirects, but using them needs
   an entity table and name-embedding index; see antflydb/antfly#1109.
-- **Cross-thread restatements.** Settling asks whether a later claim
-  "replaces, reverses or updates" an earlier one, and Laya does not reliably
-  say yes to a plain restatement. In the end-to-end run, identical "the
-  importer writes 1,024 items per batch" decisions from separate sessions all
-  stayed current, while near-identical hello.txt lessons were superseded. A
-  separate "same proposition" check at settle time would collapse duplicates.
 - **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
 - **Unicode concept keys (`uslug`).** Query seeds now come from Antfly's own
   resolver, so switching the key template to `uslug` is safe; it changes every

@@ -694,8 +694,18 @@ impl Knowledge<'_> {
             .collect())
     }
 
-    /// Asks the decide model whether `later` replaces `earlier`.
-    async fn supersedes(&self, earlier: &str, later: &str) -> AntflyResult<bool> {
+    /// Whether `later` should replace `earlier`: it restates the same fact,
+    /// or replaces, reverses or updates it. Identical statements (ignoring
+    /// case, spacing and a final period) need no model. Otherwise one decide
+    /// call asks two questions, and either is enough at the threshold: the
+    /// "replaces, reverses or updates" predicate (which catches a changed
+    /// choice that Laya otherwise reads as a different fact), and a relation
+    /// choice where "same" plus "updates" must win (which catches
+    /// restatements the predicate misses).
+    pub async fn supersedes(&self, earlier: &str, later: &str) -> AntflyResult<bool> {
+        if normalized(earlier) == normalized(later) {
+            return Ok(true);
+        }
         let request = json!({
             "model": self.antfly.config().decide_model,
             "input": format!(
@@ -704,24 +714,28 @@ impl Knowledge<'_> {
                 truncate_chars(later, DECIDE_STATEMENT_MAX_CHARS),
             ),
             "questions": [{
+                "name": "relation",
+                "type": "choice",
+                "instructions": "How does the later statement relate to the earlier statement?",
+                "choices": [
+                    {"value": "same", "description": "Asserts the same fact about the same subject, possibly in other words"},
+                    {"value": "updates", "description": "Replaces, reverses or updates the earlier statement about the same subject"},
+                    {"value": "different", "description": "Asserts a different fact about the same subject"},
+                    {"value": "unrelated", "description": "Is about a different subject"},
+                ],
+            }, {
                 "name": "supersedes",
                 "type": "predicate",
                 "instructions": "The later statement replaces, reverses or updates the earlier statement about the same subject.",
             }],
         });
         let response = self.antfly.decide(&request).await?;
-        let probability = response
-            .get("answers")
-            .and_then(Value::as_array)
-            .and_then(|answers| {
-                answers
-                    .iter()
-                    .find(|answer| answer.get("name").and_then(Value::as_str) == Some("supersedes"))
-            })
-            .and_then(|answer| answer.get("probability"))
-            .and_then(Value::as_f64)
-            .ok_or_else(|| crate::AntflyError::Malformed(format!("decide response: {response}")))?;
-        Ok(probability * 10_000.0 >= f64::from(self.config.supersede_threshold_bp))
+        let malformed = || crate::AntflyError::Malformed(format!("decide response: {response}"));
+        let probabilities = relation_probabilities(&response).ok_or_else(malformed)?;
+        let predicate = predicate_probability(&response, "supersedes").ok_or_else(malformed)?;
+        let threshold = self.config.supersede_threshold_bp;
+        Ok(predicate * 10_000.0 >= f64::from(threshold)
+            || replaces_earlier(&probabilities, threshold))
     }
 
     /// Canonical concept keys for the mentions in `text`. Antfly's
@@ -1022,6 +1036,56 @@ impl Knowledge<'_> {
     }
 }
 
+/// `text` lowercased with whitespace collapsed and a final period dropped.
+fn normalized(text: &str) -> String {
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    collapsed.trim_end_matches('.').to_string()
+}
+
+/// Choice probabilities of the decide response's `relation` answer.
+fn relation_probabilities(response: &Value) -> Option<HashMap<String, f64>> {
+    let answer = response
+        .get("answers")?
+        .as_array()?
+        .iter()
+        .find(|answer| answer.get("name").and_then(Value::as_str) == Some("relation"))?;
+    answer
+        .get("probabilities")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some((
+                entry.get("value")?.as_str()?.to_string(),
+                entry.get("probability")?.as_f64()?,
+            ))
+        })
+        .collect()
+}
+
+fn predicate_probability(response: &Value, name: &str) -> Option<f64> {
+    response
+        .get("answers")?
+        .as_array()?
+        .iter()
+        .find(|answer| answer.get("name").and_then(Value::as_str) == Some(name))?
+        .get("probability")?
+        .as_f64()
+}
+
+fn replaces_earlier(probabilities: &HashMap<String, f64>, threshold_bp: u32) -> bool {
+    let p = |value: &str| probabilities.get(value).copied().unwrap_or_default();
+    let top = probabilities
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(value, _)| value.as_str());
+    let replacing = p("same") + p("updates");
+    matches!(top, Some("same" | "updates")) && replacing * 10_000.0 >= f64::from(threshold_bp)
+}
+
 /// Personalized PageRank when it ran, else the count of shared concepts;
 /// direct search hits get a small boost either way.
 fn rank_score(ppr: &HashMap<String, f64>, key: &str, shared: usize, direct: f64) -> f64 {
@@ -1073,6 +1137,31 @@ mod tests {
             vec!["concept/qwen3_embedding", "concept/antfly"]
         );
         assert!(resolved_keys(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn restatements_and_updates_replace_earlier_claims() {
+        assert_eq!(
+            normalized("  The importer writes 1,024 items  per batch. "),
+            normalized("the importer writes 1,024 items per batch")
+        );
+        let response = |same: f64, updates: f64, different: f64| {
+            json!({"answers": [{"name": "relation", "probabilities": [
+                {"value": "same", "probability": same},
+                {"value": "updates", "probability": updates},
+                {"value": "different", "probability": different},
+                {"value": "unrelated", "probability": 1.0 - same - updates - different},
+            ]}]})
+        };
+        let decide =
+            |value: Value| relation_probabilities(&value).map(|p| replaces_earlier(&p, 8_000));
+        assert_eq!(decide(response(0.85, 0.05, 0.05)), Some(true));
+        assert_eq!(decide(response(0.10, 0.75, 0.10)), Some(true));
+        // Mass split evenly is not confident enough.
+        assert_eq!(decide(response(0.35, 0.30, 0.30)), Some(false));
+        // A different fact about the same subject never replaces.
+        assert_eq!(decide(response(0.30, 0.25, 0.42)), Some(false));
+        assert_eq!(decide(json!({"answers": []})), None);
     }
 
     #[test]
