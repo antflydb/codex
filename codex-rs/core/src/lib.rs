@@ -124,6 +124,7 @@ pub use plugins::plugins_manager_for_config;
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
 pub use prompt_debug::build_prompt_input;
+pub use prompt_debug::start_standalone_thread;
 pub(crate) mod mentions {
     pub(crate) use crate::plugins::build_connector_slug_counts;
     pub(crate) use crate::plugins::collect_explicit_app_ids;

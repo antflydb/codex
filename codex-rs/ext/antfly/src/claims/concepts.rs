@@ -106,11 +106,15 @@ pub(crate) fn parse_judgments(answer: &str, count: usize) -> anyhow::Result<Vec<
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Consolidation {
-    pub(crate) examined: usize,
-    pub(crate) lexical_merges: usize,
-    pub(crate) judged: usize,
-    pub(crate) judged_merges: usize,
+pub struct Consolidation {
+    /// Concepts examined this pass.
+    pub examined: usize,
+    /// Merged by lexical identity, without a model.
+    pub lexical_merges: usize,
+    /// Candidate pairs the model judged.
+    pub judged: usize,
+    /// Pairs the model judged the same and that were merged.
+    pub judged_merges: usize,
 }
 
 /// One consolidation pass. `judge` answers whether each pair of names means

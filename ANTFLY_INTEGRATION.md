@@ -492,6 +492,8 @@ Keep changes here minimal; delegate to the new crates.
 | `ext/extension-api/src/contributors.rs`, `contributors/tool_lifecycle.rs`; `core/src/tools/approvals.rs` (`notify_approval_resolved`) | Defaulted `ToolLifecycleContributor::on_approval_resolved`, called for every approval resolution |
 | `core/src/thread_manager.rs` (`load_thread_history`), `memories/write/src/phase1.rs`, `memories/write/src/runtime.rs`, `memories/write/src/rollout_input.rs` | Stage 1 reads history from the store when a thread has no rollout file |
 | `memories/write/src/detached.rs` (`sample_structured`) | One structured request to the memory extraction model, made like stage 1's, for the claim pipeline |
+| `core/src/prompt_debug.rs` (`start_standalone_thread`) | Thread manager plus one thread for standalone commands, factored out of `build_prompt_input` |
+| `cli/src/knowledge_cmd.rs`, `cli/src/main.rs` | `codex knowledge status/backfill/consolidate` |
 
 `LocalThreadStore` downcasts that become irrelevant once `state_db` is always
 Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
@@ -656,6 +658,71 @@ Extraction also requires `memories.generate_memories` (default on), a
 non-ephemeral interactive session (`cli`, `vscode`, and the other
 `INTERACTIVE_SESSION_SOURCES`), and a thread whose `memory_mode` is `enabled`
 (checked before every job).
+
+### Backfill: `codex knowledge`
+
+The live pipeline reaches threads that run turns, plus a startup sweep of at
+most 16 threads updated within `memories.max_rollout_age_days`. Imported and
+older history never gets claims that way, so a command reaches it on request:
+
+```sh
+codex knowledge status                  # threads seen/settled/pending, claims by state, concepts
+codex knowledge backfill --dry-run      # what is pending, and at most how many requests
+codex knowledge backfill [--since 2026-09-01] [--thread ID]... [--limit 25] [--max-requests N]
+codex knowledge consolidate             # apply aliases and run a concept-merge pass now
+```
+
+It drives the same worker as the live pipeline (`ext/antfly/src/claims/admin.rs`):
+
+- **Leases and progress:** the same leases and `codex_claim_progress` rows,
+  so a run is resumable and never extracts a thread twice.
+- **Eligibility:** interactive sources and `memory_mode = 'enabled'`, newest
+  first. `--thread` selects threads whatever their age or source.
+- **Settling:** backfilled history is old, so each thread is settled as soon
+  as it is extracted, which runs cross-thread supersession.
+- **Cost:** `--dry-run` reads only. It counts pending history items, and
+  pending turns from the turn projection. One extraction request covers one
+  or more turns (up to 60,000 characters), so the turn count bounds the
+  requests. `--max-requests` stops the run when the budget is spent; rerun to
+  continue.
+- **Attribution:** model requests are attributed to an ephemeral host thread
+  (`codex_core::start_standalone_thread`, factored out of `codex debug
+  prompt-input`), as live requests are attributed to a loaded thread.
+- **Single writer:** the command opens the embedded database itself, so the
+  app-server daemon must not be holding it.
+
+Verified on the scratch database: `--max-requests 1` extracted one thread and
+stopped, a rerun finished the other, and `status` then showed nothing pending.
+The intended flow for existing history is `codex-antfly-import`, then
+`codex knowledge backfill --since …`.
+
+**Why Codex runs the backfill, not Antfly.** Antfly already backfills
+everything it computes itself. When an index is added, rebuilt or replayed,
+it runs over the existing documents:
+
+- concept extraction on claims and notes;
+- embeddings;
+- graph edges;
+- resolver promotion;
+- merge replays.
+
+Producing claims is not one of those things, for two reasons:
+
+1. **Credentials and policy.** Extraction uses Codex's model client and the
+   user's ChatGPT-account auth. Antfly has a ChatGPT connector
+   (`zig/CHATGPT.md`), but it is scoped to explicitly initiated interactive
+   generation on a local standalone server. It deliberately refuses to serve
+   as a table's background-generation configuration, which a backfill
+   enrichment would be. It isn't available in the embedded library either.
+2. **Statefulness.** An Antfly enrichment computes one document's output
+   from that document. Claim extraction works on a thread:
+   - it groups many history items into turns;
+   - it shows the model the thread's current claims so it can replace or
+     retract them;
+   - it settles claims across threads.
+
+So Codex writes the claims, on request and under the user's own session.
+Antfly's enrichments then pick them up as usual.
 
 ### Supersession
 
@@ -947,8 +1014,14 @@ through `knowledge.search`.
   separates neither name equivalence nor restatements on its own (see
   above), so it would need its own labelled set first. Debouncing and
   batching already keep extraction at about one request per quiet period.
-- **Concept extraction on history items.** This stays off because of per-item
-  cost; claims carry thread and turn provenance instead.
+- **Concept extraction on history.** Per-item extraction costs one GLiNER
+  call per rollout item, most of them tool output, and attaches edges to
+  items rather than turns or sessions. Materializing per-turn documents in
+  Codex would duplicate the text and reimplement artifact lifecycle.
+  antflydb/antfly#1147 proposes grouped (fan-in) artifact sources instead:
+  history items grouped by `thread_id`, ordered by `ordinal`, segmented by
+  `turn_id`, extracted per turn, with `about` edges from a thread node.
+  Until then, claims carry thread and turn provenance.
 - **Entity documents beyond the resolver's.** Promoted concepts carry only
   `canonical_name`, `entity_type` and `aliases`. Descriptions or
   concept→concept summaries would need a conceptualizer

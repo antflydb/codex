@@ -269,3 +269,95 @@ pub async fn sweep_candidates(
         })
         .collect()
 }
+
+/// The thread `thread_id` as a candidate, whatever its source, age or
+/// progress. `None` when it does not exist.
+pub async fn thread_candidate(
+    antfly: &Antfly,
+    thread_id: &str,
+) -> AntflyResult<Option<SweepCandidate>> {
+    let sql = antfly.sql().await?;
+    let row = sql
+        .fetch_optional(
+            "SELECT t.id, t.next_ordinal AS history_end, t.updated_at_ms, t.cwd, \
+                    p.next_ordinal AS p_next_ordinal, p.settled_ordinal AS p_settled_ordinal, \
+                    p.failures AS p_failures \
+             FROM codex_threads t LEFT JOIN codex_claim_progress p ON p.thread_id = t.id \
+             WHERE t.id = $1",
+            sql_params![thread_id],
+        )
+        .await?;
+    row.map(|row| {
+        Ok(SweepCandidate {
+            thread_id: row.string("id")?,
+            history_end: ordinal(row.i64("history_end")?),
+            updated_at_ms: row.i64("updated_at_ms")?,
+            cwd: row.string("cwd")?,
+            progress: progress_from(&row, "p_")?,
+        })
+    })
+    .transpose()
+}
+
+/// Turns of `thread_id` starting at or after `from_ordinal`, from the
+/// paginated projection. `None` for threads without one (Legacy history).
+pub async fn pending_turns(
+    antfly: &Antfly,
+    thread_id: &str,
+    from_ordinal: u64,
+) -> AntflyResult<Option<u64>> {
+    let sql = antfly.sql().await?;
+    let projected = sql
+        .fetch_optional(
+            "SELECT next_rollout_ordinal FROM codex_thread_history_projection_state WHERE thread_id = $1",
+            sql_params![thread_id],
+        )
+        .await?;
+    if projected.is_none() {
+        return Ok(None);
+    }
+    let row = sql
+        .fetch_optional(
+            "SELECT COUNT(*) AS n FROM codex_thread_turns WHERE thread_id = $1 AND rollout_ordinal >= $2",
+            sql_params![thread_id, from_ordinal as i64],
+        )
+        .await?;
+    Ok(row.map(|row| ordinal(row.i64("n").unwrap_or_default())))
+}
+
+/// Pipeline-wide counts for `codex knowledge status`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProgressSummary {
+    /// Threads the pipeline has seen.
+    pub threads: u64,
+    /// Seen threads whose claims are all settled.
+    pub settled: u64,
+    /// Threads backing off after failures, with their last error.
+    pub failing: Vec<(String, u32, String)>,
+}
+
+pub async fn summary(antfly: &Antfly) -> AntflyResult<ProgressSummary> {
+    let sql = antfly.sql().await?;
+    let mut summary = ProgressSummary::default();
+    for row in sql
+        .fetch_all(
+            "SELECT thread_id, next_ordinal, settled_ordinal, failures, last_error FROM codex_claim_progress",
+            Vec::new(),
+        )
+        .await?
+    {
+        summary.threads += 1;
+        if row.i64("settled_ordinal")? >= row.i64("next_ordinal")? {
+            summary.settled += 1;
+        }
+        let failures = row.i64("failures")?;
+        if failures > 0 {
+            summary.failing.push((
+                row.string("thread_id")?,
+                u32::try_from(failures).unwrap_or(u32::MAX),
+                row.opt_string("last_error")?.unwrap_or_default(),
+            ));
+        }
+    }
+    Ok(summary)
+}

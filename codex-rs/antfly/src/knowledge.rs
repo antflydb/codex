@@ -249,6 +249,17 @@ pub fn concept_key(text: &str) -> Option<String> {
 /// PageRank"). The floor only decides which pairs a model judges.
 pub const CONCEPT_SIMILARITY_FLOOR: f64 = 0.80;
 
+/// Per-turn claims by state (see [`Knowledge::claim_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClaimCounts {
+    /// Current and settled.
+    pub current: u64,
+    /// Current, from a thread that has not settled.
+    pub provisional: u64,
+    pub superseded: u64,
+    pub retracted: u64,
+}
+
 /// A concept promoted into [`schema::CONCEPTS`] by the resolver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Concept {
@@ -780,6 +791,31 @@ impl Knowledge<'_> {
         documents.write(deletes).await
     }
 
+    /// Counts of per-turn claims by state.
+    pub async fn claim_counts(&self) -> AntflyResult<ClaimCounts> {
+        let mut counts = ClaimCounts::default();
+        for document in self
+            .antfly
+            .documents(schema::KNOWLEDGE)
+            .scan(ScanRequest::prefix(&format!(
+                "{}:",
+                crate::keys::escape(TURN_CLAIMS_VERSION)
+            )))
+            .await?
+        {
+            let Some(claim) = Claim::from_doc(&document.key, document.doc) else {
+                continue;
+            };
+            match claim.status {
+                ClaimStatus::Current if claim.settled => counts.current += 1,
+                ClaimStatus::Current => counts.provisional += 1,
+                ClaimStatus::Superseded => counts.superseded += 1,
+                ClaimStatus::Retracted => counts.retracted += 1,
+            }
+        }
+        Ok(counts)
+    }
+
     /// Every promoted concept.
     pub async fn concepts(&self) -> AntflyResult<Vec<Concept>> {
         Ok(self
@@ -860,6 +896,20 @@ impl Knowledge<'_> {
             )
             .await?
             .and_then(|row| row.string("key").ok()))
+    }
+
+    /// Concepts consolidation merged into another.
+    pub async fn merged_concept_count(&self) -> AntflyResult<u64> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_optional(
+                "SELECT COUNT(*) AS n FROM codex_concept_reviews WHERE merged_into IS NOT NULL",
+                vec![],
+            )
+            .await?
+            .and_then(|row| row.i64("n").ok())
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or_default())
     }
 
     /// Whether `key` has been examined and was not merged away.

@@ -31,7 +31,26 @@ pub async fn build_prompt_input(
     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
 ) -> CodexResult<Vec<ResponseItem>> {
     config.ephemeral = true;
+    let (thread_manager, thread) =
+        start_standalone_thread(config, state_db, extensions, user_instructions_provider).await?;
+    let output = build_prompt_input_from_session(&thread.thread.session, input).await;
+    let shutdown = thread.thread.shutdown_and_wait().await;
+    let _removed = thread_manager.remove_thread(&thread.thread_id).await;
 
+    shutdown?;
+    output
+}
+
+/// Starts a thread manager over the configured thread store and one thread
+/// in it, for standalone commands that need a live session (prompt debugging,
+/// knowledge backfill). Pass an ephemeral `config` to keep the thread out of
+/// the store. Shut the thread down and remove it when done.
+pub async fn start_standalone_thread(
+    config: Config,
+    state_db: Option<StateDbHandle>,
+    extensions: Arc<ExtensionRegistry<Config>>,
+    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+) -> CodexResult<(Arc<ThreadManager>, crate::NewThread)> {
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
@@ -44,7 +63,7 @@ pub async fn build_prompt_input(
 
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
-    let thread_manager = ThreadManager::new(
+    let thread_manager = Arc::new(ThreadManager::new(
         &config,
         Arc::clone(&auth_manager),
         crate::thread_manager::build_models_manager(&config, Arc::clone(&auth_manager)),
@@ -68,17 +87,11 @@ pub async fn build_prompt_input(
         installation_id,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
-    );
+    ));
     let thread = thread_manager
         .start_thread(StartThreadOptions::new(config))
         .await?;
-
-    let output = build_prompt_input_from_session(&thread.thread.session, input).await;
-    let shutdown = thread.thread.shutdown_and_wait().await;
-    let _removed = thread_manager.remove_thread(&thread.thread_id).await;
-
-    shutdown?;
-    output
+    Ok((thread_manager, thread))
 }
 
 pub(crate) async fn build_prompt_input_from_session(

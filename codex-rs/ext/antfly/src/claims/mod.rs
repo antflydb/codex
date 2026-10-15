@@ -20,6 +20,7 @@
 //! history was never extracted or whose claims were never settled (a crash,
 //! an import, a process that exited during the quiet period).
 
+pub mod admin;
 mod concepts;
 mod extract;
 mod transcript;
@@ -30,6 +31,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_antfly::Antfly;
@@ -155,6 +158,9 @@ impl ClaimPipeline {
                     timers: Arc::clone(&self.timers),
                     queue: sender.clone(),
                     consolidated: Mutex::new(HashMap::new()),
+                    per_job_requests: MAX_REQUESTS_PER_JOB,
+                    budget: None,
+                    schedule_settles: true,
                 };
                 tokio::spawn(worker.run(receiver));
                 sender
@@ -304,6 +310,29 @@ struct Worker {
     queue: mpsc::UnboundedSender<Job>,
     /// Last consolidation pass per database.
     consolidated: Mutex<HashMap<usize, std::time::Instant>>,
+    /// Model requests one job may make before yielding.
+    per_job_requests: usize,
+    /// Model requests left across all jobs, when capped.
+    budget: Option<Arc<AtomicUsize>>,
+    /// Whether finished jobs schedule a settle (live pipeline only).
+    schedule_settles: bool,
+}
+
+/// What processing one job did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// Memory generation is off for the thread, or another worker holds it,
+    /// or it is backing off.
+    Skipped,
+    /// No loaded thread to attribute model requests to.
+    NoHost,
+    Failed(String),
+    /// `requests` model requests made; `complete` when everything ready was
+    /// extracted (and settled, if asked), false when a request cap stopped it.
+    Done {
+        requests: usize,
+        complete: bool,
+    },
 }
 
 /// Why a job stopped early without failing.
@@ -332,38 +361,58 @@ impl Worker {
         }
     }
 
-    async fn process(&self, job: Job) {
+    /// A worker for a standalone run (`codex knowledge backfill`): no queue
+    /// or timers, `per_job_requests` per thread and an optional total budget.
+    pub(crate) fn standalone(
+        thread_manager: Weak<ThreadManager>,
+        per_job_requests: usize,
+        budget: Option<Arc<AtomicUsize>>,
+    ) -> Self {
+        let (queue, _receiver) = mpsc::unbounded_channel();
+        Self {
+            thread_manager,
+            owner: uuid::Uuid::new_v4().to_string(),
+            timers: Arc::new(Mutex::new(Timers::default())),
+            queue,
+            consolidated: Mutex::new(HashMap::new()),
+            per_job_requests,
+            budget,
+            schedule_settles: false,
+        }
+    }
+
+    pub(crate) async fn process(&self, job: Job) -> JobOutcome {
         let antfly = Arc::clone(&job.claims.antfly);
         // A thread not yet persisted is picked up by a later trigger or sweep.
         match claim_progress::memory_enabled(&antfly, &job.thread_id).await {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return JobOutcome::Skipped,
             Err(err) => {
                 tracing::warn!(
                     "antfly: memory mode of {} unavailable: {err}",
                     job.thread_id
                 );
-                return;
+                return JobOutcome::Failed(err.to_string());
             }
         }
         let progress =
             match claim_progress::lease(&antfly, &job.thread_id, &self.owner, LEASE_MS).await {
                 Ok(Some(progress)) => progress,
-                Ok(None) => return,
+                Ok(None) => return JobOutcome::Skipped,
                 Err(err) => {
                     tracing::warn!("antfly: claim lease for {} failed: {err}", job.thread_id);
-                    return;
+                    return JobOutcome::Failed(err.to_string());
                 }
             };
         if let Ok(mut timers) = self.timers.lock() {
             timers.pending_turns.remove(&job.thread_id);
         }
         let outcome = self.extract(&job, progress).await;
-        if outcome.is_ok() && !job.settle {
+        if outcome.is_ok() && !job.settle && self.schedule_settles {
             self.schedule_settle(&job);
         }
         let failure = match &outcome {
-            Ok(()) | Err(Stop::NoHost) => None,
+            Ok(_) | Err(Stop::NoHost) => None,
             Err(Stop::Failed(err)) => {
                 tracing::warn!(
                     "antfly: claim extraction for {} failed: {err}",
@@ -387,6 +436,11 @@ impl Worker {
                 "antfly: releasing claim lease for {} failed: {err}",
                 job.thread_id
             );
+        }
+        match outcome {
+            Ok((requests, complete)) => JobOutcome::Done { requests, complete },
+            Err(Stop::NoHost) => JobOutcome::NoHost,
+            Err(Stop::Failed(err)) => JobOutcome::Failed(err.to_string()),
         }
     }
 
@@ -438,11 +492,12 @@ impl Worker {
         None
     }
 
+    /// Extracts the job's ready turns; `(requests, complete)`.
     async fn extract(
         &self,
         job: &Job,
         progress: claim_progress::ClaimProgress,
-    ) -> Result<(), Stop> {
+    ) -> Result<(usize, bool), Stop> {
         let antfly = &job.claims.antfly;
         let knowledge = antfly
             .knowledge()
@@ -475,8 +530,8 @@ impl Worker {
                     .filter(|turn| !turn.text.is_empty())
                     .collect();
                 if !evidence.is_empty() {
-                    if requests == MAX_REQUESTS_PER_JOB {
-                        return Ok(());
+                    if requests == self.per_job_requests || !self.take_budget() {
+                        return Ok((requests, false));
                     }
                     requests += 1;
                     let current: Vec<_> = knowledge
@@ -522,7 +577,42 @@ impl Worker {
             claim_progress::settle(antfly, &job.thread_id, &self.owner, next).await?;
             self.consolidate_if_due(job).await;
         }
-        Ok(())
+        Ok((requests, true))
+    }
+
+    /// The extraction model's verdict on whether each pair of concept names
+    /// means the same thing.
+    pub(crate) async fn judge(
+        &self,
+        job: &Job,
+        pairs: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<bool>> {
+        let count = pairs.len();
+        let answer = self
+            .sample(
+                job,
+                concepts::JUDGE_INSTRUCTIONS,
+                &concepts::judge_input(&pairs),
+                concepts::judge_schema(),
+            )
+            .await
+            .map_err(|stop| match stop {
+                Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
+                Stop::Failed(err) => err,
+            })?;
+        concepts::parse_judgments(&answer, count)
+    }
+
+    /// Takes one request from the budget; false when it is spent.
+    fn take_budget(&self) -> bool {
+        let Some(budget) = &self.budget else {
+            return true;
+        };
+        budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
     }
 
     /// One request to the memory extraction model, attributed to a live
@@ -575,22 +665,7 @@ impl Worker {
         let Some(knowledge) = job.claims.antfly.knowledge() else {
             return;
         };
-        let judge = |pairs: Vec<(String, String)>| async move {
-            let count = pairs.len();
-            let answer = self
-                .sample(
-                    job,
-                    concepts::JUDGE_INSTRUCTIONS,
-                    &concepts::judge_input(&pairs),
-                    concepts::judge_schema(),
-                )
-                .await
-                .map_err(|stop| match stop {
-                    Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
-                    Stop::Failed(err) => err,
-                })?;
-            concepts::parse_judgments(&answer, count)
-        };
+        let judge = |pairs: Vec<(String, String)>| self.judge(job, pairs);
         match concepts::consolidate(&knowledge, judge).await {
             Ok(report) => tracing::info!("antfly: concept consolidation: {report:?}"),
             Err(err) => tracing::warn!("antfly: concept consolidation failed: {err}"),

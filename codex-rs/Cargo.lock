@@ -2605,6 +2605,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "codex-antfly",
+ "codex-antfly-extension",
  "codex-api",
  "codex-app-server",
  "codex-app-server-client",

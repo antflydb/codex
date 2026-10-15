@@ -14,6 +14,9 @@
 //! (see [`knowledge`]).
 
 mod claims;
+
+/// `codex knowledge`: status, backfill and consolidation over history.
+pub use claims::admin as knowledge_admin;
 pub mod knowledge;
 mod outcomes;
 mod request;

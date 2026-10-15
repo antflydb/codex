@@ -67,6 +67,7 @@ mod exec_server_args_tests;
 mod exec_server_auth;
 mod exec_server_command;
 mod exec_server_telemetry;
+mod knowledge_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod mcp_login;
@@ -169,6 +170,9 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
+
+    /// [experimental] Inspect and backfill the Antfly knowledge graph.
+    Knowledge(knowledge_cmd::KnowledgeCli),
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
@@ -1197,6 +1201,22 @@ async fn cli_main(
             let loader_overrides =
                 loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
             mcp_cli.run(loader_overrides).await?;
+        }
+        Some(Subcommand::Knowledge(mut knowledge_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "knowledge",
+            )?;
+            prepend_config_flags(
+                &mut knowledge_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            let loader_overrides =
+                loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
+            knowledge_cli
+                .run(loader_overrides, arg0_paths.clone())
+                .await?;
         }
         Some(Subcommand::Plugin(plugin_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2311,6 +2331,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Knowledge(_)) => Some("knowledge"),
         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
