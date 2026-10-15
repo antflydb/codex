@@ -2084,10 +2084,14 @@ dependencies = [
 name = "codex-antfly-extension"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "codex-antfly",
  "codex-core",
  "codex-extension-api",
+ "codex-memories-write",
  "codex-protocol",
+ "codex-rollout",
+ "codex-secrets",
  "codex-tools",
  "pretty_assertions",
  "serde",
@@ -2095,6 +2099,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

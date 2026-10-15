@@ -13,14 +13,19 @@ doctest = false
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 codex-antfly = { workspace = true }
 codex-core = { workspace = true }
 codex-extension-api = { workspace = true }
+codex-memories-write = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
+codex-secrets = { workspace = true }
 codex-tools = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+uuid = { workspace = true, features = ["v4"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -142,7 +142,8 @@ fn search_spec() -> ToolSpec {
         description: "Search knowledge distilled from earlier sessions: decisions, rationale, \
             user preferences, lessons, constraints and open questions, plus related memory notes. \
             Results are linked by shared concepts and only current claims are returned unless \
-            include_history is set. Each claim names the thread it came from."
+            include_history is set. Each claim names the thread (and turn) it came from; claims \
+            marked provisional come from a session that is still active and may still change."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -232,6 +233,12 @@ fn render(related: &codex_antfly::knowledge::Related) -> Value {
             if let Some(later) = &claim.superseded_by {
                 out["superseded_by"] = json!(later);
             }
+            if let Some(turn_id) = &claim.turn_id {
+                out["turn_id"] = json!(turn_id);
+            }
+            if !claim.settled {
+                out["provisional"] = json!(true);
+            }
             out
         }).collect::<Vec<_>>(),
         "notes": related.notes.iter().map(|note| json!({
@@ -270,6 +277,9 @@ mod tests {
                     generated_at_ms: 2,
                     supersedes: vec!["v2:s:0000".to_string()],
                     superseded_by: None,
+                    turn_id: Some("turn-1".to_string()),
+                    turn_ordinal: Some(4),
+                    settled: false,
                 },
                 concepts: vec!["concept/embeddinggemma_2".to_string()],
                 score: 1.0,
@@ -294,6 +304,8 @@ mod tests {
                     "cwd": "/repo",
                     "shared_concepts": ["embeddinggemma_2"],
                     "supersedes": ["v2:s:0000"],
+                    "turn_id": "turn-1",
+                    "provisional": true,
                 }],
                 "notes": [{
                     "namespace": "memories",

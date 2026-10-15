@@ -361,6 +361,20 @@ Fixed in Codex during the run:
   enrichment holding the connection gate while it embeds
   (antflydb/antfly#1130).
 
+  antflydb/antfly#1135 addresses both. Importing frozen copies of a 16,370-item
+  and a 72,669-item thread (release importer, fresh database each run):
+
+  | libantfly | 16k thread | 72k thread | Total | Index drain after |
+  | --- | --- | --- | --- | --- |
+  | pin `2c8240e703` | 47.3 s | 261.6 s | 309 s | 0.3 s |
+  | main `0cba59bceb` | 55.4 s | 287.9 s | 344 s | 0.2 s |
+  | #1135 `3eeb0f5dc5` | 20.7 s | 82.9 s | 104 s | 11.1 s |
+
+  #1135 imports 3.3× faster than its base. The resulting rows are identical
+  and search works. Background enrichment now defers while writes continue
+  and catches up afterwards: 11 s of index work remains when the import
+  exits.
+
 Remaining gaps:
 
 - **V8 for release builds.** A plain `cargo build --release` leaves out
@@ -370,8 +384,19 @@ Remaining gaps:
   `rusty-v8-v<version>` artifacts from openai/codex. Alternatively, set
   `RUSTY_V8_ARCHIVE` and `RUSTY_V8_SRC_BINDING_PATH` yourself, as
   `.github/actions/setup-rusty-v8` does.
-- **Stage 1 eligibility.** `memories.min_rollout_idle_hours` is clamped to at
-  least 1, so stage 1 never processes a thread active within the last hour.
+- **Upstream: memory requests rejected after the 2026-10-14 merge.** Since
+  openai/codex#53831, a Responses Lite model (the default extraction model
+  `gpt-5.6-luna`) gets its base instructions as an input fragment carrying
+  `content_item_metadata`. The ChatGPT-account endpoint rejects that with
+  `Unknown parameter: input[0].internal_chat_message_metadata_passthrough.content_item_metadata`,
+  so stage 1 fails on this setup. Normal turns are unaffected.
+  `sample_structured` (claim extraction) avoids the fragment: it sends its
+  instructions as a plain developer message and leaves `base_instructions`
+  empty (`Prompt::default()`'s are Codex's full agent prompt).
+- **Stage 1 eligibility.** `memories.min_rollout_idle_hours` defaults to 6
+  and is clamped to at least 1, so stage 1 never processes a recently active
+  thread. This is by design for `MEMORY.md`. Claims no longer depend on it;
+  see [Where claims come from](#where-claims-come-from).
 
 ### Approval reviewer (`codex_antfly_extension`)
 
@@ -461,7 +486,8 @@ Keep changes here minimal; delegate to the new crates.
 | `Cargo.toml` (workspace) | New members; `antfly-embedded` and `antfly-sdk` dependencies |
 | `thread-store/src/store.rs` | Defaulted `ThreadStore::load_full_history` (raw items in either history mode) |
 | `ext/extension-api/src/contributors.rs`, `contributors/tool_lifecycle.rs`; `core/src/tools/approvals.rs` (`notify_approval_resolved`) | Defaulted `ToolLifecycleContributor::on_approval_resolved`, called for every approval resolution |
-| `core/src/thread_manager.rs` (`load_thread_history`), `memories/write/src/phase1.rs`, `memories/write/src/runtime.rs` | Stage 1 reads history from the store when a thread has no rollout file |
+| `core/src/thread_manager.rs` (`load_thread_history`), `memories/write/src/phase1.rs`, `memories/write/src/runtime.rs`, `memories/write/src/rollout_input.rs` | Stage 1 reads history from the store when a thread has no rollout file |
+| `memories/write/src/detached.rs` (`sample_structured`) | One structured request to the memory extraction model, made like stage 1's, for the claim pipeline |
 
 `LocalThreadStore` downcasts that become irrelevant once `state_db` is always
 Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
@@ -527,28 +553,122 @@ supersession history.
 
 ### Where claims come from
 
-Stage-1 memory extraction (`memories/write`). Its strict output schema now
-includes `claims` (`phase1_output.rs`), and both prompt versions ask for
-self-contained single-sentence claims that name their subject and attribute
-preferences to the user's own words. After a successful stage 1,
-`MemoryStore::record_stage1_claims` writes them to the knowledge graph. SQLite
-stores ignore claims. Claims are removed with their thread's memory: on a
-no-output re-extraction, on `delete_thread_memory`, and on
-`clear_memory_data`. Retention pruning of stage-1 outputs keeps claims.
+Claims are extracted per turn by the claim pipeline in
+`codex_antfly_extension` (`ext/antfly/src/claims/`), not by stage-1 memory
+extraction.
 
-Stage 1 sees no turn ids, so claims are attributed to threads, not turns.
+**Why not stage 1.** Stage 1 summarizes a whole thread for `MEMORY.md`, and
+upstream gates it on idleness: a thread is only eligible once it has been
+idle for `memories.min_rollout_idle_hours` (default 6, clamped to 1–48).
+Stage 1 also runs only when another session starts a turn, and claims at most
+`max_rollouts_per_startup` (default 2) threads per run. The gate is right for
+consolidation: it avoids summarizing a moving target and re-running a full
+summary on every change. But it left the knowledge graph hours behind, and
+empty for the session that produced the knowledge. Relaxing the gate would
+only drop its protection. Instead the two consumers are separated:
+
+- **Stage 1 is unchanged from upstream** apart from reading history from the
+  thread store for threads without a rollout file. It stays the only path to
+  `MEMORY.md`, and no longer emits claims. Moving claims out entirely, rather
+  than keeping stage 1 as a backstop, avoids deduplicating two sources of the
+  same propositions and shrinks the patch to upstream's memory code.
+- **The claim pipeline owns claims.** It extracts finished turns shortly
+  after they end. The idle gate's protection comes from settling instead:
+  claims from an active session are provisional, so they rank lower and
+  cannot supersede other threads' claims until the session settles.
+
+**Pipeline.** Per thread:
+
+1. **Trigger.** When a turn ends or aborts, a debounce timer starts
+   (`claim_debounce_seconds`, default 120). If 4 finished turns are waiting,
+   extraction runs at once. A thread that stops is extracted and settled
+   immediately. A sweep, 60 seconds after the first thread starts in a
+   process, queues up to 16 recently updated threads (within
+   `memories.max_rollout_age_days`) with unextracted history or unsettled
+   claims. That covers crashes, processes that exit during the debounce, and
+   imported threads.
+2. **Lease.** One worker per process handles jobs one at a time. It leases the
+   thread in `codex_claim_progress` (15-minute lease) so two processes never
+   extract the same thread.
+3. **Read.** It reads `codex_history_items` from the thread's watermark
+   (`next_ordinal`) onward, in pages of 2,000 items, and groups them into turns
+   by their `task_started`/`task_complete`/`turn_aborted` events. Only finished
+   turns are processed; a settling thread also takes its unfinished tail. The
+   transcript keeps user and assistant text, tool calls and truncated tool
+   outputs. It drops developer messages, host-injected context (environment,
+   AGENTS.md, skills) and reasoning, and redacts secrets with
+   `codex_secrets::redact_secrets`.
+4. **Extract.** Turns are batched up to 60,000 characters (an oversized turn
+   keeps its head and tail). Each batch goes to the memory extraction model
+   (`memories.extract_model`, else the provider's preferred one) through
+   `codex_memories_write::sample_structured`, which makes the request exactly
+   as stage 1 does. The input lists the thread's current claims with short ids
+   (`c1`…, up to 40) and labels the new turns `[turn N]`. The strict output is
+   `{claims: [{turn, kind, statement, replaces}], retracts}`. The model returns
+   only new or changed claims: `replaces` names the existing claims a new one
+   updates, and `retracts` names ones that no longer hold. Unknown ids and
+   kinds are dropped, and at most 8 claims are accepted per batch.
+5. **Record.** `Knowledge::append_turn_claims` writes provisional claims keyed
+   `turns:{thread}:{turn ordinal}:{nnn}`, with `turn_id` and `turn_ordinal`. It
+   marks replaced claims `superseded` (with `superseded_by`) and retracted ones
+   `retracted`. Replacements and retractions within a thread need no decide
+   model, because the extractor saw the earlier claims. On a thread's first
+   batch, any earlier stage-1 claims of that thread are deleted. The watermark
+   then advances past the batch, so a crash repeats at most one batch.
+6. **Settle.** After an extraction, a settle timer starts
+   (`claim_settle_minutes`, default 30). A newer turn's timer replaces it, and
+   a stopping thread settles at once. `Knowledge::settle_thread` compares each
+   current provisional claim with similar settled claims from other threads
+   (see Supersession) and marks the thread's claims `settled`.
+
+**Failures.** A job that fails releases its lease with a retry time: 5 minutes,
+doubling per failure up to a day. If no thread is loaded to attribute the
+model request to, the job is dropped without penalty and the next turn or
+sweep retries it. A single job makes at most 16 model requests; a longer
+backlog continues on the next trigger.
+
+**Cost.** One model request per batch of finished turns (usually one per
+debounce window), against one per thread for stage 1. Requests use stage 1's
+reasoning effort (`low`) and the same detached request metadata.
+
+**Deletion.** Claims are no longer kept per memory version. Forgetting a
+thread's memory (`delete_thread_memory`) deletes its claims, and
+`clear_memory_data` deletes them all; extraction progress is kept, so cleared
+history is not re-extracted. Retention pruning of stage-1 outputs does not
+touch claims.
+
+**Configuration** (`[experimental_thread_store]`, with the knowledge graph on):
+
+```toml
+claim_extraction = true        # default; false leaves knowledge.search with notes only
+claim_debounce_seconds = 120   # quiet period after a turn
+claim_settle_minutes = 30      # idle time before claims settle
+```
+
+Extraction also requires `memories.generate_memories` (default on), a
+non-ephemeral interactive session (`cli`, `vscode`, and the other
+`INTERACTIVE_SESSION_SOURCES`), and a thread whose `memory_mode` is `enabled`
+(checked before every job).
 
 ### Supersession
 
-When a thread's claims are written, each new claim is compared with up to three
-similar `current` claims of the same kind from other threads (hybrid search).
-The decide model answers the predicate "the later statement replaces, reverses
-or updates the earlier statement about the same subject". At or above
-`supersede_threshold` (default 0.8) the new claim lists the earlier one in
-`supersedes`, and the earlier one becomes `superseded` with `superseded_by`
-set. Failures are logged and never fail the write. With Laya, the integration
-test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly supersedes
-"use Qwen3" and leaves an unrelated preference alone.
+Supersession happens when a thread's claims settle, not when they are written.
+A provisional claim from a session still in progress never displaces
+established knowledge. Each current claim being settled is compared with up
+to three similar `current`, settled claims of the same kind from other threads
+(hybrid search). The decide model answers the predicate "the later statement
+replaces, reverses or updates the earlier statement about the same subject".
+At or above `supersede_threshold` (default 0.8), the new claim lists the
+earlier one in `supersedes`, and the earlier one becomes `superseded` with
+`superseded_by` set. Failures are logged and never fail settling. With Laya,
+the integration test's "use EmbeddingGemma 2 instead of Qwen3" claim correctly
+supersedes "use Qwen3" after settling, and leaves an unrelated preference
+alone. Within a thread, the extractor's `replaces` and `retracts` take effect
+immediately.
+
+**Ranking.** `knowledge.search` ranks provisional claims at half their score
+and returns them with `provisional: true` and their `turn_id`, so the model can
+weigh a claim from an unfinished session accordingly.
 
 ### Retrieval: `knowledge.search`
 
@@ -679,8 +799,12 @@ approval prompt (up to 3,000 characters) does not.
   writes (#1084). antflydb/antfly#1096 now generates mention embeddings,
   promotes entities in Lite and honours alias redirects, but using them needs
   an entity table and name-embedding index; see antflydb/antfly#1109.
-- **Turn attribution.** Inject turn markers into stage-1 input and have claims
-  cite them.
+- **Cross-thread restatements.** Settling asks whether a later claim
+  "replaces, reverses or updates" an earlier one, and Laya does not reliably
+  say yes to a plain restatement. In the end-to-end run, identical "the
+  importer writes 1,024 items per batch" decisions from separate sessions all
+  stayed current, while near-identical hello.txt lessons were superseded. A
+  separate "same proposition" check at settle time would collapse duplicates.
 - **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
 - **Unicode concept keys (`uslug`).** Query seeds now come from Antfly's own
   resolver, so switching the key template to `uslug` is safe; it changes every
@@ -767,11 +891,13 @@ approval prompt (up to 3,000 characters) does not.
 See [Knowledge graph](#knowledge-graph).
 
 1. ✅ Embedded probe of graph indexes, extraction, resolvers and traversal.
-2. ✅ Claims from stage-1 extraction into `codex_knowledge`.
-3. ✅ Supersession with a decide predicate at write time.
+2. ✅ Claims into `codex_knowledge`: first from stage-1 extraction, now from
+   the per-turn claim pipeline, with turn attribution.
+3. ✅ Supersession: within a thread by the extractor; across threads with a
+   decide predicate when a thread settles.
 4. ✅ Retrieval and the `knowledge.search` tool.
 5. ✅ Memory notes reconciled from disk and linked to the same concepts.
-6. Synonym resolution, turn attribution and seeded PageRank.
+6. Synonym resolution. Seeded PageRank is done.
 7. Decide models: benchmark Laya, GLiNER2.5-multi-Decide and
    GLiNER2.5-Decide-1B on the approval and supersession questions.
    Gate: a labeled set from real sessions, and precision targets met, before
