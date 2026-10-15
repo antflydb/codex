@@ -4473,6 +4473,22 @@
             "approvals": {
               "$ref": "#/definitions/AntflyApprovalsToml"
             },
+            "claim_debounce_seconds": {
+              "description": "Quiet period after a turn before its claims are extracted (default 120 seconds).",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "claim_extraction": {
+              "description": "Extract claims from finished turns with the memory extraction model (default `true` when the knowledge graph is on).",
+              "type": "boolean"
+            },
+            "claim_settle_minutes": {
+              "description": "Idle time after which a thread's provisional claims are settled (default 30 minutes).",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "decide_model": {
               "description": "Typed-decision model used to review approvals (default `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).",
               "type": "string"

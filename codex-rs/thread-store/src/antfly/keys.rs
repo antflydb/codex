@@ -8,6 +8,7 @@
 
 use codex_protocol::ThreadId;
 
+/// Same format as `codex_antfly::history::item_key`, which readers use.
 pub(crate) fn history_item_id(thread_id: ThreadId, ordinal: u64) -> String {
     format!("{thread_id}:{ordinal:020}")
 }

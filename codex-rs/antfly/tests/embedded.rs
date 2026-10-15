@@ -270,8 +270,8 @@ fn switching_embedders_reindexes_existing_documents() -> Result<(), Box<dyn std:
 #[test]
 fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std::error::Error>> {
     use codex_antfly::knowledge::ClaimKind;
-    use codex_antfly::knowledge::ClaimSource;
-    use codex_antfly::knowledge::NewClaim;
+    use codex_antfly::knowledge::TurnClaim;
+    use codex_antfly::knowledge::TurnClaimBatch;
     if !has_models("fastino") || !has_models("convaiinnovations") {
         return Ok(());
     }
@@ -279,27 +279,38 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
     runtime().block_on(async {
         let antfly = open(&dir, false);
         let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
-        let source = |thread: &str, at: i64| ClaimSource {
-            version: "v2".to_string(),
+        let claim = |kind: ClaimKind, statement: &str| TurnClaim {
+            kind,
+            statement: statement.to_string(),
+            turn_id: Some("turn-1".to_string()),
+            turn_ordinal: 0,
+            replaces: Vec::new(),
+        };
+        let batch = |thread: &str, at: i64, claims: Vec<TurnClaim>| TurnClaimBatch {
             thread_id: thread.to_string(),
             cwd: None,
             source_updated_at_ms: at,
+            claims,
+            retracts: Vec::new(),
         };
         knowledge
-            .record_thread_claims(
-                &source("thread-a", 1),
+            .append_turn_claims(batch(
+                "thread-a",
+                1,
                 vec![
-                    NewClaim {
-                        kind: ClaimKind::Decision,
-                        statement: "Use Qwen3 Embedding as the embedder for Codex semantic search in Antfly.".to_string(),
-                    },
-                    NewClaim {
-                        kind: ClaimKind::Preference,
-                        statement: "Pin Antfly by git revision rather than tracking a branch.".to_string(),
-                    },
+                    claim(
+                        ClaimKind::Decision,
+                        "Use Qwen3 Embedding as the embedder for Codex semantic search in Antfly.",
+                    ),
+                    claim(
+                        ClaimKind::Preference,
+                        "Pin Antfly by git revision rather than tracking a branch.",
+                    ),
                 ],
-            )
+            ))
             .await?;
+        knowledge.settle_thread("thread-a").await?;
+        let a_decision = format!("turns:thread-a:{}:000", codex_antfly::keys::ordinal(0));
         // Supersession compares against claims that are already searchable;
         // indexing is asynchronous, so wait for thread A's decision to land.
         for _ in 0..100 {
@@ -307,21 +318,32 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
                 .documents(schema::KNOWLEDGE)
                 .search_text("Qwen3 Embedding embedder", None, 5, 0)
                 .await?;
-            if hits.iter().any(|hit| hit.key == "v2:thread-a:0000") {
+            if hits.iter().any(|hit| hit.key == a_decision) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let later = knowledge
-            .record_thread_claims(
-                &source("thread-b", 2),
-                vec![NewClaim {
-                    kind: ClaimKind::Decision,
-                    statement: "Use EmbeddingGemma 2 instead of Qwen3 Embedding as the Codex semantic search embedder; Antfly detects the dimensions.".to_string(),
-                }],
-            )
+            .append_turn_claims(batch(
+                "thread-b",
+                2,
+                vec![claim(
+                    ClaimKind::Decision,
+                    "Use EmbeddingGemma 2 instead of Qwen3 Embedding as the Codex semantic search embedder; Antfly detects the dimensions.",
+                )],
+            ))
             .await?;
-        assert_eq!(later[0].supersedes, vec!["v2:thread-a:0000".to_string()]);
+        // A provisional claim never supersedes another thread's claim.
+        assert!(later[0].supersedes.is_empty());
+        assert!(!later[0].settled);
+        knowledge.settle_thread("thread-b").await?;
+        let b_decision = later[0].id.clone();
+        let later = knowledge
+            .get(&b_decision)
+            .await?
+            .ok_or("thread B's decision missing")?;
+        assert!(later.settled);
+        assert_eq!(later.supersedes, vec![a_decision.clone()]);
         antfly
             .documents(schema::MEMORY_NOTES)
             .write(vec![Write::put(
@@ -340,8 +362,8 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
         }
         // Only the current decision is surfaced, linked through shared concepts.
         let ids: Vec<&str> = related.claims.iter().map(|c| c.claim.id.as_str()).collect();
-        assert!(ids.contains(&"v2:thread-b:0000"), "{related:#?}");
-        assert!(!ids.contains(&"v2:thread-a:0000"), "{related:#?}");
+        assert!(ids.contains(&b_decision.as_str()), "{related:#?}");
+        assert!(!ids.contains(&a_decision.as_str()), "{related:#?}");
         let current = &related.claims[0];
         assert!(current.concepts.len() > 1, "{related:#?}");
         assert_eq!(
@@ -395,7 +417,7 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
             .cloned()
             .unwrap_or_default();
         assert!(
-            scores.iter().any(|entry| entry["node"] == "v2:thread-b:0000"
+            scores.iter().any(|entry| entry["node"] == b_decision.as_str()
                 && entry["score"].as_f64().unwrap_or_default() > 0.0),
             "{ppr:#}"
         );
@@ -406,10 +428,10 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
         let earlier = with_history
             .claims
             .iter()
-            .find(|c| c.claim.id == "v2:thread-a:0000")
+            .find(|c| c.claim.id == a_decision)
             .ok_or("superseded claim missing from history")?;
         assert_eq!(earlier.claim.status, codex_antfly::knowledge::ClaimStatus::Superseded);
-        assert_eq!(earlier.claim.superseded_by.as_deref(), Some("v2:thread-b:0000"));
+        assert_eq!(earlier.claim.superseded_by.as_deref(), Some(b_decision.as_str()));
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
@@ -491,6 +513,143 @@ fn graph_upgrades_replace_the_old_version_without_a_gap() -> Result<(), Box<dyn 
             .await;
         assert!(old.is_err() || !old?.to_string().contains("\"b\""));
         backend.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn turn_claims_replace_retract_and_track_progress() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::claim_progress;
+    use codex_antfly::knowledge::ClaimKind;
+    use codex_antfly::knowledge::ClaimStatus;
+    use codex_antfly::knowledge::TurnClaim;
+    use codex_antfly::knowledge::TurnClaimBatch;
+    if !has_models("fastino") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let claim = |ordinal: u64, statement: &str, replaces: Vec<String>| TurnClaim {
+            kind: ClaimKind::Decision,
+            statement: statement.to_string(),
+            turn_id: Some(format!("turn-{ordinal}")),
+            turn_ordinal: ordinal,
+            replaces,
+        };
+        let batch = |claims: Vec<TurnClaim>, retracts: Vec<String>| TurnClaimBatch {
+            thread_id: "thread-a".to_string(),
+            cwd: Some("/repo".to_string()),
+            source_updated_at_ms: 10,
+            claims,
+            retracts,
+        };
+        let first = knowledge
+            .append_turn_claims(batch(
+                vec![
+                    claim(2, "The importer writes 256 items per batch.", Vec::new()),
+                    claim(2, "Imports run on a debug build.", Vec::new()),
+                ],
+                Vec::new(),
+            ))
+            .await?;
+        assert_eq!(first[0].turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(first[0].turn_ordinal, Some(2));
+        assert!(!first[0].settled);
+        // A later turn replaces one claim and retracts the other; ids from
+        // other threads are ignored.
+        let second = knowledge
+            .append_turn_claims(batch(
+                vec![claim(
+                    9,
+                    "The importer writes 1,024 items per batch.",
+                    vec![first[0].id.clone(), "turns:thread-b:x:000".to_string()],
+                )],
+                vec![first[1].id.clone()],
+            ))
+            .await?;
+        assert_eq!(second[0].supersedes, vec![first[0].id.clone()]);
+        let claims = knowledge.thread_claims("thread-a").await?;
+        let status = |id: &str| {
+            claims
+                .iter()
+                .find(|claim| claim.id == id)
+                .map(|claim| (claim.status, claim.superseded_by.clone()))
+        };
+        assert_eq!(
+            status(&first[0].id),
+            Some((ClaimStatus::Superseded, Some(second[0].id.clone())))
+        );
+        assert_eq!(status(&first[1].id), Some((ClaimStatus::Retracted, None)));
+        assert_eq!(status(&second[0].id), Some((ClaimStatus::Current, None)));
+        assert_eq!(knowledge.settle_thread("thread-a").await?, 3);
+        assert!(
+            knowledge
+                .thread_claims("thread-a")
+                .await?
+                .iter()
+                .all(|claim| claim.settled)
+        );
+
+        // Progress: one owner at a time, advanced and settled under the lease.
+        let lease = claim_progress::lease(&antfly, "thread-a", "owner-1", 60_000)
+            .await?
+            .ok_or("first lease")?;
+        assert_eq!(lease.next_ordinal, 0);
+        assert!(
+            claim_progress::lease(&antfly, "thread-a", "owner-2", 60_000)
+                .await?
+                .is_none()
+        );
+        claim_progress::advance(&antfly, "thread-a", "owner-1", 12).await?;
+        claim_progress::settle(&antfly, "thread-a", "owner-1", 12).await?;
+        assert!(
+            claim_progress::advance(&antfly, "thread-a", "owner-2", 99)
+                .await
+                .is_err()
+        );
+        claim_progress::release(&antfly, "thread-a", "owner-1", Some(("boom", i64::MAX))).await?;
+        // Backing off: nobody may lease until the retry time.
+        assert!(
+            claim_progress::lease(&antfly, "thread-a", "owner-2", 60_000)
+                .await?
+                .is_none()
+        );
+
+        // The sweep finds threads with unextracted history.
+        let sql = antfly.sql().await?;
+        for (id, next) in [("thread-new", 5_i64), ("thread-a", 12)] {
+            sql.execute(
+                "INSERT INTO codex_threads (id, rollout_path, created_at, updated_at, created_at_ms, \
+                 updated_at_ms, recency_at, recency_at_ms, source, model_provider, cwd, title, \
+                 sandbox_policy, approval_mode, next_ordinal) \
+                 VALUES ($1, '', 1, 1, 1000, 1000, 1, 1000, 'cli', 'p', '/repo', 't', 's', 'a', $2)",
+                codex_antfly::sql_params![id, next],
+            )
+            .await?;
+        }
+        let candidates = claim_progress::sweep_candidates(
+            &antfly,
+            claim_progress::SweepParams {
+                sources: &["cli", "vscode"],
+                min_updated_at_ms: 0,
+                settle_before_ms: 2_000,
+                now_ms: 3_000,
+                limit: 10,
+            },
+        )
+        .await?;
+        // thread-a is extracted, settled and backing off.
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.thread_id.as_str(), candidate.history_end, candidate.progress))
+                .collect::<Vec<_>>(),
+            vec![("thread-new", 5, None)]
+        );
+        antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
     Ok(())

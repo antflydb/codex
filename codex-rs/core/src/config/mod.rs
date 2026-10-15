@@ -2593,6 +2593,9 @@ fn thread_store_config(
                 knowledge_graph: antfly.knowledge_graph,
                 extract_model: antfly.extract_model,
                 supersede_threshold: antfly.supersede_threshold,
+                claim_extraction: antfly.claim_extraction,
+                claim_debounce_seconds: antfly.claim_debounce_seconds,
+                claim_settle_minutes: antfly.claim_settle_minutes,
             })
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())

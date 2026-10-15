@@ -92,32 +92,6 @@ impl MemoryStore {
         clear_memory_data_in_pool(pool.as_ref()).await
     }
 
-    /// Records the claims stage-1 extraction distilled from `thread_id` in
-    /// the knowledge graph, replacing earlier ones from that thread. Only the
-    /// Antfly backend keeps claims; SQLite ignores them.
-    pub async fn record_stage1_claims(
-        &self,
-        thread_id: ThreadId,
-        source_updated_at: i64,
-        cwd: Option<&str>,
-        claims: &[crate::MemoryClaim],
-    ) -> anyhow::Result<usize> {
-        match &self.backend {
-            MemoryBackend::Sqlite { .. } => Ok(0),
-            MemoryBackend::Antfly { antfly, version } => {
-                Box::pin(antfly_memories::record_stage1_claims(
-                    antfly,
-                    version,
-                    thread_id,
-                    source_updated_at,
-                    cwd,
-                    claims,
-                ))
-                .await
-            }
-        }
-    }
-
     /// Record usage for cited stage-1 outputs.
     ///
     /// Each thread id increments `usage_count` by one and sets `last_usage` to

@@ -191,56 +191,23 @@ fn stage1_output_from_joined_row(row: &SqlRow) -> anyhow::Result<Stage1Output> {
 
 /// Claims live in the knowledge graph, outside the SQL transactions here:
 /// cleanup is best effort and never fails the memory operation.
-async fn delete_claims(antfly: &Antfly, version: &str, thread_id: Option<&str>) {
+/// Claims are not kept per memory version: forgetting a thread or clearing
+/// memories removes its claims from every version.
+async fn delete_claims(antfly: &Antfly, thread_id: Option<&str>) {
     let Some(knowledge) = antfly.knowledge() else {
         return;
     };
     let result = match thread_id {
-        Some(thread_id) => knowledge.delete_thread_claims(version, thread_id).await,
-        None => knowledge.clear(version).await,
+        Some(thread_id) => knowledge.delete_thread_claims(thread_id).await,
+        None => knowledge.clear().await,
     };
     if let Err(err) = result {
         tracing::warn!("antfly: failed to delete memory claims: {err}");
     }
 }
 
-pub(crate) async fn record_stage1_claims(
-    antfly: &Arc<Antfly>,
-    version: &str,
-    thread_id: ThreadId,
-    source_updated_at: i64,
-    cwd: Option<&str>,
-    claims: &[crate::MemoryClaim],
-) -> anyhow::Result<usize> {
-    use codex_antfly::knowledge::ClaimKind;
-    let Some(knowledge) = antfly.knowledge() else {
-        return Ok(0);
-    };
-    let claims: Vec<codex_antfly::knowledge::NewClaim> = claims
-        .iter()
-        .filter_map(|claim| {
-            let kind: ClaimKind =
-                serde_json::from_value(serde_json::Value::String(claim.kind.clone())).ok()?;
-            Some(codex_antfly::knowledge::NewClaim {
-                kind,
-                statement: claim.statement.clone(),
-            })
-        })
-        .collect();
-    let source = codex_antfly::knowledge::ClaimSource {
-        version: version.to_string(),
-        thread_id: thread_id.to_string(),
-        cwd: cwd.map(str::to_string),
-        source_updated_at_ms: source_updated_at.saturating_mul(1000),
-    };
-    let recorded = Box::pin(knowledge.record_thread_claims(&source, claims))
-        .await
-        .map_err(internal)?;
-    Ok(recorded.len())
-}
-
 pub(crate) async fn clear_memory_data(antfly: &Arc<Antfly>, version: &str) -> anyhow::Result<()> {
-    delete_claims(antfly, version, None).await;
+    delete_claims(antfly, None).await;
     let sql = antfly.sql().await.map_err(internal)?;
     let version = version.to_string();
     with_retry(sql, move |tx| {
@@ -521,7 +488,7 @@ pub(crate) async fn delete_thread_memory(
     version: &str,
     thread_id: ThreadId,
 ) -> anyhow::Result<()> {
-    delete_claims(antfly, version, Some(&thread_id.to_string())).await;
+    delete_claims(antfly, Some(&thread_id.to_string())).await;
     let sql = antfly.sql().await.map_err(internal)?;
     let now = Utc::now().timestamp();
     let version = version.to_string();
@@ -974,7 +941,6 @@ pub(crate) async fn mark_stage1_job_succeeded_no_output(
     thread_id: ThreadId,
     ownership_token: &str,
 ) -> anyhow::Result<bool> {
-    let claims_version = version;
     let sql = antfly.sql().await.map_err(internal)?;
     let now = Utc::now().timestamp();
     let version = version.to_string();
@@ -1022,10 +988,6 @@ pub(crate) async fn mark_stage1_job_succeeded_no_output(
     })
     .await
     .map_err(internal)?;
-    // Nothing worth remembering remains, so neither do its claims.
-    if succeeded {
-        delete_claims(antfly, claims_version, Some(&thread_id.to_string())).await;
-    }
     Ok(succeeded)
 }
 
@@ -1596,45 +1558,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stage1_claims_follow_the_thread_memory_lifecycle() {
+    async fn claims_follow_the_thread_memory_lifecycle() {
+        use codex_antfly::knowledge::ClaimKind;
+        use codex_antfly::knowledge::TurnClaim;
+        use codex_antfly::knowledge::TurnClaimBatch;
         let (store, antfly, dir) = test_store().await;
         let knowledge = antfly.knowledge().expect("knowledge graph enabled");
         let thread_id = new_thread_id();
-        let claim_id = format!("v1:{thread_id}:0000");
-        let claims = [
-            crate::MemoryClaim {
-                kind: "decision".to_string(),
+        let batch = || TurnClaimBatch {
+            thread_id: thread_id.to_string(),
+            cwd: Some("/repo".to_string()),
+            source_updated_at_ms: 1_700_000_000_000,
+            claims: vec![TurnClaim {
+                kind: ClaimKind::Decision,
                 statement: "Codex pins Antfly by git revision.".to_string(),
-            },
-            crate::MemoryClaim {
-                kind: "not_a_kind".to_string(),
-                statement: "Dropped.".to_string(),
-            },
-        ];
-        let recorded = store
-            .record_stage1_claims(thread_id, 1_700_000_000, Some("/repo"), &claims)
-            .await
-            .expect("record claims");
-        assert_eq!(recorded, 1);
-        let claim = knowledge
-            .get(&claim_id)
-            .await
-            .expect("get claim")
-            .expect("claim stored");
-        assert_eq!(claim.statement, "Codex pins Antfly by git revision.");
-        assert_eq!(claim.cwd.as_deref(), Some("/repo"));
-        assert_eq!(claim.source_updated_at_ms, 1_700_000_000_000);
+                turn_id: Some("turn-1".to_string()),
+                turn_ordinal: 3,
+                replaces: Vec::new(),
+            }],
+            retracts: Vec::new(),
+        };
+        let recorded = knowledge.append_turn_claims(batch()).await.expect("record");
+        let claim_id = recorded[0].id.clone();
+        assert!(knowledge.get(&claim_id).await.expect("get claim").is_some());
 
+        // Forgetting a thread's memory forgets its claims.
         store
             .delete_thread_memory(thread_id)
             .await
             .expect("delete thread memory");
         assert!(knowledge.get(&claim_id).await.expect("get claim").is_none());
 
-        store
-            .record_stage1_claims(thread_id, 1_700_000_001, None, &claims)
-            .await
-            .expect("record claims");
+        knowledge.append_turn_claims(batch()).await.expect("record");
         store.clear_memory_data().await.expect("clear memory data");
         assert!(knowledge.get(&claim_id).await.expect("get claim").is_none());
         cleanup(&antfly, dir).await;

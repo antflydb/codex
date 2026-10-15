@@ -13,11 +13,16 @@
 //!   an index with an artifact source, and keeping it separate means a concept
 //!   rebuild never loses supersession history.
 //!
-//! Supersession is judged when claims are written: each new claim is compared
-//! with its most similar current claims from other threads using a
-//! decide-model predicate. Retrieval seeds concepts from the query (GLiNER at
-//! query time plus the concepts of direct search hits), then walks `about`
-//! edges back to the claims and notes that share them.
+//! Claims are extracted turn by turn (see `codex_antfly_extension`'s claim
+//! pipeline). The extractor sees its thread's current claims, so a later turn
+//! replaces or retracts an earlier claim from the same thread directly. A
+//! claim stays provisional (`settled: false`) until its thread goes idle;
+//! settling compares each claim with its most similar settled claims from
+//! other threads using a decide-model predicate, so a half-finished session
+//! never supersedes established knowledge. Retrieval seeds concepts from the
+//! query (GLiNER at query time plus the concepts of direct search hits), then
+//! walks `about` edges back to the claims and notes that share them, ranking
+//! provisional claims below settled ones.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -84,6 +89,13 @@ const QUERY_EXTRACT_MAX_BYTES: usize = 600;
 /// Laya rejects over-long inputs; keep each statement well inside them.
 const DECIDE_STATEMENT_MAX_CHARS: usize = 600;
 const SUPERSEDE_CANDIDATES: usize = 3;
+/// `version` of claims written by the per-turn pipeline. Claims from the
+/// earlier stage-1 extraction used the memory version (`v1`, `v2`).
+pub const TURN_CLAIMS_VERSION: &str = "turns";
+/// Every claim key namespace, for deletion.
+const CLAIM_VERSIONS: &[&str] = &[TURN_CLAIMS_VERSION, "v1", "v2"];
+/// Provisional claims rank at this fraction of their score.
+const PROVISIONAL_WEIGHT: f64 = 0.5;
 
 fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -243,24 +255,32 @@ impl ClaimKind {
 pub enum ClaimStatus {
     Current,
     Superseded,
+    /// A later turn of the same thread said it no longer holds.
+    Retracted,
 }
 
-/// A claim to record for a thread.
+/// A claim extracted from one turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewClaim {
+pub struct TurnClaim {
     pub kind: ClaimKind,
     pub statement: String,
+    pub turn_id: Option<String>,
+    /// History ordinal where the turn starts; orders claims within a thread.
+    pub turn_ordinal: u64,
+    /// Ids of the thread's current claims this one replaces.
+    pub replaces: Vec<String>,
 }
 
-/// Where a thread's claims came from.
+/// Claims extracted from a batch of a thread's turns.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaimSource {
-    /// Memory pipeline version (`v1`, `v2`); claims are kept per version.
-    pub version: String,
+pub struct TurnClaimBatch {
     pub thread_id: String,
     pub cwd: Option<String>,
-    /// The thread's `updated_at` that the claims were distilled from.
+    /// When the newest turn in the batch was recorded.
     pub source_updated_at_ms: i64,
+    pub claims: Vec<TurnClaim>,
+    /// Ids of the thread's current claims that no longer hold.
+    pub retracts: Vec<String>,
 }
 
 /// A stored claim.
@@ -281,6 +301,18 @@ pub struct Claim {
     pub supersedes: Vec<String>,
     #[serde(default)]
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub turn_ordinal: Option<u64>,
+    /// False while the claim's thread is still active. Claims from before
+    /// the per-turn pipeline were extracted from finished threads.
+    #[serde(default = "settled_by_default")]
+    pub settled: bool,
+}
+
+fn settled_by_default() -> bool {
+    true
 }
 
 impl Claim {
@@ -431,74 +463,153 @@ impl Knowledge<'_> {
         }
     }
 
-    /// Replaces `source`'s claims with `claims`. Each new claim is checked
-    /// against similar current claims from other threads; ones it
-    /// supersedes are marked so. Supersession failures are logged and never
-    /// fail the write.
-    pub async fn record_thread_claims(
-        &self,
-        source: &ClaimSource,
-        claims: Vec<NewClaim>,
-    ) -> AntflyResult<Vec<Claim>> {
-        let documents = self.antfly.documents(schema::KNOWLEDGE);
-        let prefix = claim_prefix(&source.version, &source.thread_id);
-        let existing: BTreeSet<String> = documents
-            .scan(ScanRequest::prefix(&prefix))
+    /// Every claim of `thread_id` from the per-turn pipeline, in turn order.
+    pub async fn thread_claims(&self, thread_id: &str) -> AntflyResult<Vec<Claim>> {
+        Ok(self
+            .antfly
+            .documents(schema::KNOWLEDGE)
+            .scan(ScanRequest::prefix(&claim_prefix(
+                TURN_CLAIMS_VERSION,
+                thread_id,
+            )))
             .await?
             .into_iter()
-            .map(|document| document.key)
+            .filter_map(|document| Claim::from_doc(&document.key, document.doc))
+            .collect())
+    }
+
+    /// Records `batch` as provisional claims. Claims it replaces or retracts
+    /// must be current claims of the same thread; other ids are ignored.
+    /// Earlier stage-1 claims of the thread are dropped on its first batch.
+    pub async fn append_turn_claims(&self, batch: TurnClaimBatch) -> AntflyResult<Vec<Claim>> {
+        let documents = self.antfly.documents(schema::KNOWLEDGE);
+        let existing = self.thread_claims(&batch.thread_id).await?;
+        let mut writes = Vec::new();
+        if existing.is_empty() {
+            for version in CLAIM_VERSIONS
+                .iter()
+                .filter(|version| **version != TURN_CLAIMS_VERSION)
+            {
+                for document in documents
+                    .scan(ScanRequest::prefix(&claim_prefix(
+                        version,
+                        &batch.thread_id,
+                    )))
+                    .await?
+                {
+                    writes.push(Write::delete(document.key));
+                }
+            }
+        }
+        let mut current: BTreeMap<String, Claim> = existing
+            .into_iter()
+            .filter(|claim| claim.status == ClaimStatus::Current)
+            .map(|claim| (claim.id.clone(), claim))
             .collect();
+        let prefix = claim_prefix(TURN_CLAIMS_VERSION, &batch.thread_id);
         let generated_at_ms = now_ms();
-        let mut records = Vec::with_capacity(claims.len());
-        let mut superseded: BTreeMap<String, String> = BTreeMap::new();
-        for (index, claim) in claims.into_iter().enumerate() {
+        let mut per_turn: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut records = Vec::with_capacity(batch.claims.len());
+        let mut changed: BTreeMap<String, Claim> = BTreeMap::new();
+        for claim in batch.claims {
             let statement = claim.statement.trim().to_string();
             if statement.is_empty() {
                 continue;
             }
-            let id = format!("{prefix}{index:04}");
+            let index = per_turn.entry(claim.turn_ordinal).or_default();
+            let id = format!(
+                "{prefix}{}:{:03}",
+                crate::keys::ordinal(claim.turn_ordinal),
+                *index
+            );
+            *index += 1;
             let mut supersedes = Vec::new();
-            match self
-                .supersede_candidates(source, claim.kind, &statement)
-                .await
-            {
-                Ok(candidates) => {
-                    for earlier in candidates {
-                        match self.supersedes(&earlier.statement, &statement).await {
-                            Ok(true) => {
-                                superseded.insert(earlier.id.clone(), id.clone());
-                                supersedes.push(earlier.id);
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                tracing::warn!("antfly: supersession check failed: {err}")
-                            }
-                        }
-                    }
+            for replaced in claim.replaces {
+                if let Some(mut earlier) = current.remove(&replaced) {
+                    earlier.status = ClaimStatus::Superseded;
+                    earlier.superseded_by = Some(id.clone());
+                    supersedes.push(earlier.id.clone());
+                    changed.insert(earlier.id.clone(), earlier);
                 }
-                Err(err) => tracing::warn!("antfly: supersession search failed: {err}"),
             }
             records.push(Claim {
                 id,
                 kind: claim.kind,
                 statement,
                 status: ClaimStatus::Current,
-                thread_id: source.thread_id.clone(),
-                version: source.version.clone(),
-                cwd: source.cwd.clone(),
-                source_updated_at_ms: source.source_updated_at_ms,
+                thread_id: batch.thread_id.clone(),
+                version: TURN_CLAIMS_VERSION.to_string(),
+                cwd: batch.cwd.clone(),
+                source_updated_at_ms: batch.source_updated_at_ms,
                 generated_at_ms,
                 supersedes,
                 superseded_by: None,
+                turn_id: claim.turn_id,
+                turn_ordinal: Some(claim.turn_ordinal),
+                settled: false,
             });
         }
-        let kept: BTreeSet<&str> = records.iter().map(|claim| claim.id.as_str()).collect();
-        let mut writes = Vec::new();
-        for key in existing.iter().filter(|key| !kept.contains(key.as_str())) {
-            writes.push(Write::delete(key.clone()));
+        for retracted in batch.retracts {
+            if let Some(mut earlier) = current.remove(&retracted) {
+                earlier.status = ClaimStatus::Retracted;
+                changed.insert(earlier.id.clone(), earlier);
+            }
         }
-        for record in &records {
-            writes.push(Write::put(record.id.clone(), record.to_doc()?));
+        for claim in changed.values().chain(records.iter()) {
+            writes.push(Write::put(claim.id.clone(), claim.to_doc()?));
+        }
+        if !writes.is_empty() {
+            let _guard = self.antfly.lock().await;
+            documents.write(writes).await?;
+        }
+        Ok(records)
+    }
+
+    /// Settles `thread_id`'s provisional claims: each current one is checked
+    /// against similar settled claims from other threads, which it may
+    /// supersede, and then marked settled. Supersession failures are logged
+    /// and never fail settling. Returns the number of claims settled.
+    pub async fn settle_thread(&self, thread_id: &str) -> AntflyResult<usize> {
+        let documents = self.antfly.documents(schema::KNOWLEDGE);
+        let pending: Vec<Claim> = self
+            .thread_claims(thread_id)
+            .await?
+            .into_iter()
+            .filter(|claim| !claim.settled)
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut superseded: BTreeMap<String, String> = BTreeMap::new();
+        let mut writes = Vec::with_capacity(pending.len());
+        for mut claim in pending.iter().cloned() {
+            if claim.status == ClaimStatus::Current {
+                match self
+                    .supersede_candidates(thread_id, claim.kind, &claim.statement)
+                    .await
+                {
+                    Ok(candidates) => {
+                        for earlier in candidates {
+                            if superseded.contains_key(&earlier.id) {
+                                continue;
+                            }
+                            match self.supersedes(&earlier.statement, &claim.statement).await {
+                                Ok(true) => {
+                                    superseded.insert(earlier.id.clone(), claim.id.clone());
+                                    claim.supersedes.push(earlier.id);
+                                }
+                                Ok(false) => {}
+                                Err(err) => {
+                                    tracing::warn!("antfly: supersession check failed: {err}")
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!("antfly: supersession search failed: {err}"),
+                }
+            }
+            claim.settled = true;
+            writes.push(Write::put(claim.id.clone(), claim.to_doc()?));
         }
         let _guard = self.antfly.lock().await;
         for (earlier_id, later_id) in &superseded {
@@ -513,31 +624,34 @@ impl Knowledge<'_> {
             writes.push(Write::put(earlier.id.clone(), earlier.to_doc()?));
         }
         documents.write(writes).await?;
-        Ok(records)
+        Ok(pending.len())
     }
 
-    /// Deletes every claim distilled from `thread_id`, for any version.
-    pub async fn delete_thread_claims(&self, version: &str, thread_id: &str) -> AntflyResult<()> {
+    /// Deletes every claim distilled from `thread_id`.
+    pub async fn delete_thread_claims(&self, thread_id: &str) -> AntflyResult<()> {
         let documents = self.antfly.documents(schema::KNOWLEDGE);
-        let deletes: Vec<Write> = documents
-            .scan(ScanRequest::prefix(&claim_prefix(version, thread_id)))
-            .await?
-            .into_iter()
-            .map(|document| Write::delete(document.key))
-            .collect();
+        let mut deletes = Vec::new();
+        for version in CLAIM_VERSIONS {
+            for document in documents
+                .scan(ScanRequest::prefix(&claim_prefix(version, thread_id)))
+                .await?
+            {
+                deletes.push(Write::delete(document.key));
+            }
+        }
         documents.write(deletes).await
     }
 
-    /// Deletes every claim of `version`.
-    pub async fn clear(&self, version: &str) -> AntflyResult<()> {
+    /// Deletes every claim.
+    pub async fn clear(&self) -> AntflyResult<()> {
         let documents = self.antfly.documents(schema::KNOWLEDGE);
-        let prefix = format!("{}:", crate::keys::escape(version));
-        let deletes: Vec<Write> = documents
-            .scan(ScanRequest::prefix(&prefix))
-            .await?
-            .into_iter()
-            .map(|document| Write::delete(document.key))
-            .collect();
+        let mut deletes = Vec::new();
+        for version in CLAIM_VERSIONS {
+            let prefix = format!("{}:", crate::keys::escape(version));
+            for document in documents.scan(ScanRequest::prefix(&prefix)).await? {
+                deletes.push(Write::delete(document.key));
+            }
+        }
         documents.write(deletes).await
     }
 
@@ -550,16 +664,17 @@ impl Knowledge<'_> {
             .and_then(|doc| Claim::from_doc(id, doc)))
     }
 
+    /// Current, settled claims of `kind` from threads other than
+    /// `thread_id` that are most similar to `statement`.
     async fn supersede_candidates(
         &self,
-        source: &ClaimSource,
+        thread_id: &str,
         kind: ClaimKind,
         statement: &str,
     ) -> AntflyResult<Vec<Claim>> {
         let filter = json!({"conjuncts": [
             {"term": {"status": "current"}},
             {"term": {"kind": kind.as_str()}},
-            {"term": {"version": source.version}},
         ]});
         let hits = self
             .antfly
@@ -567,14 +682,14 @@ impl Knowledge<'_> {
             .search_text(
                 statement,
                 Some(filter),
-                SUPERSEDE_CANDIDATES,
-                SUPERSEDE_CANDIDATES,
+                SUPERSEDE_CANDIDATES * 3,
+                SUPERSEDE_CANDIDATES * 3,
             )
             .await?;
         Ok(hits
             .into_iter()
             .filter_map(|hit| Claim::from_doc(&hit.key, hit.doc?))
-            .filter(|claim| claim.thread_id != source.thread_id)
+            .filter(|claim| claim.thread_id != thread_id && claim.settled)
             .take(SUPERSEDE_CANDIDATES)
             .collect())
     }
@@ -859,10 +974,17 @@ impl Knowledge<'_> {
         }
         let mut claims: Vec<RelatedClaim> = candidates
             .into_iter()
-            .map(|(key, (claim, concepts, direct))| RelatedClaim {
-                score: rank_score(&ppr, &key, concepts.len(), direct),
-                claim,
-                concepts,
+            .map(|(key, (claim, concepts, direct))| {
+                let weight = if claim.settled {
+                    1.0
+                } else {
+                    PROVISIONAL_WEIGHT
+                };
+                RelatedClaim {
+                    score: weight * rank_score(&ppr, &key, concepts.len(), direct),
+                    claim,
+                    concepts,
+                }
             })
             .collect();
         claims.sort_by(|a, b| {

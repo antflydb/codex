@@ -5,6 +5,7 @@
 //! workspace diffing.
 
 mod control;
+mod detached;
 mod extensions;
 mod guard;
 mod metrics;
@@ -23,6 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub use control::clear_memory_roots_contents;
+pub use detached::sample_structured;
 pub use extensions::prune_old_extension_resources;
 pub use prompts::build_consolidation_prompt;
 pub use prompts::build_stage_one_input_message;

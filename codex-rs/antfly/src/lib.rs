@@ -6,9 +6,11 @@
 //! same JSON contracts, so stores are written once against the backend trait.
 
 mod backend;
+pub mod claim_progress;
 mod config;
 mod embedded;
 mod error;
+pub mod history;
 pub mod keys;
 pub mod knowledge;
 mod remote;
@@ -30,6 +32,7 @@ pub use config::AntflyTomlSettings;
 pub use config::ApprovalMode;
 pub use config::ApprovalSettings;
 pub use config::BackendConfig;
+pub use config::ClaimPipelineConfig;
 pub use config::DEFAULT_DECIDE_MODEL;
 pub use config::DEFAULT_EXTRACT_MODEL;
 pub use config::EmbedderConfig;

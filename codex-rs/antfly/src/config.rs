@@ -56,6 +56,8 @@ pub struct KnowledgeConfig {
     /// A new claim supersedes an earlier one when the decide model is at
     /// least this confident, in basis points.
     pub supersede_threshold_bp: u32,
+    /// Per-turn claim extraction; `None` turns it off.
+    pub claims: Option<ClaimPipelineConfig>,
 }
 
 impl Default for KnowledgeConfig {
@@ -63,6 +65,25 @@ impl Default for KnowledgeConfig {
         Self {
             extract_model: DEFAULT_EXTRACT_MODEL.to_string(),
             supersede_threshold_bp: 8_000,
+            claims: Some(ClaimPipelineConfig::default()),
+        }
+    }
+}
+
+/// When the per-turn claim pipeline runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimPipelineConfig {
+    /// Quiet period after a turn ends before its thread is extracted.
+    pub debounce_seconds: u64,
+    /// A thread idle this long has its provisional claims settled.
+    pub settle_minutes: u64,
+}
+
+impl Default for ClaimPipelineConfig {
+    fn default() -> Self {
+        Self {
+            debounce_seconds: 120,
+            settle_minutes: 30,
         }
     }
 }
@@ -142,6 +163,9 @@ pub struct AntflyTomlSettings {
     pub knowledge_graph: Option<bool>,
     pub extract_model: Option<String>,
     pub supersede_threshold: Option<f64>,
+    pub claim_extraction: Option<bool>,
+    pub claim_debounce_seconds: Option<u64>,
+    pub claim_settle_minutes: Option<u64>,
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -228,6 +252,17 @@ impl AntflyConfig {
                     settings.supersede_threshold,
                     default.supersede_threshold_bp,
                 )?,
+                claims: (settings.claim_extraction != Some(false)).then(|| {
+                    let default = ClaimPipelineConfig::default();
+                    ClaimPipelineConfig {
+                        debounce_seconds: settings
+                            .claim_debounce_seconds
+                            .unwrap_or(default.debounce_seconds),
+                        settle_minutes: settings
+                            .claim_settle_minutes
+                            .unwrap_or(default.settle_minutes),
+                    }
+                }),
             })
         };
         Ok(Self {

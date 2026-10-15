@@ -613,6 +613,15 @@ pub struct AntflyStoreToml {
     /// Minimum decide-model probability before a new claim supersedes an
     /// earlier one (default 0.8).
     pub supersede_threshold: Option<f64>,
+    /// Extract claims from finished turns with the memory extraction model
+    /// (default `true` when the knowledge graph is on).
+    pub claim_extraction: Option<bool>,
+    /// Quiet period after a turn before its claims are extracted (default
+    /// 120 seconds).
+    pub claim_debounce_seconds: Option<u64>,
+    /// Idle time after which a thread's provisional claims are settled
+    /// (default 30 minutes).
+    pub claim_settle_minutes: Option<u64>,
 }
 
 /// Local typed-decision review of approval requests.

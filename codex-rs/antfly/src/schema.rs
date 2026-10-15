@@ -532,6 +532,24 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         revision TEXT NOT NULL,
         last_published_turn TEXT
     )"],
+}, Migration {
+    version: 23,
+    name: "per-turn claim extraction progress",
+    // One row per thread the claim pipeline has seen. `next_ordinal` is the
+    // first history ordinal not yet extracted; claims below
+    // `settled_ordinal` have been settled. The lease keeps two processes off
+    // one thread; failures back off through `retry_at_ms`.
+    statements: &["CREATE TABLE IF NOT EXISTS codex_claim_progress (
+        thread_id TEXT PRIMARY KEY,
+        next_ordinal BIGINT NOT NULL DEFAULT 0,
+        settled_ordinal BIGINT NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_until_ms BIGINT,
+        failures BIGINT NOT NULL DEFAULT 0,
+        retry_at_ms BIGINT,
+        last_error TEXT,
+        updated_at_ms BIGINT NOT NULL
+    )"],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

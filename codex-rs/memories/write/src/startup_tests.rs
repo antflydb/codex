@@ -1002,7 +1002,7 @@ async fn run_memory_phase_one_model_request_test(
         assert!(outputs[0].rollout_summary.len() < 10_000);
         assert_eq!(
             request.body_json()["text"]["format"]["schema"]["required"],
-            serde_json::json!(["rollout_summary", "rollout_slug", "claims"])
+            serde_json::json!(["rollout_summary", "rollout_slug"])
         );
     }
     shutdown_test_codex(&test).await?;
