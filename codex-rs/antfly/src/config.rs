@@ -58,6 +58,8 @@ pub struct KnowledgeConfig {
     pub supersede_threshold_bp: u32,
     /// Per-turn claim extraction; `None` turns it off.
     pub claims: Option<ClaimPipelineConfig>,
+    /// Concept names to merge, as `(alias, canonical name)`.
+    pub concept_aliases: Vec<(String, String)>,
 }
 
 impl Default for KnowledgeConfig {
@@ -66,6 +68,7 @@ impl Default for KnowledgeConfig {
             extract_model: DEFAULT_EXTRACT_MODEL.to_string(),
             supersede_threshold_bp: 8_000,
             claims: Some(ClaimPipelineConfig::default()),
+            concept_aliases: Vec::new(),
         }
     }
 }
@@ -166,6 +169,7 @@ pub struct AntflyTomlSettings {
     pub claim_extraction: Option<bool>,
     pub claim_debounce_seconds: Option<u64>,
     pub claim_settle_minutes: Option<u64>,
+    pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -252,6 +256,12 @@ impl AntflyConfig {
                     settings.supersede_threshold,
                     default.supersede_threshold_bp,
                 )?,
+                concept_aliases: settings
+                    .concept_aliases
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
                 claims: (settings.claim_extraction != Some(false)).then(|| {
                     let default = ClaimPipelineConfig::default();
                     ClaimPipelineConfig {

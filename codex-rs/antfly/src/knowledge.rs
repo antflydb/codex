@@ -41,9 +41,16 @@ use crate::backend::GraphIndex;
 use crate::schema;
 
 pub const CONCEPT_GRAPH_PREFIX: &str = "codex_concepts";
-pub const CLAIM_LINKS_INDEX: &str = "codex_claim_links";
+/// Field-derived claim-to-claim edges. Versioned so a change of edge types
+/// replaces the index in place (`replaces_prefix`).
+pub const CLAIM_LINKS_INDEX: &str = "codex_claim_links_v2";
+const CLAIM_LINKS_PREFIX: &str = "codex_claim_links";
 pub const ABOUT_EDGE: &str = "about";
 pub const SUPERSEDES_EDGE: &str = "supersedes";
+/// A rationale (or lesson, constraint) motivates the decision it explains.
+pub const MOTIVATES_EDGE: &str = "motivates";
+/// An alternative was rejected in favor of the decision chosen instead.
+pub const REJECTED_IN_FAVOR_OF_EDGE: &str = "rejected_in_favor_of";
 /// Name of the concept resolver declared inline by every concept graph.
 pub const CONCEPT_RESOLVER: &str = "concepts";
 /// Query text sent to query-time resolution; the configured extractor
@@ -161,7 +168,10 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
             "source_artifact": artifact,
             "resolution_artifact": format!("{name}_resolution"),
             // Label-free keys: a per-mention label guess in the key would
-            // split one idea into several nodes.
+            // split one idea into several nodes. `uslug` would keep non-ASCII
+            // names distinct, but switching needs an in-place graph upgrade,
+            // which Antfly refuses for graphs with inline resolvers
+            // (antflydb/antfly#1144).
             "key_template": "concept/{{ slug _entity.text }}",
             "min_confidence": 0.5,
             "config_generation": 1,
@@ -177,8 +187,12 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
 pub(crate) fn claim_links_index() -> GraphIndex {
     GraphIndex {
         name: CLAIM_LINKS_INDEX.to_string(),
-        config: json!({"edge_types": [{"name": SUPERSEDES_EDGE, "field": "supersedes"}]}),
-        replaces_prefix: "",
+        config: json!({"edge_types": [
+            {"name": SUPERSEDES_EDGE, "field": "supersedes"},
+            {"name": MOTIVATES_EDGE, "field": "motivates"},
+            {"name": REJECTED_IN_FAVOR_OF_EDGE, "field": "rejected_in_favor_of"},
+        ]}),
+        replaces_prefix: CLAIM_LINKS_PREFIX,
     }
 }
 
@@ -225,6 +239,56 @@ pub fn concept_key(text: &str) -> Option<String> {
     (!out.is_empty()).then(|| format!("{CONCEPT_PREFIX}{out}"))
 }
 
+/// Minimum name similarity for a concept-merge candidate: a neighbor's
+/// search score divided by the concept's own score. Queries and stored names
+/// are embedded with different roles, so even a name scores below 1.0
+/// against itself and raw scores are not comparable across names. On
+/// `tests/fixtures/knowledge_eval/concept_pairs.jsonl`, true synonyms score
+/// 0.82–0.97, except abbreviations such as "KG" (0.73; configure those as
+/// aliases), while hard negatives reach 0.91 ("PageRank" and "Personalized
+/// PageRank"). The floor only decides which pairs a model judges.
+pub const CONCEPT_SIMILARITY_FLOOR: f64 = 0.80;
+
+/// A concept promoted into [`schema::CONCEPTS`] by the resolver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Concept {
+    pub key: String,
+    pub name: String,
+    pub entity_type: Option<String>,
+}
+
+/// A name's lexical identity: its alphanumeric runs lowercased, each with a
+/// plural `s` dropped, joined without separators. "ThreadStore", "thread
+/// store" and "thread-stores" share one; digits are kept, so versions never
+/// do.
+pub fn concept_identity(name: &str) -> String {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            let lower = token.to_lowercase();
+            match lower.strip_suffix('s') {
+                Some(stem)
+                    if stem.chars().count() >= 3
+                        && !stem.ends_with('s')
+                        && stem.chars().all(char::is_alphabetic) =>
+                {
+                    stem.to_string()
+                }
+                _ => lower,
+            }
+        })
+        .collect()
+}
+
+/// The number runs in `name` ("Qwen3" → `["3"]`, "GLiNER 2.5" → `["2",
+/// "5"]`). Names with different numbers name different versions or parts.
+pub fn number_tokens(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// What a claim asserts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +299,8 @@ pub enum ClaimKind {
     Lesson,
     Constraint,
     OpenQuestion,
+    /// An option considered and not chosen.
+    Alternative,
 }
 
 impl ClaimKind {
@@ -246,6 +312,7 @@ impl ClaimKind {
             ClaimKind::Lesson => "lesson",
             ClaimKind::Constraint => "constraint",
             ClaimKind::OpenQuestion => "open_question",
+            ClaimKind::Alternative => "alternative",
         }
     }
 }
@@ -269,6 +336,18 @@ pub struct TurnClaim {
     pub turn_ordinal: u64,
     /// Ids of the thread's current claims this one replaces.
     pub replaces: Vec<String>,
+    /// Decisions this claim explains (for rationale, lessons, constraints).
+    pub motivates: Vec<ClaimRef>,
+    /// Decisions chosen instead of this alternative.
+    pub rejected_in_favor_of: Vec<ClaimRef>,
+}
+
+/// A claim a new claim links to: an existing one, or another claim of the
+/// same batch by its position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimRef {
+    Existing(String),
+    New(usize),
 }
 
 /// Claims extracted from a batch of a thread's turns.
@@ -301,6 +380,12 @@ pub struct Claim {
     pub supersedes: Vec<String>,
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Decisions this claim explains.
+    #[serde(default)]
+    pub motivates: Vec<String>,
+    /// Decisions chosen instead of this alternative.
+    #[serde(default)]
+    pub rejected_in_favor_of: Vec<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
     #[serde(default)]
@@ -336,6 +421,10 @@ pub struct RelatedClaim {
     /// Shared concepts that led here, as concept keys.
     pub concepts: Vec<String>,
     pub score: f64,
+    /// Current claims that explain this one (`motivates` edges into it).
+    pub motivated_by: Vec<Claim>,
+    /// Alternatives rejected in favor of this one.
+    pub alternatives: Vec<Claim>,
 }
 
 /// A memory note found by [`Knowledge::related`].
@@ -501,12 +590,16 @@ impl Knowledge<'_> {
                 }
             }
         }
+        let thread_ids: BTreeSet<String> = existing.iter().map(|claim| claim.id.clone()).collect();
         let mut current: BTreeMap<String, Claim> = existing
             .into_iter()
             .filter(|claim| claim.status == ClaimStatus::Current)
             .map(|claim| (claim.id.clone(), claim))
             .collect();
         let prefix = claim_prefix(TURN_CLAIMS_VERSION, &batch.thread_id);
+        // Batch position → record index, and each record's unresolved links.
+        let mut positions: Vec<Option<usize>> = Vec::with_capacity(batch.claims.len());
+        let mut links: Vec<(Vec<ClaimRef>, Vec<ClaimRef>)> = Vec::new();
         let generated_at_ms = now_ms();
         let mut per_turn: BTreeMap<u64, usize> = BTreeMap::new();
         let mut records = Vec::with_capacity(batch.claims.len());
@@ -514,8 +607,11 @@ impl Knowledge<'_> {
         for claim in batch.claims {
             let statement = claim.statement.trim().to_string();
             if statement.is_empty() {
+                positions.push(None);
                 continue;
             }
+            positions.push(Some(records.len()));
+            links.push((claim.motivates, claim.rejected_in_favor_of));
             let index = per_turn.entry(claim.turn_ordinal).or_default();
             let id = format!(
                 "{prefix}{}:{:03}",
@@ -544,10 +640,39 @@ impl Knowledge<'_> {
                 generated_at_ms,
                 supersedes,
                 superseded_by: None,
+                motivates: Vec::new(),
+                rejected_in_favor_of: Vec::new(),
                 turn_id: claim.turn_id,
                 turn_ordinal: Some(claim.turn_ordinal),
                 settled: false,
             });
+        }
+        let resolve = |records: &[Claim], own: usize, refs: Vec<ClaimRef>| -> Vec<String> {
+            let mut ids = Vec::new();
+            for target in refs {
+                let id = match target {
+                    ClaimRef::Existing(id) if thread_ids.contains(&id) => Some(id),
+                    ClaimRef::Existing(_) => None,
+                    ClaimRef::New(position) => positions
+                        .get(position)
+                        .copied()
+                        .flatten()
+                        .filter(|index| *index != own)
+                        .map(|index| records[index].id.clone()),
+                };
+                if let Some(id) = id
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        for (index, (motivates, rejected)) in links.into_iter().enumerate() {
+            let motivates = resolve(&records, index, motivates);
+            let rejected = resolve(&records, index, rejected);
+            records[index].motivates = motivates;
+            records[index].rejected_in_favor_of = rejected;
         }
         for retracted in batch.retracts {
             if let Some(mut earlier) = current.remove(&retracted) {
@@ -653,6 +778,123 @@ impl Knowledge<'_> {
             }
         }
         documents.write(deletes).await
+    }
+
+    /// Every promoted concept.
+    pub async fn concepts(&self) -> AntflyResult<Vec<Concept>> {
+        Ok(self
+            .antfly
+            .documents(schema::CONCEPTS)
+            .scan(ScanRequest::prefix(CONCEPT_PREFIX))
+            .await?
+            .into_iter()
+            .filter_map(|document| concept_from(document.key, &document.doc))
+            .collect())
+    }
+
+    /// Concepts whose names are semantically nearest to `name`, with their
+    /// similarity scores, most similar first.
+    pub async fn concept_neighbors(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> AntflyResult<Vec<(Concept, f64)>> {
+        Ok(self
+            .antfly
+            .documents(schema::CONCEPTS)
+            .nearest(name, limit)
+            .await?
+            .into_iter()
+            .filter_map(|hit| {
+                let score = hit.score;
+                concept_from(hit.key, hit.doc.as_ref()?).map(|concept| (concept, score))
+            })
+            .collect())
+    }
+
+    /// Merges concept `from` into `to` in every table with a concept graph,
+    /// so later and replayed mentions resolve to `to`. `false` when the
+    /// backend cannot merge.
+    pub async fn merge_concept(&self, from: &str, to: &str) -> AntflyResult<bool> {
+        let mut merged = true;
+        for table in [schema::KNOWLEDGE, schema::MEMORY_NOTES] {
+            merged &= self
+                .antfly
+                .documents(table)
+                .merge_resolver_keys(CONCEPT_RESOLVER, from, to)
+                .await?;
+        }
+        Ok(merged)
+    }
+
+    /// The concept key the resolver gives `name`, following aliases and
+    /// merges. `None` when the backend cannot render keys.
+    pub async fn concept_key_for(&self, name: &str) -> AntflyResult<Option<String>> {
+        self.antfly
+            .documents(schema::KNOWLEDGE)
+            .render_resolver_key(CONCEPT_RESOLVER, json!({"text": name, "label": "concept"}))
+            .await
+    }
+
+    /// Keys of concepts the consolidation pass has already examined.
+    pub async fn reviewed_concepts(&self) -> AntflyResult<BTreeSet<String>> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_all("SELECT key FROM codex_concept_reviews", vec![])
+            .await?
+            .iter()
+            .filter_map(|row| row.string("key").ok())
+            .collect())
+    }
+
+    /// An examined, unmerged concept with the same lexical identity as
+    /// `concept`, other than `concept` itself.
+    pub async fn lexical_twin(&self, concept: &Concept) -> AntflyResult<Option<String>> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_optional(
+                "SELECT key FROM codex_concept_reviews \
+                 WHERE identity = $1 AND merged_into IS NULL AND key <> $2 \
+                 ORDER BY key LIMIT 1",
+                crate::sql_params![concept_identity(&concept.name), concept.key.clone()],
+            )
+            .await?
+            .and_then(|row| row.string("key").ok()))
+    }
+
+    /// Whether `key` has been examined and was not merged away.
+    pub async fn is_canonical_concept(&self, key: &str) -> AntflyResult<bool> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_optional(
+                "SELECT key FROM codex_concept_reviews WHERE key = $1 AND merged_into IS NULL",
+                crate::sql_params![key],
+            )
+            .await?
+            .is_some())
+    }
+
+    /// Records that `concept` was examined, and what it was merged into.
+    pub async fn record_concept_review(
+        &self,
+        concept: &Concept,
+        merged_into: Option<&str>,
+    ) -> AntflyResult<()> {
+        let sql = self.antfly.sql().await?;
+        sql.execute(
+            "INSERT INTO codex_concept_reviews (key, identity, merged_into, reviewed_at_ms) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (key) DO UPDATE SET \
+             identity = excluded.identity, merged_into = excluded.merged_into, \
+             reviewed_at_ms = excluded.reviewed_at_ms",
+            crate::sql_params![
+                concept.key.clone(),
+                concept_identity(&concept.name),
+                merged_into.map(str::to_string),
+                now_ms()
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn get(&self, id: &str) -> AntflyResult<Option<Claim>> {
@@ -878,6 +1120,62 @@ impl Knowledge<'_> {
             .collect()
     }
 
+    /// Fills each claim's rationale and rejected alternatives from the
+    /// claim links graph. Failures leave them empty.
+    async fn attach_links(&self, claims: &mut [RelatedClaim]) {
+        let keys: Vec<String> = claims.iter().map(|found| found.claim.id.clone()).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let documents = self.antfly.documents(schema::KNOWLEDGE);
+        let index = match documents.serving_graph(CLAIM_LINKS_INDEX).await {
+            Ok(index) => index,
+            Err(err) => {
+                tracing::warn!("antfly: claim links lookup failed: {err}");
+                return;
+            }
+        };
+        let request = json!({
+            "graph_queries": {"links": {"index": index, "traverse": {
+                "start": {"keys": keys},
+                "direction": "in",
+                "edge_types": [MOTIVATES_EDGE, REJECTED_IN_FAVOR_OF_EDGE],
+                "max_depth": 1,
+                "include_documents": true, "include_paths": true,
+                "deduplicate_nodes": false, "limit": 200,
+            }}},
+            "limit": 1,
+        });
+        let response = match documents.query(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("antfly: claim links traversal failed: {err}");
+                return;
+            }
+        };
+        for node in reached_nodes(&response, "links") {
+            let Some(linked) = node.doc.and_then(|doc| Claim::from_doc(&node.key, doc)) else {
+                continue;
+            };
+            if linked.status != ClaimStatus::Current {
+                continue;
+            }
+            let Some(target) = claims.iter_mut().find(|found| found.claim.id == node.from) else {
+                continue;
+            };
+            let list = if linked.rejected_in_favor_of.contains(&node.from) {
+                &mut target.alternatives
+            } else if linked.motivates.contains(&node.from) {
+                &mut target.motivated_by
+            } else {
+                continue;
+            };
+            if !list.iter().any(|claim| claim.id == linked.id) {
+                list.push(linked);
+            }
+        }
+    }
+
     /// Personalized PageRank scores in `table`, seeded at `seeds` and
     /// walking edges both ways. Empty when the metric is unavailable.
     async fn ppr_scores(
@@ -998,6 +1296,8 @@ impl Knowledge<'_> {
                     score: weight * rank_score(&ppr, &key, concepts.len(), direct),
                     claim,
                     concepts,
+                    motivated_by: Vec::new(),
+                    alternatives: Vec::new(),
                 }
             })
             .collect();
@@ -1009,6 +1309,7 @@ impl Knowledge<'_> {
             )
         });
         claims.truncate(limit);
+        self.attach_links(&mut claims).await;
 
         let note_ppr = self
             .ppr_scores(schema::MEMORY_NOTES, &seeds, limit * 8)
@@ -1084,6 +1385,18 @@ fn replaces_earlier(probabilities: &HashMap<String, f64>, threshold_bp: u32) -> 
         .map(|(value, _)| value.as_str());
     let replacing = p("same") + p("updates");
     matches!(top, Some("same" | "updates")) && replacing * 10_000.0 >= f64::from(threshold_bp)
+}
+
+fn concept_from(key: String, doc: &Value) -> Option<Concept> {
+    let name = doc.get("canonical_name")?.as_str()?.to_string();
+    Some(Concept {
+        key,
+        name,
+        entity_type: doc
+            .get("entity_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// Personalized PageRank when it ran, else the count of shared concepts;
@@ -1162,6 +1475,31 @@ mod tests {
         // A different fact about the same subject never replaces.
         assert_eq!(decide(response(0.30, 0.25, 0.42)), Some(false));
         assert_eq!(decide(json!({"answers": []})), None);
+    }
+
+    #[test]
+    fn lexical_identity_and_numbers_separate_variants_from_versions() {
+        for (a, b) in [
+            ("ThreadStore", "thread store"),
+            ("approvals reviewer", "approval reviewer"),
+            ("app-server", "app server"),
+            ("knowledge-graph", "Knowledge Graph"),
+            ("agents", "agent"),
+        ] {
+            assert_eq!(concept_identity(a), concept_identity(b), "{a} ~ {b}");
+        }
+        for (a, b) in [
+            ("Qwen3", "Qwen2"),
+            ("EmbeddingGemma 2", "EmbeddingGemma"),
+            ("Antfly", "Antfarm"),
+            ("process", "proces"),
+            ("status", "stat"),
+        ] {
+            assert_ne!(concept_identity(a), concept_identity(b), "{a} ~ {b}");
+        }
+        assert_eq!(number_tokens("GLiNER 2.5"), vec!["2", "5"]);
+        assert_eq!(number_tokens("Qwen3 Embedding"), vec!["3"]);
+        assert!(number_tokens("Antfly").is_empty());
     }
 
     #[test]

@@ -2596,6 +2596,7 @@ fn thread_store_config(
                 claim_extraction: antfly.claim_extraction,
                 claim_debounce_seconds: antfly.claim_debounce_seconds,
                 claim_settle_minutes: antfly.claim_settle_minutes,
+                concept_aliases: antfly.concept_aliases,
             })
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())

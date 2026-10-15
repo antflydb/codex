@@ -143,7 +143,9 @@ fn search_spec() -> ToolSpec {
             user preferences, lessons, constraints and open questions, plus related memory notes. \
             Results are linked by shared concepts and only current claims are returned unless \
             include_history is set. Each claim names the thread (and turn) it came from; claims \
-            marked provisional come from a session that is still active and may still change."
+            marked provisional come from a session that is still active and may still change. \
+            Decisions include the rationale that motivated them and the alternatives rejected in \
+            their favor, when known."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -239,6 +241,18 @@ fn render(related: &codex_antfly::knowledge::Related) -> Value {
             if !claim.settled {
                 out["provisional"] = json!(true);
             }
+            let brief = |claims: &[codex_antfly::knowledge::Claim]| {
+                claims
+                    .iter()
+                    .map(|claim| json!({"id": claim.id, "kind": claim.kind.as_str(), "statement": claim.statement}))
+                    .collect::<Vec<_>>()
+            };
+            if !found.motivated_by.is_empty() {
+                out["motivated_by"] = json!(brief(&found.motivated_by));
+            }
+            if !found.alternatives.is_empty() {
+                out["rejected_alternatives"] = json!(brief(&found.alternatives));
+            }
             out
         }).collect::<Vec<_>>(),
         "notes": related.notes.iter().map(|note| json!({
@@ -277,12 +291,33 @@ mod tests {
                     generated_at_ms: 2,
                     supersedes: vec!["v2:s:0000".to_string()],
                     superseded_by: None,
+                    motivates: Vec::new(),
+                    rejected_in_favor_of: Vec::new(),
                     turn_id: Some("turn-1".to_string()),
                     turn_ordinal: Some(4),
                     settled: false,
                 },
                 concepts: vec!["concept/embeddinggemma_2".to_string()],
                 score: 1.0,
+                motivated_by: vec![Claim {
+                    id: "turns:t:4:001".to_string(),
+                    kind: ClaimKind::Rationale,
+                    statement: "Antfly detects its dimensions.".to_string(),
+                    status: ClaimStatus::Current,
+                    thread_id: "t".to_string(),
+                    version: "turns".to_string(),
+                    cwd: None,
+                    source_updated_at_ms: 1,
+                    generated_at_ms: 2,
+                    supersedes: Vec::new(),
+                    superseded_by: None,
+                    motivates: vec!["v2:t:0000".to_string()],
+                    rejected_in_favor_of: Vec::new(),
+                    turn_id: None,
+                    turn_ordinal: None,
+                    settled: true,
+                }],
+                alternatives: Vec::new(),
             }],
             notes: vec![RelatedNote {
                 namespace: "memories".to_string(),
@@ -306,6 +341,7 @@ mod tests {
                     "supersedes": ["v2:s:0000"],
                     "turn_id": "turn-1",
                     "provisional": true,
+                    "motivated_by": [{"id": "turns:t:4:001", "kind": "rationale", "statement": "Antfly detects its dimensions."}],
                 }],
                 "notes": [{
                     "namespace": "memories",

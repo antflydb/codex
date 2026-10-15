@@ -622,6 +622,9 @@ pub struct AntflyStoreToml {
     /// Idle time after which a thread's provisional claims are settled
     /// (default 30 minutes).
     pub claim_settle_minutes: Option<u64>,
+    /// Concept names to merge in the knowledge graph, as `alias = "canonical
+    /// name"` (for example `KG = "knowledge graph"`).
+    pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Local typed-decision review of approval requests.

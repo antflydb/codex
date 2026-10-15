@@ -1,0 +1,27 @@
+{
+ "schema_version": 2,
+ "model": "fastino/gliner2.5-base-v1",
+ "options": {
+  "threshold": 0.5,
+  "long_document": {
+   "mode": "window",
+   "window_words": 256,
+   "overlap_words": 32
+  }
+ },
+ "schema": {
+  "entities": [
+   "concept",
+   "technology",
+   "tool",
+   "project",
+   "organization",
+   "person",
+   "goal",
+   "problem",
+   "practice",
+   "constraint",
+   "metric"
+  ]
+ }
+}

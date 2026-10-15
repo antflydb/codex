@@ -105,6 +105,30 @@ pub trait Backend: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Durably redirects `resolver`'s identity `from` to `to` (both rendered
+    /// keys) and replays affected extractions in the background. `false`
+    /// when the backend cannot merge keys.
+    fn merge_resolver_keys(
+        &self,
+        _table: String,
+        _resolver: String,
+        _from: String,
+        _to: String,
+    ) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// The canonical key `resolver` gives `mention` (`{"text", "label"}`),
+    /// following aliases and merges. `None` when the backend cannot render.
+    fn render_resolver_key(
+        &self,
+        _table: String,
+        _resolver: String,
+        _mention: Value,
+    ) -> BackendFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// The in-process database handle, when there is one. Relational SQL
     /// shares it so its connections never contend with this backend for the
     /// file's writer lease.

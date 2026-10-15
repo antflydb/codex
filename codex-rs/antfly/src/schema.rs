@@ -60,6 +60,8 @@ pub struct DocumentTable {
     /// `document_schemas` properties, as JSON Schema property definitions.
     pub fields: &'static [(&'static str, &'static str)],
     pub graphs: &'static [TableGraph],
+    /// Field the dense index embeds, when not `search_text`.
+    pub dense_field: Option<&'static str>,
 }
 
 pub const DOCUMENT_TABLES: &[DocumentTable] = &[
@@ -73,6 +75,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("created_at_ms", "integer"),
         ],
         graphs: &[],
+        dense_field: None,
     },
     DocumentTable {
         name: APPROVALS,
@@ -87,6 +90,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("decided_at_ms", "integer"),
         ],
         graphs: &[],
+        dense_field: None,
     },
     DocumentTable {
         name: MEMORY_NOTES,
@@ -96,6 +100,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("updated_at_ms", "integer"),
         ],
         graphs: &[TableGraph::Concepts],
+        dense_field: None,
     },
     DocumentTable {
         name: KNOWLEDGE,
@@ -108,6 +113,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("generated_at_ms", "integer"),
         ],
         graphs: &[TableGraph::Concepts, TableGraph::ClaimLinks],
+        dense_field: None,
     },
     // Promotion target of the concept resolver. It must exist before any
     // extraction runs: Lite promotion aborts the batch on a missing table.
@@ -115,10 +121,22 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
         name: CONCEPTS,
         fields: &[("canonical_name", "string"), ("entity_type", "string")],
         graphs: &[],
+        // Nearest-name lookup for concept merging.
+        dense_field: Some("canonical_name"),
     },
 ];
 
 impl DocumentTable {
+    /// The declared table named `name`.
+    pub fn named(name: &str) -> Option<&'static DocumentTable> {
+        DOCUMENT_TABLES.iter().find(|table| table.name == name)
+    }
+
+    /// Field the table's dense index embeds.
+    pub fn dense_field(&self) -> &'static str {
+        self.dense_field.unwrap_or(crate::SEARCH_TEXT_FIELD)
+    }
+
     /// `antfly_db_create_table_json` / `POST /tables/{name}` schema.
     pub fn schema_json(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
@@ -550,6 +568,21 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         last_error TEXT,
         updated_at_ms BIGINT NOT NULL
     )"],
+}, Migration {
+    version: 24,
+    name: "concept consolidation reviews",
+    // One row per promoted concept the consolidation pass has examined.
+    // `identity` is its lexical identity (see `knowledge::concept_identity`);
+    // `merged_into` is set when the concept was merged into another.
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS codex_concept_reviews (
+            key TEXT PRIMARY KEY,
+            identity TEXT NOT NULL,
+            merged_into TEXT,
+            reviewed_at_ms BIGINT NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS codex_concept_reviews_identity ON codex_concept_reviews (identity)",
+    ],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

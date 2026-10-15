@@ -285,6 +285,8 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
             turn_id: Some("turn-1".to_string()),
             turn_ordinal: 0,
             replaces: Vec::new(),
+            motivates: Vec::new(),
+            rejected_in_favor_of: Vec::new(),
         };
         let batch = |thread: &str, at: i64, claims: Vec<TurnClaim>| TurnClaimBatch {
             thread_id: thread.to_string(),
@@ -538,6 +540,8 @@ fn turn_claims_replace_retract_and_track_progress() -> Result<(), Box<dyn std::e
             turn_id: Some(format!("turn-{ordinal}")),
             turn_ordinal: ordinal,
             replaces,
+            motivates: Vec::new(),
+            rejected_in_favor_of: Vec::new(),
         };
         let batch = |claims: Vec<TurnClaim>, retracts: Vec<String>| TurnClaimBatch {
             thread_id: "thread-a".to_string(),
@@ -699,6 +703,206 @@ fn supersession_collapses_restatements_but_keeps_distinct_facts()
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn decisions_carry_their_rationale_and_rejected_alternatives()
+-> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::knowledge::ClaimKind;
+    use codex_antfly::knowledge::ClaimRef;
+    use codex_antfly::knowledge::TurnClaim;
+    use codex_antfly::knowledge::TurnClaimBatch;
+    if !has_models("fastino") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let claim = |kind: ClaimKind, statement: &str, motivates: Vec<ClaimRef>, rejected: Vec<ClaimRef>| TurnClaim {
+            kind,
+            statement: statement.to_string(),
+            turn_id: Some("turn-1".to_string()),
+            turn_ordinal: 4,
+            replaces: Vec::new(),
+            motivates,
+            rejected_in_favor_of: rejected,
+        };
+        let recorded = knowledge
+            .append_turn_claims(TurnClaimBatch {
+                thread_id: "thread-links".to_string(),
+                cwd: None,
+                source_updated_at_ms: 1,
+                claims: vec![
+                    claim(ClaimKind::Decision, "The Codex Antfly importer writes 1,024 history items per batch.", Vec::new(), Vec::new()),
+                    claim(ClaimKind::Rationale, "Larger Codex import batches are possible because Antfly lifted its 2 MiB transaction limit.", vec![ClaimRef::New(0)], Vec::new()),
+                    claim(ClaimKind::Alternative, "Keeping 256-item Codex import batches was considered and rejected.", Vec::new(), vec![ClaimRef::New(0)]),
+                    claim(ClaimKind::Lesson, "A link to itself or another thread is dropped.", vec![ClaimRef::New(3), ClaimRef::Existing("turns:other:x:000".to_string())], Vec::new()),
+                ],
+                retracts: Vec::new(),
+            })
+            .await?;
+        let decision = recorded[0].id.clone();
+        assert_eq!(recorded[1].motivates, vec![decision.clone()]);
+        assert_eq!(recorded[2].rejected_in_favor_of, vec![decision.clone()]);
+        assert!(recorded[3].motivates.is_empty());
+        let mut found = None;
+        for _ in 0..150 {
+            let related = knowledge.related("How many history items per Codex import batch?", 5, false).await?;
+            if let Some(hit) = related.claims.into_iter().find(|hit| hit.claim.id == decision)
+                && !hit.motivated_by.is_empty()
+                && !hit.alternatives.is_empty()
+            {
+                found = Some(hit);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let hit = found.ok_or("decision without its links")?;
+        assert_eq!(hit.motivated_by.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![recorded[1].id.clone()]);
+        assert_eq!(hit.alternatives.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![recorded[2].id.clone()]);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+/// Precision and recall of supersession and of the concept-merge gates on
+/// `tests/fixtures/knowledge_eval`. Opt-in (needs models, prints a report):
+/// `cargo test -p codex-antfly --test embedded knowledge_eval -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn knowledge_eval() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::knowledge::CONCEPT_SIMILARITY_FLOOR;
+    use codex_antfly::knowledge::concept_identity;
+    use codex_antfly::knowledge::number_tokens;
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/knowledge_eval");
+    let read = |name: &str| -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        Ok(std::fs::read_to_string(fixtures.join(name))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?)
+    };
+    let supersession = read("supersession.jsonl")?;
+    let pairs = read("concept_pairs.jsonl")?;
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, true);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let (mut tp, mut fp, mut fn_) = (0_usize, 0_usize, 0_usize);
+        for case in &supersession {
+            let earlier = case["earlier"].as_str().unwrap_or_default();
+            let later = case["later"].as_str().unwrap_or_default();
+            let expected = case["replaces"].as_bool().unwrap_or_default();
+            let got = knowledge.supersedes(earlier, later).await?;
+            match (got, expected) {
+                (true, true) => tp += 1,
+                (true, false) => { fp += 1; println!("  false supersession: {earlier:?} -> {later:?}"); }
+                (false, true) => { fn_ += 1; println!("  missed supersession: {earlier:?} -> {later:?}"); }
+                (false, false) => {}
+            }
+        }
+        println!("supersession: precision {:.2} recall {:.2} ({tp} tp, {fp} fp, {fn_} fn)",
+            tp as f64 / (tp + fp).max(1) as f64, tp as f64 / (tp + fn_).max(1) as f64);
+
+        let concepts = antfly.documents(schema::CONCEPTS);
+        let mut names: Vec<String> = pairs.iter()
+            .flat_map(|pair| [pair["a"].as_str().unwrap_or_default().to_string(), pair["b"].as_str().unwrap_or_default().to_string()])
+            .collect();
+        names.sort();
+        names.dedup();
+        concepts.write(names.iter().map(|name| Write::put(format!("concept/{name}"), json!({"canonical_name": name}))).collect()).await?;
+        for _ in 0..200 {
+            if concepts.nearest(&names[0], names.len()).await?.len() == names.len() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // Gate outcome per pair: merged without a model, judged, or kept apart.
+        let (mut lexical, mut judged_same, mut judged_different, mut apart_same) = (0, 0, 0, 0);
+        for pair in &pairs {
+            let a = pair["a"].as_str().unwrap_or_default();
+            let b = pair["b"].as_str().unwrap_or_default();
+            let same = pair["same"].as_bool().unwrap_or_default();
+            if concept_identity(a) == concept_identity(b) {
+                lexical += 1;
+                if !same { println!("  false lexical merge: {a:?} ~ {b:?}"); }
+                continue;
+            }
+            let hits = concepts.nearest(a, names.len()).await?;
+            let score = |name: &str| hits.iter().find(|hit| hit.key == format!("concept/{name}")).map(|hit| hit.score);
+            let similarity = score(b).zip(score(a)).map(|(pair, own)| pair / own).unwrap_or(0.0);
+            let candidate = similarity >= CONCEPT_SIMILARITY_FLOOR && number_tokens(a) == number_tokens(b);
+            match (candidate, same) {
+                (true, true) => judged_same += 1,
+                (true, false) => judged_different += 1,
+                (false, true) => { apart_same += 1; println!("  synonym kept apart ({similarity:.2}): {a:?} ~ {b:?}"); }
+                (false, false) => {}
+            }
+        }
+        let synonyms = pairs.iter().filter(|pair| pair["same"].as_bool() == Some(true)).count();
+        println!("concept gates: {lexical} lexical merges; {} pairs judged ({judged_same} synonyms, {judged_different} not); \
+                  {apart_same} synonyms kept apart; synonym recall before judgment {:.2}",
+            judged_same + judged_different,
+            (lexical + judged_same) as f64 / synonyms.max(1) as f64);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+/// Antfly refuses to replace a graph that owns an inline resolver
+/// (antflydb/antfly#1144). Setup must keep the old graph serving and the
+/// table writable instead of failing.
+#[test]
+fn refused_graph_replacement_keeps_the_old_graph_serving() -> Result<(), Box<dyn std::error::Error>>
+{
+    use codex_antfly::GraphIndex;
+    use codex_antfly::TableSpec;
+    if !has_models("fastino") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let backend = antfly.backend().await?;
+        let graph = |name: &str, template: &str| GraphIndex {
+            name: name.to_string(),
+            replaces_prefix: "kg_",
+            config: json!({
+                "source": {"artifact": format!("{name}_extraction"), "path": "$.relations[*]",
+                           "format": "extraction_relation", "mention_edge_type": "about",
+                           "edge": {"type": "{{ _item.type }}", "weight": "{{ _item.score }}"}},
+                "artifact": {"name": format!("{name}_extraction"), "kind": "asset",
+                             "source": {"type": "field", "value": "search_text"},
+                             "content_type": "application/json",
+                             "producer_json": {"type": "extractor", "config": {
+                                 "provider": "antfly", "model": codex_antfly::DEFAULT_EXTRACT_MODEL,
+                                 "schema": {"entities": ["concept","technology","tool","project","organization","person","goal","problem","practice","constraint","metric"],
+                                            "relations": [{"type":"part_of"},{"type":"alternative_to"},{"type":"uses"},{"type":"depends_on"},{"type":"replaces"},{"type":"causes"}]},
+                                 "options": {"include_confidence": true, "include_spans": true, "long_document": {"mode": "window"}}}}},
+                "edge_types": [{"name": "about"}],
+                "resolvers": [{"name": "concepts", "table": "repro_concepts",
+                               "source_artifact": format!("{name}_extraction"),
+                               "resolution_artifact": format!("{name}_resolution"),
+                               "key_template": template, "min_confidence": 0.5, "config_generation": 1}],
+            }),
+        };
+        let schema = json!({"document_schemas": {"default": {"schema": {"type": "object", "properties": {"search_text": {"type": "string"}}}}}});
+        backend.ensure_table(TableSpec { name: "repro_concepts".into(), schema: schema.clone(), dense: None, graphs: vec![] }).await?;
+        backend.ensure_table(TableSpec { name: "repro".into(), schema: schema.clone(), dense: None,
+            graphs: vec![graph("kg_v2", "concept/{{ slug _entity.text }}")] }).await?;
+        backend.write("repro".into(), vec![Write::put("d1", json!({"search_text": "Codex uses Antfly for semantic search."}))]).await?;
+        backend.ensure_table(TableSpec { name: "repro".into(), schema, dense: None,
+            graphs: vec![graph("kg_v3", "concept/{{ uslug _entity.text }}")] }).await?;
+        let serving = backend.serving_graph("repro".into(), "kg_v3".into()).await?;
+        // Antfly refuses the replacement today; accept either until it can.
+        assert!(serving == "kg_v2" || serving == "kg_v3", "{serving}");
+        backend.write("repro".into(), vec![Write::put("d2", json!({"search_text": "Still writable."}))]).await?;
+        assert!(backend.get("repro".into(), "d2".into()).await?.is_some());
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

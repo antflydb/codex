@@ -136,6 +136,8 @@ enum GraphState {
     Ready,
     /// `old` keeps serving while the replacement builds in the background.
     Replacing { old: String },
+    /// Antfly refused the replacement; `old` keeps serving.
+    Refused { old: String, error: String },
 }
 
 /// Adds `name` (replacing `stale` when given) and reports which index serves.
@@ -382,8 +384,16 @@ impl EmbeddedBackend {
                     return Ok(GraphState::Ready);
                 }
                 // Replace the newest older version; any others are dropped
-                // once the replacement has swapped in.
-                reconcile_graph(db, &name, stale.last().map(|old| old.as_str()), &config)
+                // once the replacement has swapped in. A refused replacement
+                // leaves the old version serving rather than failing setup.
+                let old = stale.last().map(|old| old.as_str());
+                match (reconcile_graph(db, &name, old, &config), old) {
+                    (Err(err), Some(old)) => Ok(GraphState::Refused {
+                        old: old.to_string(),
+                        error: err.to_string(),
+                    }),
+                    (result, _) => result,
+                }
             })
             .await?;
         let serving_key = format!("{table}:{}", graph.name);
@@ -399,6 +409,15 @@ impl EmbeddedBackend {
             GraphState::Replacing { old } => {
                 tracing::info!(
                     "antfly: graph index {} on {table} is building; {old} serves until it swaps in",
+                    graph.name
+                );
+                if let Ok(mut serving) = self.serving.lock() {
+                    serving.insert(serving_key, old);
+                }
+            }
+            GraphState::Refused { old, error } => {
+                tracing::warn!(
+                    "antfly: could not replace graph index {old} on {table} with {}; {old} keeps serving: {error}",
                     graph.name
                 );
                 if let Ok(mut serving) = self.serving.lock() {
@@ -527,8 +546,13 @@ impl Backend for EmbeddedBackend {
                     known.insert(marker);
                 }
             }
+            // Graphs serve search features; a graph that cannot be set up
+            // must not stop the table's writes.
             for graph in spec.graphs {
-                self.ensure_graph(&table, graph).await?;
+                let name = graph.name.clone();
+                if let Err(err) = self.ensure_graph(&table, graph).await {
+                    tracing::warn!("antfly: graph index {name} on {table} is unavailable: {err}");
+                }
             }
             let Some(dense) = spec.dense else {
                 return Ok(());
@@ -650,6 +674,46 @@ impl Backend for EmbeddedBackend {
                 })
                 .await?;
             Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
+    fn merge_resolver_keys(
+        &self,
+        table: String,
+        resolver: String,
+        from: String,
+        to: String,
+    ) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            let request = serde_json::to_vec(&json!({"key": from, "target": to}))?;
+            self.call_in(table, move |db| {
+                retry_busy(|| db.merge_resolver_keys_json(&resolver, &request))
+                    .map_err(embedded("merge resolver keys"))
+            })
+            .await?;
+            Ok(true)
+        })
+    }
+
+    fn render_resolver_key(
+        &self,
+        table: String,
+        resolver: String,
+        mention: Value,
+    ) -> BackendFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&mention)?;
+            let raw = self
+                .call_in(table, move |db| {
+                    retry_busy(|| db.render_resolver_key_json(&resolver, &bytes))
+                        .map_err(embedded("render resolver key"))
+                })
+                .await?;
+            let rendered: Value = serde_json::from_slice(&raw)?;
+            Ok(rendered
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_string))
         })
     }
 

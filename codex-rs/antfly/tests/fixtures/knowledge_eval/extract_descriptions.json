@@ -1,0 +1,62 @@
+{
+ "schema_version": 2,
+ "model": "fastino/gliner2.5-base-v1",
+ "options": {
+  "threshold": 0.5,
+  "long_document": {
+   "mode": "window",
+   "window_words": 256,
+   "overlap_words": 32
+  }
+ },
+ "schema": {
+  "entities": [
+   "concept",
+   "technology",
+   "tool",
+   "project",
+   "organization",
+   "person",
+   "goal",
+   "problem",
+   "practice",
+   "constraint",
+   "metric"
+  ],
+  "entity_definitions": {
+   "concept": {
+    "description": "An idea, data structure or abstraction discussed in software engineering work."
+   },
+   "technology": {
+    "description": "A named software system, library, model, database or platform."
+   },
+   "tool": {
+    "description": "A program, command, service or component used to do the work."
+   },
+   "project": {
+    "description": "A named codebase, product, repository or change such as a pull request."
+   },
+   "organization": {
+    "description": "A company, team or group."
+   },
+   "person": {
+    "description": "A named individual."
+   },
+   "goal": {
+    "description": "An outcome the work is trying to achieve."
+   },
+   "problem": {
+    "description": "A bug, failure, limitation or error encountered."
+   },
+   "practice": {
+    "description": "A way of working, process or convention."
+   },
+   "constraint": {
+    "description": "A limit or requirement that applies to the work."
+   },
+   "metric": {
+    "description": "A measured quantity, score or ranking."
+   }
+  }
+ }
+}

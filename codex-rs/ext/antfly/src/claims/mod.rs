@@ -20,6 +20,7 @@
 //! history was never extracted or whose claims were never settled (a crash,
 //! an import, a process that exited during the quiet period).
 
+mod concepts;
 mod extract;
 mod transcript;
 
@@ -70,6 +71,8 @@ const RETRY_MAX_MS: i64 = 24 * 60 * 60 * 1_000;
 const SWEEP_DELAY: Duration = Duration::from_secs(60);
 /// Threads examined per sweep.
 const SWEEP_LIMIT: usize = 16;
+/// Minimum time between concept consolidation passes on one database.
+const CONSOLIDATION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Finished turns that trigger extraction without waiting for quiet.
 const MAX_PENDING_TURNS: u32 = 4;
 
@@ -151,6 +154,7 @@ impl ClaimPipeline {
                     owner: self.owner.clone(),
                     timers: Arc::clone(&self.timers),
                     queue: sender.clone(),
+                    consolidated: Mutex::new(HashMap::new()),
                 };
                 tokio::spawn(worker.run(receiver));
                 sender
@@ -246,6 +250,18 @@ async fn sweep(
     queue: &mpsc::UnboundedSender<Job>,
     claims: &ThreadClaims,
 ) -> codex_antfly::AntflyResult<()> {
+    if let Some(knowledge) = claims.antfly.knowledge()
+        && let Some(config) = claims.antfly.config().knowledge.as_ref()
+        && !config.concept_aliases.is_empty()
+    {
+        match concepts::apply_aliases(&knowledge, &config.concept_aliases).await {
+            Ok(applied) if applied > 0 => {
+                tracing::info!("antfly: applied {applied} concept aliases")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("antfly: applying concept aliases failed: {err}"),
+        }
+    }
     let now = now_ms();
     let sources: Vec<String> = codex_rollout::INTERACTIVE_SESSION_SOURCES
         .iter()
@@ -286,6 +302,8 @@ struct Worker {
     owner: String,
     timers: Arc<Mutex<Timers>>,
     queue: mpsc::UnboundedSender<Job>,
+    /// Last consolidation pass per database.
+    consolidated: Mutex<HashMap<usize, std::time::Instant>>,
 }
 
 /// Why a job stopped early without failing.
@@ -469,21 +487,14 @@ impl Worker {
                         .collect();
                     let cwd = job.claims.config.cwd.as_path().display().to_string();
                     let request = extract::request(Some(&cwd), &current, &evidence);
-                    let thread_manager = self.thread_manager.upgrade().ok_or(Stop::NoHost)?;
-                    let (host_id, host) = self
-                        .host(&thread_manager, &job.thread_id)
-                        .await
-                        .ok_or(Stop::NoHost)?;
-                    let answer = codex_memories_write::sample_structured(
-                        thread_manager,
-                        host_id,
-                        host,
-                        &job.claims.config,
-                        extract::INSTRUCTIONS.to_string(),
-                        &request.input,
-                        extract::output_schema(),
-                    )
-                    .await?;
+                    let answer = self
+                        .sample(
+                            job,
+                            extract::INSTRUCTIONS,
+                            &request.input,
+                            extract::output_schema(),
+                        )
+                        .await?;
                     let (claims, retracts) = request.parse(&answer)?;
                     if !claims.is_empty() || !retracts.is_empty() {
                         knowledge
@@ -509,8 +520,81 @@ impl Worker {
         if job.settle {
             knowledge.settle_thread(&job.thread_id).await?;
             claim_progress::settle(antfly, &job.thread_id, &self.owner, next).await?;
+            self.consolidate_if_due(job).await;
         }
         Ok(())
+    }
+
+    /// One request to the memory extraction model, attributed to a live
+    /// thread (see [`Self::host`]).
+    async fn sample(
+        &self,
+        job: &Job,
+        instructions: &str,
+        input: &str,
+        schema: serde_json::Value,
+    ) -> Result<String, Stop> {
+        let thread_manager = self.thread_manager.upgrade().ok_or(Stop::NoHost)?;
+        let (host_id, host) = self
+            .host(&thread_manager, &job.thread_id)
+            .await
+            .ok_or(Stop::NoHost)?;
+        Ok(codex_memories_write::sample_structured(
+            thread_manager,
+            host_id,
+            host,
+            &job.claims.config,
+            instructions.to_string(),
+            input,
+            schema,
+        )
+        .await?)
+    }
+
+    /// Runs a concept consolidation pass when the last one on this database
+    /// was at least [`CONSOLIDATION_INTERVAL`] ago. Failures are logged.
+    async fn consolidate_if_due(&self, job: &Job) {
+        let key = Arc::as_ptr(&job.claims.antfly) as usize;
+        let now = std::time::Instant::now();
+        let due = self
+            .consolidated
+            .lock()
+            .map(|mut last| {
+                let due = last
+                    .get(&key)
+                    .is_none_or(|at| now.duration_since(*at) >= CONSOLIDATION_INTERVAL);
+                if due {
+                    last.insert(key, now);
+                }
+                due
+            })
+            .unwrap_or(false);
+        if !due {
+            return;
+        }
+        let Some(knowledge) = job.claims.antfly.knowledge() else {
+            return;
+        };
+        let judge = |pairs: Vec<(String, String)>| async move {
+            let count = pairs.len();
+            let answer = self
+                .sample(
+                    job,
+                    concepts::JUDGE_INSTRUCTIONS,
+                    &concepts::judge_input(&pairs),
+                    concepts::judge_schema(),
+                )
+                .await
+                .map_err(|stop| match stop {
+                    Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
+                    Stop::Failed(err) => err,
+                })?;
+            concepts::parse_judgments(&answer, count)
+        };
+        match concepts::consolidate(&knowledge, judge).await {
+            Ok(report) => tracing::info!("antfly: concept consolidation: {report:?}"),
+            Err(err) => tracing::warn!("antfly: concept consolidation failed: {err}"),
+        }
     }
 }
 

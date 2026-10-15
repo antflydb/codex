@@ -33,11 +33,17 @@ pub const SEARCH_TEXT_FIELD: &str = "search_text";
 pub(crate) const DENSE_INDEX_PREFIX: &str = "codex_search_text";
 
 /// `codex_search_text_<FNV-1a of "model[:dims]">`, stable across releases.
-fn dense_index_name(embedder: &crate::config::EmbedderConfig) -> String {
-    let identity = match embedder.dims {
+fn dense_index_name(embedder: &crate::config::EmbedderConfig, field: &str) -> String {
+    let mut identity = match embedder.dims {
         Some(dims) => format!("{}:{dims}", embedder.model),
         None => embedder.model.clone(),
     };
+    // Indexes over `search_text` keep the names they had before other
+    // fields could be embedded.
+    if field != SEARCH_TEXT_FIELD {
+        identity.push('@');
+        identity.push_str(field);
+    }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in identity.bytes() {
         hash ^= u64::from(byte);
@@ -156,10 +162,10 @@ impl Antfly {
         Arc::clone(&self.lock).lock_owned().await
     }
 
-    fn dense_index(&self) -> Option<DenseIndex> {
+    fn dense_index(&self, table: &schema::DocumentTable) -> Option<DenseIndex> {
         self.config.embedder.as_ref().map(|embedder| DenseIndex {
-            name: dense_index_name(embedder),
-            field: SEARCH_TEXT_FIELD.to_string(),
+            name: dense_index_name(embedder, table.dense_field()),
+            field: table.dense_field().to_string(),
             model: embedder.model.clone(),
             dims: embedder.dims,
         })
@@ -193,7 +199,7 @@ impl Antfly {
                         .ensure_table(TableSpec {
                             name: table.name.to_string(),
                             schema: table.schema_json(),
-                            dense: self.dense_index(),
+                            dense: self.dense_index(table),
                             graphs: self.graphs(table),
                         })
                         .await?;
@@ -367,6 +373,53 @@ impl Documents<'_> {
             .await
     }
 
+    /// See [`crate::Backend::merge_resolver_keys`].
+    pub async fn merge_resolver_keys(
+        &self,
+        resolver: &str,
+        from: &str,
+        to: &str,
+    ) -> AntflyResult<bool> {
+        self.backend()
+            .await?
+            .merge_resolver_keys(
+                self.table.to_string(),
+                resolver.to_string(),
+                from.to_string(),
+                to.to_string(),
+            )
+            .await
+    }
+
+    /// See [`crate::Backend::render_resolver_key`].
+    pub async fn render_resolver_key(
+        &self,
+        resolver: &str,
+        mention: Value,
+    ) -> AntflyResult<Option<String>> {
+        self.backend()
+            .await?
+            .render_resolver_key(self.table.to_string(), resolver.to_string(), mention)
+            .await
+    }
+
+    /// Semantic neighbors of `text` in the table's dense index, most similar
+    /// first. Empty without an embedder.
+    pub async fn nearest(&self, text: &str, limit: usize) -> AntflyResult<Vec<SearchHit>> {
+        let (Some(embedder), Some(table)) = (
+            self.antfly.config.embedder.as_ref(),
+            schema::DocumentTable::named(self.table),
+        ) else {
+            return Ok(Vec::new());
+        };
+        self.search(serde_json::json!({
+            "semantic_search": text,
+            "indexes": [dense_index_name(embedder, table.dense_field())],
+            "limit": limit,
+        }))
+        .await
+    }
+
     /// Full-text matches followed by semantic neighbors not already matched,
     /// optionally restricted by an Antfly filter query. Semantic failures
     /// degrade to full text only.
@@ -393,7 +446,7 @@ impl Documents<'_> {
         }
         let mut semantic = serde_json::json!({
             "semantic_search": text,
-            "indexes": [dense_index_name(embedder)],
+            "indexes": [dense_index_name(embedder, SEARCH_TEXT_FIELD)],
             "limit": semantic_limit,
         });
         if let Some(filter) = filter {

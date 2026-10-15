@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `2c8240e703` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `89df7aff46` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `2c8240e703` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `89df7aff46` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -373,7 +373,11 @@ Fixed in Codex during the run:
   #1135 imports 3.3× faster than its base. The resulting rows are identical
   and search works. Background enrichment now defers while writes continue
   and catches up afterwards: 11 s of index work remains when the import
-  exits. Bounding that lag under steady writes is antflydb/antfly#1139.
+  exits. #1135 also regressed commits of transactions that insert under a
+  foreign key and then delete through a subquery (`42P01` on `COMMIT`,
+  antflydb/antfly#1141, fixed by #1142). Unbounded index lag under steady
+  writes (antflydb/antfly#1139) is addressed by #1140. The pin
+  (`89df7aff46`) includes all three.
 
 Remaining gaps:
 
@@ -501,10 +505,13 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `2c8240e703`, which includes
+against Antfly 1258e8cfcb; the pin is now `89df7aff46`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
-replacement) and #1127 (NUL diagnostics, statement context in errors).
+replacement), #1127 (NUL diagnostics, statement context in errors), #1135
+(cheap SQL recovery, background maintenance outside the connection gate),
+#1142 (foreign-key commits after a refresh) and #1140 (maintenance progress
+under steady writes).
 
 ### Goal
 
@@ -712,10 +719,85 @@ weigh a claim from an unfinished session accordingly.
    the count of shared concepts. Superseded claims are dropped unless history
    is requested; superseded claims carry `superseded_by`.
 
+4. **Links.** For each returned claim, a one-hop traversal of the claim
+   links graph (`codex_claim_links_v2`, `direction: "in"`) collects the
+   current claims that `motivates` it and the alternatives
+   `rejected_in_favor_of` it.
+
 `codex-antfly-extension` contributes the tool `knowledge.search(query,
 max_results, include_history)` whenever the thread store is Antfly and the
-knowledge graph is on. It returns current claims (with thread, `cwd`,
-`supersedes` and shared concepts) and related memory notes.
+knowledge graph is on. It returns current claims (with thread, turn, `cwd`,
+`supersedes`, shared concepts, `motivated_by` and `rejected_alternatives`)
+and related memory notes.
+
+### Claim links
+
+The extractor links claims to the decisions they explain:
+
+- A `rationale`, `lesson` or `constraint` lists the decision it explains in
+  `motivates`.
+- An `alternative` (a claim kind for an option considered and not chosen)
+  lists the decision chosen instead in `rejected_in_favor_of`.
+
+Targets are existing claims of the same thread (by short id) or other claims
+in the same answer (`n1`, `n2`, … by position). `append_turn_claims` resolves
+them to claim ids and drops self-links and links to other threads. Both
+fields become field-derived edges, next to `supersedes`, in the claim links
+graph. Its name is versioned (`codex_claim_links_v2`, replacing
+`codex_claim_links` in place), so changing edge types rebuilds it without a
+gap.
+
+### Concept consolidation (synonyms)
+
+The resolver mints concept keys deterministically:
+`concept/{{ slug _entity.text }}`. So "ThreadStore" and "thread store", or
+"Antfly" and "Antfly database", start as separate concepts. Merging them was measured before it
+was built:
+
+- **Embeddings alone can't do it.** Under EmbeddingGemma 2, version siblings
+  score higher than most true synonyms: "EmbeddingGemma 2" and
+  "EmbeddingGemma" 0.986, "Qwen3" and "Qwen2" 0.957, against "Antfly" and
+  "Antfly database" 0.897. A cosine threshold in Antfly's resolver scorer
+  would merge exactly the concepts that most need to stay apart. The scorer's
+  lexical comparators can't require matching version numbers either.
+- **Laya can't do it either.** Asked whether two names refer to the same
+  thing, it rates "Antfly" and "Antfarm" 0.87 same and "Codex" and "Claude
+  Code" 0.80, about as high as true synonyms.
+
+So the resolver stays deterministic, and Codex merges afterwards through
+Antfly's durable `merge_resolver_keys`. The merge redirects the key in the
+claims and memory-notes resolvers and replays affected extractions. A
+consolidation pass (`ext/antfly/src/claims/concepts.rs`) runs after a thread
+settles, at most every 10 minutes per database. For each promoted concept it
+has not examined (`codex_concept_reviews`, migration 24):
+
+1. **Lexical identity** (`concept_identity`): alphanumeric runs lowercased,
+   plural `s` dropped, joined without separators. A concept with the same
+   identity as an examined one merges into it with no model. Digits are kept,
+   so versions never collide.
+2. **Candidates:** the nearest examined concept by name embedding (a dense
+   index on `codex_concepts.canonical_name`), with the same number tokens and
+   a self-normalized similarity of at least `CONCEPT_SIMILARITY_FLOOR` (0.80).
+   Queries and stored names are embedded with different roles, so scores are
+   divided by the concept's score against itself.
+3. **Judgment:** up to 40 candidate pairs per pass go to the memory
+   extraction model in one request (`sample_structured`). It answers `same`
+   only for synonyms, abbreviations, spellings and non-identifying
+   qualifiers, not versions, parts, kinds or sibling products.
+
+On the labelled pairs (`antfly/tests/fixtures/knowledge_eval/concept_pairs.jsonl`),
+4 pairs merge lexically and 14 reach judgment (9 synonyms, 5 hard negatives).
+Synonym recall before judgment is 0.93. The miss is the abbreviation "KG"
+(0.73); abbreviations belong in configuration:
+
+```toml
+[experimental_thread_store.concept_aliases]
+KG = "knowledge graph"
+```
+
+Aliases are rendered through the resolver (`render_resolver_key`) and merged
+during the startup sweep; applied ones render to the same key and are
+skipped.
 
 ### Memory notes
 
@@ -745,9 +827,24 @@ The label set must be this wide. Antfly serves windowed GLiNER2.5 extraction
 only inside its measured long-document profile, whose minimum padded sequence
 (103 tokens) was measured with an 11-entity, 6-relation schema. A 6-entity,
 3-relation schema made short claims fall below it, and every extraction failed
-with `GlinerBoundaryPaddedSequenceLimitExceeded`. The long-document profile
-also excludes `entity_definitions` and classification, so the enrichment uses
-bare labels. Classification is only qualified on short (≤610-byte) inputs.
+with `GlinerBoundaryPaddedSequenceLimitExceeded`. Classification is only
+qualified on short (≤610-byte) inputs.
+
+**Label descriptions** (`entity_definitions`) are now qualified for windowed
+extraction on the FP32 base. They were evaluated before being adopted, with
+Antfly's `scripts/eval_extract.py` on 22 hand-labelled claim statements (55
+concept mentions, two negatives;
+`antfly/tests/fixtures/knowledge_eval/concept_extraction.jsonl`):
+
+| Config | Exact-span F1 (label-agnostic) | Overlap precision / recall | Labelled F1 |
+| --- | --- | --- | --- |
+| Bare labels | 0.69 | 0.91 / 0.74 | 0.37 |
+| Descriptions | 0.64 | 0.87 / 0.84 | 0.32 |
+
+Concept keys are label-free, so span quality is what matters. Descriptions
+trade exact spans and precision for overlap recall, so the enrichment keeps
+bare labels. The corpus is small; rerun with the fixture configs
+(`extract_plain.json`, `extract_descriptions.json`) when it grows.
 
 ### Model roles
 
@@ -809,30 +906,53 @@ approval prompt (up to 3,000 characters) does not.
 - **Remote.** Graph indexes are created with `POST /tables/{t}/indexes/{name}`
   (`"type":"graph"`). Stale remote versions are not dropped automatically.
 
+### Evaluation
+
+`antfly/tests/fixtures/knowledge_eval/` holds labelled sets:
+
+- supersession pairs;
+- concept-name pairs (synonyms and hard negatives);
+- the concept-extraction corpus with both extraction configs.
+
+The opt-in test `knowledge_eval` prints precision and recall for supersession
+and for the concept-merge gates:
+
+```sh
+cargo test -p codex-antfly --test embedded knowledge_eval -- --ignored --nocapture
+```
+
+Current baseline:
+
+- **Supersession:** precision 1.00, recall 0.71. It misses a changed default
+  ("off" to "shadow mode") and an open question answered from another thread;
+  within a thread, the extractor's `replaces` covers both.
+- **Concept gates:** as above.
+
+The sets are seeded from this project's sessions and the calibration runs.
+Grow them from real sessions, especially with claim-extraction labels, before
+knowledge is injected into context automatically. Today it is only reached
+through `knowledge.search`.
+
 ### Not built yet
 
-- **Synonym resolution.** Merge "Qwen3" and "Qwen3 Embedding". The resolver has
-  ANN candidate search (`candidate_search:"ann"`) and a Fellegi–Sunter scorer,
-  but per `zig/RESOLUTION.md` the mention `name_embedding` is not generated yet,
-  and ANN candidates come from promoted entity documents, which Lite never
-  writes (#1084). antflydb/antfly#1096 now generates mention embeddings,
-  promotes entities in Lite and honours alias redirects, but using them needs
-  an entity table and name-embedding index; see antflydb/antfly#1109.
-- **`motivated_by` / `rejected_in_favor_of` edges** from the distiller.
-- **Unicode concept keys (`uslug`).** Query seeds now come from Antfly's own
-  resolver, so switching the key template to `uslug` is safe; it changes every
-  key, so do it with a namespace migration (`set_resolver_namespace`).
-- **Aliases, promotion and an entity table.** These need concepts promoted into
-  entity documents, which is worth doing together with ANN synonym merging
-  (antflydb/antfly#1109).
-- **Label descriptions** in windowed extraction, now qualified for FP32 base.
-  Evaluate their effect on extraction first (antflydb/antfly#1109).
-- **Triage classification** of user messages (short-input profile only).
-- **Concept extraction on history items.** This is left off because of
-  per-item cost; claims carry thread provenance instead.
-- **Evaluation.** A labeled set from real sessions with claim and supersession
-  precision, before anything is injected into context automatically; today
-  knowledge is only reached through the tool.
+- **Unicode concept keys (`uslug`).** These would keep non-ASCII names
+  distinct, but switching the key template requires an in-place concept-graph
+  upgrade. Antfly refuses to replace a graph that owns an inline resolver
+  (`ResolverSourceArtifactImmutable`, antflydb/antfly#1144), which also blocks
+  changing `extract_model` on an existing database. Until that's fixed, a
+  refused upgrade logs a warning and the old graph keeps serving; table setup
+  no longer fails, which used to block every write to the table.
+- **Triage before extraction.** A local decide-model check that a turn holds
+  durable knowledge, to skip extraction requests. It isn't built. Laya
+  separates neither name equivalence nor restatements on its own (see
+  above), so it would need its own labelled set first. Debouncing and
+  batching already keep extraction at about one request per quiet period.
+- **Concept extraction on history items.** This stays off because of per-item
+  cost; claims carry thread and turn provenance instead.
+- **Entity documents beyond the resolver's.** Promoted concepts carry only
+  `canonical_name`, `entity_type` and `aliases`. Descriptions or
+  concept→concept summaries would need a conceptualizer
+  (`LITE_KNOWLEDGE_GRAPH.md`).
 
 ## Plan
 
@@ -910,7 +1030,9 @@ See [Knowledge graph](#knowledge-graph).
    decide predicate when a thread settles.
 4. ✅ Retrieval and the `knowledge.search` tool.
 5. ✅ Memory notes reconciled from disk and linked to the same concepts.
-6. Synonym resolution. Seeded PageRank is done.
+6. ✅ Synonym resolution (consolidation with lexical, embedding and model
+   gates; configured aliases), claim links and an evaluation harness. Seeded
+   PageRank is done. Unicode keys wait on antflydb/antfly#1144.
 7. Decide models: benchmark Laya, GLiNER2.5-multi-Decide and
    GLiNER2.5-Decide-1B on the approval and supersession questions.
    Gate: a labeled set from real sessions, and precision targets met, before

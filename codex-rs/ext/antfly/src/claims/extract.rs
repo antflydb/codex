@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use codex_antfly::knowledge::Claim;
 use codex_antfly::knowledge::ClaimKind;
+use codex_antfly::knowledge::ClaimRef;
 use codex_antfly::knowledge::TurnClaim;
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,6 +31,7 @@ const KINDS: &[&str] = &[
     "lesson",
     "constraint",
     "open_question",
+    "alternative",
 ];
 
 pub(crate) fn output_schema() -> Value {
@@ -45,8 +47,10 @@ pub(crate) fn output_schema() -> Value {
                         "kind": {"type": "string", "enum": KINDS},
                         "statement": {"type": "string"},
                         "replaces": {"type": "array", "items": {"type": "string"}},
+                        "motivates": {"type": "array", "items": {"type": "string"}},
+                        "rejected_in_favor_of": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["turn", "kind", "statement", "replaces"],
+                    "required": ["turn", "kind", "statement", "replaces", "motivates", "rejected_in_favor_of"],
                     "additionalProperties": false,
                 },
             },
@@ -122,6 +126,8 @@ struct OutputClaim {
     kind: String,
     statement: String,
     replaces: Vec<String>,
+    motivates: Vec<String>,
+    rejected_in_favor_of: Vec<String>,
 }
 
 /// `text` cut to about `max` bytes, keeping its start and its end (where a
@@ -158,33 +164,74 @@ impl Request {
     /// kinds are dropped; an out-of-range turn is attributed to the last one.
     pub(crate) fn parse(&self, answer: &str) -> anyhow::Result<(Vec<TurnClaim>, Vec<String>)> {
         let output: Output = serde_json::from_str(answer.trim())?;
-        let claims = output
+        let parsed: Vec<Option<(ClaimKind, String)>> = output
             .claims
-            .into_iter()
-            .filter_map(|claim| {
-                let kind: ClaimKind = serde_json::from_value(Value::String(claim.kind)).ok()?;
+            .iter()
+            .map(|claim| {
+                let kind: ClaimKind =
+                    serde_json::from_value(Value::String(claim.kind.clone())).ok()?;
                 let statement = truncate(claim.statement.trim(), MAX_STATEMENT_CHARS).to_string();
-                if statement.is_empty() {
-                    return None;
-                }
-                let index = usize::try_from(claim.turn.saturating_sub(1))
-                    .unwrap_or(0)
-                    .min(self.turns.len().saturating_sub(1));
-                let (turn_id, turn_ordinal) = self.turns.get(index).cloned()?;
-                Some(TurnClaim {
-                    kind,
-                    statement,
-                    turn_id,
-                    turn_ordinal,
-                    replaces: claim
-                        .replaces
-                        .iter()
-                        .filter_map(|short| self.existing.get(short).cloned())
-                        .collect(),
-                })
+                (!statement.is_empty()).then_some((kind, statement))
             })
-            .take(MAX_CLAIMS)
             .collect();
+        // Answer position of each kept claim → its position in the result.
+        let mut kept: HashMap<usize, usize> = HashMap::new();
+        for (position, claim) in parsed.iter().enumerate() {
+            if claim.is_some() && kept.len() < MAX_CLAIMS {
+                kept.insert(position, kept.len());
+            }
+        }
+        let refs = |targets: &[String]| -> Vec<ClaimRef> {
+            targets
+                .iter()
+                .filter_map(|target| {
+                    if let Some(id) = self.existing.get(target) {
+                        return Some(ClaimRef::Existing(id.clone()));
+                    }
+                    let position: usize = target.strip_prefix('n')?.parse().ok()?;
+                    kept.get(&position.checked_sub(1)?)
+                        .map(|index| ClaimRef::New(*index))
+                })
+                .collect()
+        };
+        let mut claims = Vec::with_capacity(kept.len());
+        for (position, (claim, parsed)) in output.claims.iter().zip(parsed).enumerate() {
+            let (Some((kind, statement)), true) = (parsed, kept.contains_key(&position)) else {
+                continue;
+            };
+            let index = usize::try_from(claim.turn.saturating_sub(1))
+                .unwrap_or(0)
+                .min(self.turns.len().saturating_sub(1));
+            let Some((turn_id, turn_ordinal)) = self.turns.get(index).cloned() else {
+                continue;
+            };
+            claims.push(TurnClaim {
+                kind,
+                statement,
+                turn_id,
+                turn_ordinal,
+                replaces: claim
+                    .replaces
+                    .iter()
+                    .filter_map(|short| self.existing.get(short).cloned())
+                    .collect(),
+                // Only explanations motivate and only alternatives are
+                // rejected; the model sometimes links a decision backwards.
+                motivates: if matches!(
+                    kind,
+                    ClaimKind::Rationale | ClaimKind::Lesson | ClaimKind::Constraint
+                ) {
+                    refs(&claim.motivates)
+                } else {
+                    Vec::new()
+                },
+                rejected_in_favor_of: if kind == ClaimKind::Alternative {
+                    refs(&claim.rejected_in_favor_of)
+                } else {
+                    Vec::new()
+                },
+            });
+        }
         let retracts = output
             .retracts
             .iter()
@@ -223,6 +270,8 @@ mod tests {
             generated_at_ms: 0,
             supersedes: Vec::new(),
             superseded_by: None,
+            motivates: Vec::new(),
+            rejected_in_favor_of: Vec::new(),
             turn_id: None,
             turn_ordinal: Some(ordinal),
             settled: false,
@@ -254,15 +303,29 @@ mod tests {
 
         let answer = json!({
             "claims": [
-                {"turn": 1, "kind": "decision", "statement": "The importer writes 1,024 items per batch.", "replaces": ["c1", "c9"]},
-                {"turn": 7, "kind": "lesson", "statement": "Release builds import faster.", "replaces": []},
-                {"turn": 1, "kind": "not_a_kind", "statement": "Dropped.", "replaces": []},
+                {"turn": 1, "kind": "not_a_kind", "statement": "Dropped.", "replaces": [], "motivates": [], "rejected_in_favor_of": []},
+                {"turn": 1, "kind": "decision", "statement": "The importer writes 1,024 items per batch.", "replaces": ["c1", "c9"], "motivates": ["n3"], "rejected_in_favor_of": ["n4"]},
+                {"turn": 7, "kind": "lesson", "statement": "Release builds import faster.", "replaces": [], "motivates": ["n2", "n1", "c2"], "rejected_in_favor_of": []},
+                {"turn": 1, "kind": "alternative", "statement": "Keep 256-item batches.", "replaces": [], "motivates": [], "rejected_in_favor_of": ["n2"]},
             ],
             "retracts": ["c2", "c5"],
         });
         let (claims, retracts) = request.parse(&answer.to_string())?;
-        assert_eq!(claims.len(), 2);
+        assert_eq!(claims.len(), 3);
         assert_eq!(claims[0].replaces, vec!["turns:t:2:000".to_string()]);
+        // A decision neither motivates nor is rejected.
+        assert!(claims[0].motivates.is_empty() && claims[0].rejected_in_favor_of.is_empty());
+        // `n2` is the decision, which lands first once the invalid claim
+        // before it is dropped; `n1` (the dropped claim) resolves to nothing.
+        assert_eq!(
+            claims[1].motivates,
+            vec![
+                ClaimRef::New(0),
+                ClaimRef::Existing("turns:t:2:001".to_string())
+            ]
+        );
+        assert_eq!(claims[2].kind, ClaimKind::Alternative);
+        assert_eq!(claims[2].rejected_in_favor_of, vec![ClaimRef::New(0)]);
         assert_eq!(claims[0].turn_id.as_deref(), Some("turn-a"));
         assert_eq!(
             (claims[1].turn_id.as_deref(), claims[1].turn_ordinal),

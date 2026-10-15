@@ -1575,6 +1575,8 @@ mod tests {
                 turn_id: Some("turn-1".to_string()),
                 turn_ordinal: 3,
                 replaces: Vec::new(),
+                motivates: Vec::new(),
+                rejected_in_favor_of: Vec::new(),
             }],
             retracts: Vec::new(),
         };
