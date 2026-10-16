@@ -330,7 +330,7 @@ learning_mode_windows = { git = "https://github.com/microsoft/mxc", rev = "6cd3d
 wxc_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 age = "0.12.1"
 ansi-to-tui = "8.0.1"
-antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "f9f1582346733d5f47e3da8966fb7df48cb064bc", features = ["libantfly", "sqlx"] }
+antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "9dd098d773c0bf7e1d339726fe26456fe9b193e8", features = ["libantfly", "sqlx"] }
 anyhow = "1"
 appcontainer_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 arboard = { version = "3", features = ["wayland-data-control"] }
