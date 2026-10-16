@@ -881,13 +881,15 @@ checks this: a merge made under `slug` still resolves after the upgrade, and
 "Café" keeps its accent. If Antfly does refuse a replacement, the old graph
 keeps serving and table setup logs a warning instead of failing writes.
 
-Open problem: on a database that keeps taking writes while the replacement
-builds, the replacement can stall. The table's extraction enrichment stops
-partway and retries `ResourceTemporarilyUnavailable` indefinitely, and the
-replacement waits on its artifact (`phase: building`, `scanned_keys: 0`,
-`last_error: null`). It does not recover after writes stop; an explicit
-`run_until_idle` completes it. The old graph keeps serving meanwhile. This is
-being reduced to an Antfly repro.
+Open problem: on a live database the replacement can stall in
+`phase: building` with `scanned_keys: 0` while `target_sequence` keeps
+rising. The cause is upstream: a graph whose extractor feeds an inline
+resolver re-triggers its own enrichment, so the table never goes idle, even
+after a single write (antflydb/antfly#1159). The old graph keeps serving
+meanwhile. Opening with an explicit `models_dir` separately breaks background
+extraction (`BadPathName`, antflydb/antfly#1160). The concept-graph tests
+don't catch either problem, because their extraction fails and the
+replacement swaps without any concepts.
 
 ### Memory notes
 
