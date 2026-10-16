@@ -854,12 +854,11 @@ fn knowledge_eval() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Antfly refuses to replace a graph that owns an inline resolver
-/// (antflydb/antfly#1144). Setup must keep the old graph serving and the
-/// table writable instead of failing.
+/// Upgrading a graph whose inline resolver changes key template (`slug` to
+/// `uslug`) carries curated merges over: the namespace is migrated first,
+/// then the replacement transfers the resolver (antflydb/antfly#1144).
 #[test]
-fn refused_graph_replacement_keeps_the_old_graph_serving() -> Result<(), Box<dyn std::error::Error>>
-{
+fn graph_upgrade_moves_resolver_and_keeps_merges() -> Result<(), Box<dyn std::error::Error>> {
     use codex_antfly::GraphIndex;
     use codex_antfly::TableSpec;
     if !has_models("fastino") {
@@ -896,11 +895,26 @@ fn refused_graph_replacement_keeps_the_old_graph_serving() -> Result<(), Box<dyn
         backend.ensure_table(TableSpec { name: "repro".into(), schema: schema.clone(), dense: None,
             graphs: vec![graph("kg_v2", "concept/{{ slug _entity.text }}")] }).await?;
         backend.write("repro".into(), vec![Write::put("d1", json!({"search_text": "Codex uses Antfly for semantic search."}))]).await?;
+        assert!(backend
+            .merge_resolver_keys("repro".into(), "concepts".into(), "concept/agents".into(), "concept/agent".into())
+            .await?);
         backend.ensure_table(TableSpec { name: "repro".into(), schema, dense: None,
             graphs: vec![graph("kg_v3", "concept/{{ uslug _entity.text }}")] }).await?;
-        let serving = backend.serving_graph("repro".into(), "kg_v3".into()).await?;
-        // Antfly refuses the replacement today; accept either until it can.
-        assert!(serving == "kg_v2" || serving == "kg_v3", "{serving}");
+        let mut serving = String::new();
+        for _ in 0..300 {
+            serving = backend.serving_graph("repro".into(), "kg_v3".into()).await?;
+            if serving == "kg_v3" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(serving, "kg_v3");
+        let render = |text: &str| backend.render_resolver_key(
+            "repro".into(), "concepts".into(), json!({"text": text, "label": "concept"}));
+        // The merge survived the namespace change.
+        assert_eq!(render("Agents").await?.as_deref(), Some("concept/agent"));
+        // uslug keeps non-ASCII names instead of dropping them.
+        assert_eq!(render("Café").await?.as_deref(), Some("concept/café"));
         backend.write("repro".into(), vec![Write::put("d2", json!({"search_text": "Still writable."}))]).await?;
         assert!(backend.get("repro".into(), "d2".into()).await?.is_some());
         antfly.close().await?;

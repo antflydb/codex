@@ -86,7 +86,7 @@ const CONCEPT_RELATIONS: &[&str] = &[
     "causes",
 ];
 /// Bump when the labels, relations, resolver or metric settings change.
-const CONCEPT_SCHEMA_VERSION: u32 = 2;
+const CONCEPT_SCHEMA_VERSION: u32 = 3;
 /// Personalized PageRank over the concept graph, seeded per query.
 pub const PPR_METRIC: &str = "ppr";
 /// `graph_metric` accepts at most this many seed nodes.
@@ -168,11 +168,9 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
             "source_artifact": artifact,
             "resolution_artifact": format!("{name}_resolution"),
             // Label-free keys: a per-mention label guess in the key would
-            // split one idea into several nodes. `uslug` would keep non-ASCII
-            // names distinct, but switching needs an in-place graph upgrade,
-            // which Antfly refuses for graphs with inline resolvers
-            // (antflydb/antfly#1144).
-            "key_template": "concept/{{ slug _entity.text }}",
+            // split one idea into several nodes. `uslug` keeps non-ASCII
+            // names distinct instead of collapsing them.
+            "key_template": "concept/{{ uslug _entity.text }}",
             "min_confidence": 0.5,
             "config_generation": 1,
         }],

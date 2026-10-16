@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `89df7aff46` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `f9f1582346` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `89df7aff46` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `f9f1582346` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -377,7 +377,7 @@ Fixed in Codex during the run:
   foreign key and then delete through a subquery (`42P01` on `COMMIT`,
   antflydb/antfly#1141, fixed by #1142). Unbounded index lag under steady
   writes (antflydb/antfly#1139) is addressed by #1140. The pin
-  (`89df7aff46`) includes all three.
+  (`f9f1582346`) includes all three.
 
 Remaining gaps:
 
@@ -507,13 +507,13 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `89df7aff46`, which includes
+against Antfly 1258e8cfcb; the pin is now `f9f1582346`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
 (cheap SQL recovery, background maintenance outside the connection gate),
-#1142 (foreign-key commits after a refresh) and #1140 (maintenance progress
-under steady writes).
+#1142 (foreign-key commits after a refresh), #1140 (maintenance progress
+under steady writes) and #1145 (graph replacement with an inline resolver).
 
 ### Goal
 
@@ -817,9 +817,10 @@ gap.
 ### Concept consolidation (synonyms)
 
 The resolver mints concept keys deterministically:
-`concept/{{ slug _entity.text }}`. So "ThreadStore" and "thread store", or
-"Antfly" and "Antfly database", start as separate concepts. Merging them was measured before it
-was built:
+`concept/{{ uslug _entity.text }}`. `uslug` keeps non-ASCII names distinct
+instead of collapsing them. So "ThreadStore" and "thread store", or "Antfly"
+and "Antfly database", start as separate concepts. Merging them was measured
+before it was built:
 
 - **Embeddings alone can't do it.** Under EmbeddingGemma 2, version siblings
   score higher than most true synonyms: "EmbeddingGemma 2" and
@@ -865,6 +866,28 @@ KG = "knowledge graph"
 Aliases are rendered through the resolver (`render_resolver_key`) and merged
 during the startup sweep; applied ones render to the same key and are
 skipped.
+
+**Upgrading the concept graph.** The concept graph's name hashes the
+extraction model and a schema version, so changing either builds a
+replacement graph in place. The switch from `slug` to `uslug` is schema
+version 3. Since antflydb/antfly#1144 (fixed by #1145), a replacement takes
+over the old graph's inline resolver, merges included. A key-template change
+on a resolver with merges still needs an explicit namespace migration first.
+`EmbeddedBackend` does it before replacing:
+`set_resolver_namespace` with a `key_map` that maps every merge endpoint to
+itself. `uslug` renders ASCII names to the same keys as `slug`, so the
+redirects stay valid. The test `graph_upgrade_moves_resolver_and_keeps_merges`
+checks this: a merge made under `slug` still resolves after the upgrade, and
+"Café" keeps its accent. If Antfly does refuse a replacement, the old graph
+keeps serving and table setup logs a warning instead of failing writes.
+
+Open problem: on a database that keeps taking writes while the replacement
+builds, the replacement can stall. The table's extraction enrichment stops
+partway and retries `ResourceTemporarilyUnavailable` indefinitely, and the
+replacement waits on its artifact (`phase: building`, `scanned_keys: 0`,
+`last_error: null`). It does not recover after writes stop; an explicit
+`run_until_idle` completes it. The old graph keeps serving meanwhile. This is
+being reduced to an Antfly repro.
 
 ### Memory notes
 
@@ -1002,13 +1025,6 @@ through `knowledge.search`.
 
 ### Not built yet
 
-- **Unicode concept keys (`uslug`).** These would keep non-ASCII names
-  distinct, but switching the key template requires an in-place concept-graph
-  upgrade. Antfly refuses to replace a graph that owns an inline resolver
-  (`ResolverSourceArtifactImmutable`, antflydb/antfly#1144), which also blocks
-  changing `extract_model` on an existing database. Until that's fixed, a
-  refused upgrade logs a warning and the old graph keeps serving; table setup
-  no longer fails, which used to block every write to the table.
 - **Triage before extraction.** A local decide-model check that a turn holds
   durable knowledge, to skip extraction requests. It isn't built. Laya
   separates neither name equivalence nor restatements on its own (see
@@ -1104,8 +1120,8 @@ See [Knowledge graph](#knowledge-graph).
 4. ✅ Retrieval and the `knowledge.search` tool.
 5. ✅ Memory notes reconciled from disk and linked to the same concepts.
 6. ✅ Synonym resolution (consolidation with lexical, embedding and model
-   gates; configured aliases), claim links and an evaluation harness. Seeded
-   PageRank is done. Unicode keys wait on antflydb/antfly#1144.
+   gates; configured aliases), claim links, Unicode keys and an evaluation
+   harness. Seeded PageRank is done.
 7. Decide models: benchmark Laya, GLiNER2.5-multi-Decide and
    GLiNER2.5-Decide-1B on the approval and supersession questions.
    Gate: a labeled set from real sessions, and precision targets met, before

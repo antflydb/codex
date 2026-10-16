@@ -140,6 +140,79 @@ enum GraphState {
     Refused { old: String, error: String },
 }
 
+/// Moves curated resolver identities into the namespace `config` declares.
+///
+/// Antfly replaces a graph whose inline resolver changes `table` or
+/// `key_template` only when that resolver has no merges or aliases; curated
+/// identities need an explicit `set_resolver_namespace` first. Merge
+/// endpoints are mapped to themselves: Codex's template changes (`slug` to
+/// `uslug`) render ASCII names to the same keys, so existing redirects stay
+/// valid in the new namespace.
+fn migrate_resolver_namespaces(db: &Database, config: &Value) -> AntflyResult<()> {
+    let Some(resolvers) = config.get("resolvers").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let identities: Value = serde_json::from_slice(
+        &db.resolver_identities_json()
+            .map_err(embedded("list resolver identities"))?,
+    )?;
+    for resolver in resolvers {
+        let (Some(name), Some(table), Some(template)) = (
+            resolver.get("name").and_then(Value::as_str),
+            resolver.get("table").and_then(Value::as_str),
+            resolver.get("key_template").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(identity) = identities
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|identity| {
+                identity.pointer("/config/name").and_then(Value::as_str) == Some(name)
+            })
+        else {
+            continue;
+        };
+        let unchanged = identity.pointer("/config/table").and_then(Value::as_str) == Some(table)
+            && identity
+                .pointer("/config/key_template")
+                .and_then(Value::as_str)
+                == Some(template);
+        let merges = identity
+            .get("merges")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if unchanged || merges.is_empty() {
+            continue;
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for merge in &merges {
+            for field in ["key", "target"] {
+                if let Some(key) = merge.get(field).and_then(Value::as_str) {
+                    keys.insert(key.to_string());
+                }
+            }
+        }
+        let request = serde_json::to_vec(&json!({
+            "table": table,
+            "key_template": template,
+            "key_map": keys
+                .iter()
+                .map(|key| json!({"key": key, "target": key}))
+                .collect::<Vec<_>>(),
+        }))?;
+        tracing::info!(
+            "antfly: moving resolver {name} and its {} merges to {template}",
+            merges.len()
+        );
+        retry_busy(|| db.set_resolver_namespace_json(name, &request))
+            .map_err(embedded("set resolver namespace"))?;
+    }
+    Ok(())
+}
+
 /// Adds `name` (replacing `stale` when given) and reports which index serves.
 fn reconcile_graph(
     db: &Database,
@@ -387,7 +460,12 @@ impl EmbeddedBackend {
                 // once the replacement has swapped in. A refused replacement
                 // leaves the old version serving rather than failing setup.
                 let old = stale.last().map(|old| old.as_str());
-                match (reconcile_graph(db, &name, old, &config), old) {
+                let result = match old {
+                    Some(_) => migrate_resolver_namespaces(db, &config)
+                        .and_then(|()| reconcile_graph(db, &name, old, &config)),
+                    None => reconcile_graph(db, &name, old, &config),
+                };
+                match (result, old) {
                     (Err(err), Some(old)) => Ok(GraphState::Refused {
                         old: old.to_string(),
                         error: err.to_string(),
