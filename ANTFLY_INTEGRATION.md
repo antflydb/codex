@@ -80,8 +80,10 @@ implementation differs and why.
   Defaults: allow when P(none)+P(local) ≥ 0.70, the most likely category is
   contained, and P(destructive) < 0.20; deny when P(destructive) ≥ 0.80;
   otherwise defer to Guardian and the user. `approvals.mode` defaults to
-  `off`; run `shadow` first. Decisions and observed tool outcomes are stored
-  in `codex_approvals` for calibration and as precedents.
+  `shadow`, so verdicts and outcomes accumulate without changing what the
+  user sees. In `enforce` mode only denials are applied, unless
+  `approvals.apply_allow = true`. Decisions and observed tool outcomes are
+  stored in `codex_approvals` for calibration and as precedents.
 
 ### Antfly findings
 
@@ -143,9 +145,10 @@ Known limitations:
   with 32 and 64 concurrent databases, and the Antfly suites pass at normal
   test parallelism. Build `libantfly` from that commit or later. Tests close
   databases with `Antfly::close()` before removing their directories.
-- Approval review defaults to `off`. Laya's zero-shot probabilities are only
-  moderately separated; collect shadow-mode decisions and outcomes (stored
-  in `codex_approvals`) before enforcing, and consider fine-tuning on them.
+- Approval review defaults to `shadow`. Laya's zero-shot probabilities are
+  only moderately separated. Enforce only after `codex knowledge benchmark`
+  shows the deny precision you need on logged outcomes, and consider
+  fine-tuning on them (`antfly inference finetune train laya`).
 - The importer was exercised on a subset of a 28 GB, 1,245-thread history; a
   full import takes hours on a debug build. Imported forks and reverts are
   flattened into self-contained threads.
@@ -414,8 +417,9 @@ is registered before `codex_guardian_v2::install`
   policy is not `OnRequest`/`Granular` unless `require_guardian`; never fast
   allow when `require_fresh_review`. Escalated shell commands always set
   `require_fresh_review`, so the reviewer still runs and records these
-  (`fresh_review_required: true`). Only a `Deny` is applied in enforce mode;
-  an `Allow` is left to Guardian and the user.
+  (`fresh_review_required: true`). In enforce mode a `Deny` is applied. An
+  `Allow` is left to Guardian and the user unless `approvals.apply_allow` is
+  set, and even then never when a fresh review is required.
 - Build `state` from `action`, `permissions`, `category` (`GuardianScope`),
   cwd, the latest user request (via `Weak<ThreadManager>`), and similar past
   approvals from the store.
@@ -468,9 +472,11 @@ decide_model = "convaiinnovations/laya"
 # supersede_threshold = 0.8          # decide-model confidence before a claim supersedes another
 
 [experimental_thread_store.approvals]
-mode = "shadow"                      # off | shadow | enforce
+mode = "shadow"                      # off | shadow (default) | enforce
 allow_threshold = 0.7
 deny_threshold = 0.8
+# apply_allow = false                # enforce mode: also apply confident allows
+# model = "fastino/GLiNER2.5-Decide-1B"  # approval model, if not decide_model
 ```
 
 ## Upstream patch points

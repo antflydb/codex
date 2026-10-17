@@ -148,9 +148,10 @@ pub struct AntflyConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     /// Approvals go to the user as usual.
-    #[default]
     Off,
-    /// Decisions are computed and logged; the user still decides.
+    /// Decisions are computed and logged; the user still decides. The
+    /// default, so labeled outcomes accumulate for calibration.
+    #[default]
     Shadow,
     /// Confident decisions are applied; everything else goes to the user.
     Enforce,
@@ -166,14 +167,18 @@ pub struct ApprovalSettings {
     pub allow_threshold_bp: u32,
     /// Deny when the action is at least this likely to be destructive.
     pub deny_threshold_bp: u32,
+    /// In enforce mode, also apply confident allows. Off by default: only
+    /// denials are applied until outcomes show allows are safe.
+    pub apply_allow: bool,
 }
 
 impl Default for ApprovalSettings {
     fn default() -> Self {
         Self {
-            mode: ApprovalMode::Off,
+            mode: ApprovalMode::Shadow,
             allow_threshold_bp: 7_000,
             deny_threshold_bp: 8_000,
+            apply_allow: false,
         }
     }
 }
@@ -193,6 +198,7 @@ pub struct AntflyTomlSettings {
     pub decide_model: Option<String>,
     pub approvals_mode: Option<String>,
     pub approvals_model: Option<String>,
+    pub approvals_apply_allow: Option<bool>,
     pub allow_threshold: Option<f64>,
     pub deny_threshold: Option<f64>,
     pub knowledge_graph: Option<bool>,
@@ -272,7 +278,8 @@ impl AntflyConfig {
         };
         let defaults = ApprovalSettings::default();
         let mode = match settings.approvals_mode.as_deref() {
-            None | Some("off") => ApprovalMode::Off,
+            None => defaults.mode,
+            Some("off") => ApprovalMode::Off,
             Some("shadow") => ApprovalMode::Shadow,
             Some("enforce") => ApprovalMode::Enforce,
             Some(other) => {
@@ -356,6 +363,9 @@ impl AntflyConfig {
                     settings.deny_threshold,
                     defaults.deny_threshold_bp,
                 )?,
+                apply_allow: settings
+                    .approvals_apply_allow
+                    .unwrap_or(defaults.apply_allow),
             },
             approvals_model: settings.approvals_model,
         })

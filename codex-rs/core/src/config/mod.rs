@@ -2589,6 +2589,7 @@ fn thread_store_config(
                 decide_model: antfly.decide_model,
                 approvals_mode: antfly.approvals.as_ref().and_then(|a| a.mode.clone()),
                 approvals_model: antfly.approvals.as_ref().and_then(|a| a.model.clone()),
+                approvals_apply_allow: antfly.approvals.as_ref().and_then(|a| a.apply_allow),
                 allow_threshold: antfly.approvals.as_ref().and_then(|a| a.allow_threshold),
                 deny_threshold: antfly.approvals.as_ref().and_then(|a| a.deny_threshold),
                 knowledge_graph: antfly.knowledge_graph,

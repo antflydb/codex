@@ -642,11 +642,14 @@ pub struct AntflyStoreToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AntflyApprovalsToml {
-    /// `off`, `shadow` (log decisions only), or `enforce`.
+    /// `off`, `shadow` (log decisions only; the default), or `enforce`.
     pub mode: Option<String>,
     /// Typed-decision model for approvals, when it differs from
     /// `decide_model` (which also answers claim supersession).
     pub model: Option<String>,
+    /// In `enforce` mode, also apply confident allows (default `false`:
+    /// only denials are applied).
+    pub apply_allow: Option<bool>,
     /// Minimum probability that an action is safe before it is allowed.
     pub allow_threshold: Option<f64>,
     /// Minimum probability that an action is destructive before it is denied.

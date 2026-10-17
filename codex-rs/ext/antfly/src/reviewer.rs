@@ -5,6 +5,7 @@ use std::sync::Weak;
 
 use codex_antfly::Antfly;
 use codex_antfly::ApprovalMode;
+use codex_antfly::ApprovalSettings;
 use codex_antfly::Write;
 use codex_antfly::schema;
 use codex_core::ThreadManager;
@@ -160,7 +161,7 @@ impl LayaApprovalReviewer {
             "local approval review"
         );
 
-        let applied = applied_decision(settings.mode, &decided, input.require_fresh_review);
+        let applied = applied_decision(&settings, &decided, input.require_fresh_review);
         self.record(
             &antfly,
             input,
@@ -292,17 +293,19 @@ impl TurnInputContributor for LayaApprovalReviewer {
 }
 
 /// What a verdict may change. Shadow mode only records. In enforce mode a
-/// confident denial is applied, and a confident allow is applied unless the
-/// host requires a fresh review (escalated commands, retries): the host does
-/// not trust a fast allow there, so the request goes to the user (or the
-/// configured reviewer) instead of an implicit model review.
+/// confident denial is applied. A confident allow is applied only when
+/// `apply_allow` is set and the host does not require a fresh review
+/// (escalated commands, retries): the host does not trust a fast allow
+/// there, so the request goes to the user (or the configured reviewer).
 pub(crate) fn applied_decision(
-    mode: ApprovalMode,
+    settings: &ApprovalSettings,
     verdict: &Verdict,
     require_fresh_review: bool,
 ) -> Option<ApprovalDecision> {
-    match (mode, verdict) {
-        (ApprovalMode::Enforce, Verdict::Allow) if !require_fresh_review => {
+    match (settings.mode, verdict) {
+        (ApprovalMode::Enforce, Verdict::Allow)
+            if settings.apply_allow && !require_fresh_review =>
+        {
             Some(ApprovalDecision::Allow)
         }
         (ApprovalMode::Enforce, Verdict::Deny { reason }) => {
@@ -318,23 +321,37 @@ pub(crate) fn applied_decision(
 mod applied_decision_tests {
     use super::*;
 
+    fn settings(mode: ApprovalMode, apply_allow: bool) -> ApprovalSettings {
+        ApprovalSettings {
+            mode,
+            apply_allow,
+            ..ApprovalSettings::default()
+        }
+    }
+
     #[test]
-    fn fresh_reviews_keep_denials_but_never_fast_allow() {
+    fn enforce_applies_denials_and_allows_only_when_asked() {
         let deny = Verdict::Deny {
             reason: "destructive".to_string(),
         };
+        let enforce = settings(ApprovalMode::Enforce, false);
+        let enforce_allow = settings(ApprovalMode::Enforce, true);
+        let shadow = settings(ApprovalMode::Shadow, true);
+        // Allows are advisory unless apply_allow, and never fast without a
+        // fresh review.
+        assert!(applied_decision(&enforce, &Verdict::Allow, false).is_none());
         assert!(matches!(
-            applied_decision(ApprovalMode::Enforce, &Verdict::Allow, false),
+            applied_decision(&enforce_allow, &Verdict::Allow, false),
             Some(ApprovalDecision::Allow)
         ));
-        assert!(applied_decision(ApprovalMode::Enforce, &Verdict::Allow, true).is_none());
+        assert!(applied_decision(&enforce_allow, &Verdict::Allow, true).is_none());
         for fresh in [false, true] {
             assert!(matches!(
-                applied_decision(ApprovalMode::Enforce, &deny, fresh),
+                applied_decision(&enforce, &deny, fresh),
                 Some(ApprovalDecision::Reviewed(ReviewDecision::Denied { .. }))
             ));
-            assert!(applied_decision(ApprovalMode::Shadow, &deny, fresh).is_none());
-            assert!(applied_decision(ApprovalMode::Shadow, &Verdict::Allow, fresh).is_none());
+            assert!(applied_decision(&shadow, &deny, fresh).is_none());
+            assert!(applied_decision(&shadow, &Verdict::Allow, fresh).is_none());
         }
     }
 }

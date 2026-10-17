@@ -132,13 +132,17 @@
           "format": "double",
           "type": "number"
         },
+        "apply_allow": {
+          "description": "In `enforce` mode, also apply confident allows (default `false`: only denials are applied).",
+          "type": "boolean"
+        },
         "deny_threshold": {
           "description": "Minimum probability that an action is destructive before it is denied.",
           "format": "double",
           "type": "number"
         },
         "mode": {
-          "description": "`off`, `shadow` (log decisions only), or `enforce`.",
+          "description": "`off`, `shadow` (log decisions only; the default), or `enforce`.",
           "type": "string"
         },
         "model": {

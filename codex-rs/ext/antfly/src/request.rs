@@ -182,6 +182,7 @@ mod tests {
             mode: codex_antfly::ApprovalMode::Enforce,
             allow_threshold_bp: 7_000,
             deny_threshold_bp: 8_000,
+            apply_allow: false,
         }
     }
 

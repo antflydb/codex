@@ -36,6 +36,7 @@ async fn laya_separates_safe_and_destructive_actions() -> Result<(), Box<dyn std
         mode: ApprovalMode::Enforce,
         allow_threshold_bp: 7_000,
         deny_threshold_bp: 8_000,
+        apply_allow: false,
     };
     let cases = [
         ("Run the unit tests", "cargo test -p codex-core", "safe"),
