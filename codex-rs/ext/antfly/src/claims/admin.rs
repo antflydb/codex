@@ -308,10 +308,13 @@ async fn labeled_approvals(antfly: &Antfly, limit: usize) -> anyhow::Result<Vec<
             let doc = document.doc;
             let decision = doc.get("decision")?.as_str()?;
             let state = doc.get("search_text")?.as_str()?.to_string();
-            let outcome = doc.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = doc
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let at = doc
                 .get("decided_at_ms")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
             Some((
                 at,
@@ -323,7 +326,7 @@ async fn labeled_approvals(antfly: &Antfly, limit: usize) -> anyhow::Result<Vec<
             ))
         })
         .collect();
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     Ok(found
         .into_iter()
         .take(limit)

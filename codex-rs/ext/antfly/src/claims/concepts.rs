@@ -249,6 +249,7 @@ mod tests {
         if !has_models("google") || !has_models("fastino") {
             return Ok(());
         }
+        let _serial = crate::MODEL_TESTS.acquire().await?;
         let dir = tempfile::tempdir()?;
         let config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
         let antfly = codex_antfly::Antfly::open(config)?;

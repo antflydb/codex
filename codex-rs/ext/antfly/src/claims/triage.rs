@@ -159,6 +159,7 @@ mod tests {
             .thread_stack_size(16 * 1024 * 1024)
             .enable_all()
             .build()?;
+        let _serial = runtime.block_on(crate::MODEL_TESTS.acquire())?;
         runtime.block_on(async {
             let mut config =
                 codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));

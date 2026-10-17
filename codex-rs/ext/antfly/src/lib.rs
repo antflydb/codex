@@ -57,3 +57,9 @@ pub fn install(
     registry.config_contributor(Arc::clone(&knowledge) as _);
     registry.tool_contributor(knowledge);
 }
+
+/// Runs unit tests that open a database or load local models one at a
+/// time: several loading models at once can exceed inference memory
+/// admission and fail spuriously.
+#[cfg(test)]
+pub(crate) static MODEL_TESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
