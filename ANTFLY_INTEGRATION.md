@@ -1052,6 +1052,32 @@ durable. Before a batch is sent, the decide model screens each turn
 produced claims would still be extracted, and how many turns would be
 skipped.
 
+### Decide-model benchmark
+
+`codex knowledge benchmark [--model M]... [--limit N]` replays Codex's
+labeled questions through each model (`codex-rs/antfly/src/bench.rs`; the
+default models are the configured decide and approval models). The tasks:
+
+| Task | Inputs | Label | Score |
+|---|---|---|---|
+| `supersession` | the hand-labeled pairs in `supersession.jsonl` | `replaces` | `supersession_score`: the `supersedes` predicate, or same + updates when one of them is the top relation. A threshold on this score is Codex's supersession rule |
+| `approval_deny` | logged approval states the user resolved | the user denied or aborted | p(destructive) |
+| `approval_allow` | the same | approved, and it ran successfully | p(none) + p(local) |
+| `triage` | logged extraction turns, rendered from history | extraction found claims | 1 − p(routine) |
+
+For each model and task it reports AUC, precision and recall at 0.5 and
+0.8, median latency, and failures, such as requests over a model's
+qualified input limit.
+
+First run on the E2E scratch database (approvals and triage had no labels
+yet):
+
+| Model | Supersession AUC | At 0.8 |
+|---|---|---|
+| `convaiinnovations/laya` | 0.98 | precision 100%, recall 71% |
+| `fastino/GLiNER2.5-Decide-1B` | 0.69 | no positives |
+| `antflydb/gliner2.5-decide-1B-gguf` | 0.69 | no positives; the approval state was rejected as over its 198-token limit |
+
 ### Label logs
 
 Every model call that decides something on Codex's behalf is kept as a

@@ -230,6 +230,149 @@ pub async fn describe(
     Ok(knowledge.describe_concepts(max).await?)
 }
 
+/// Benchmarks `models` on every labeled task Codex has data for: the
+/// supersession fixture, logged approvals with the user's decision, and
+/// logged extraction turns (at most `limit` of each).
+pub async fn benchmark(
+    antfly: &Antfly,
+    models: &[String],
+    limit: usize,
+) -> anyhow::Result<Vec<codex_antfly::bench::TaskResult>> {
+    let approvals = labeled_approvals(antfly, limit).await?;
+    let turns = labeled_turns(antfly, limit).await?;
+    let mut results = Vec::new();
+    for model in models {
+        results.push(codex_antfly::bench::supersession(antfly, model).await);
+        let mut deny = codex_antfly::bench::TaskResult::new("approval_deny", model);
+        let mut allow = codex_antfly::bench::TaskResult::new("approval_allow", model);
+        for approval in &approvals {
+            let request = crate::request::build_decide_request(model, &approval.state);
+            let started = std::time::Instant::now();
+            let answers = antfly
+                .decide(&request)
+                .await
+                .map_err(|err| err.to_string())
+                .map(|response| crate::request::Answers::parse(&response));
+            let elapsed = started.elapsed();
+            let scored = |pick: fn(&crate::request::Answers) -> f64| match &answers {
+                Ok(answers) => Ok(answers.as_ref().map(pick)),
+                Err(err) => Err(err.clone()),
+            };
+            deny.record_scored(
+                approval.denied,
+                scored(|answers| answers.destructive),
+                elapsed,
+            );
+            allow.record_scored(
+                approval.allowed_and_ran,
+                scored(crate::request::Answers::contained),
+                elapsed,
+            );
+        }
+        results.push(deny);
+        results.push(allow);
+        let mut triage = codex_antfly::bench::TaskResult::new("triage", model);
+        for turn in &turns {
+            let request = super::triage::request(model, &turn.turn);
+            triage
+                .record(turn.had_claims, async {
+                    antfly
+                        .decide(&request)
+                        .await
+                        .map(|response| super::triage::probability(&response))
+                        .map_err(|err| err.to_string())
+                })
+                .await;
+        }
+        results.push(triage);
+    }
+    Ok(results)
+}
+
+struct LabeledApproval {
+    state: String,
+    /// The user declined it.
+    denied: bool,
+    /// The user approved it and it ran successfully.
+    allowed_and_ran: bool,
+}
+
+/// Recorded approvals the user resolved, newest first.
+async fn labeled_approvals(antfly: &Antfly, limit: usize) -> anyhow::Result<Vec<LabeledApproval>> {
+    let mut found: Vec<(i64, LabeledApproval)> = antfly
+        .documents(codex_antfly::schema::APPROVALS)
+        .scan(codex_antfly::ScanRequest::prefix(""))
+        .await?
+        .into_iter()
+        .filter_map(|document| {
+            let doc = document.doc;
+            let decision = doc.get("decision")?.as_str()?;
+            let state = doc.get("search_text")?.as_str()?.to_string();
+            let outcome = doc.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+            let at = doc
+                .get("decided_at_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            Some((
+                at,
+                LabeledApproval {
+                    state,
+                    denied: matches!(decision, "denied" | "abort"),
+                    allowed_and_ran: decision.starts_with("approved") && outcome == "executed",
+                },
+            ))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(found
+        .into_iter()
+        .take(limit)
+        .map(|(_, approval)| approval)
+        .collect())
+}
+
+struct LabeledTurn {
+    turn: super::transcript::Turn,
+    had_claims: bool,
+}
+
+/// Turns sent for extraction, newest first, with their rendered evidence.
+async fn labeled_turns(antfly: &Antfly, limit: usize) -> anyhow::Result<Vec<LabeledTurn>> {
+    let sql = antfly.sql().await?;
+    let rows = sql
+        .fetch_all(
+            "SELECT thread_id, turn_start, turn_end, claims FROM codex_extraction_log \
+             ORDER BY extracted_at_ms DESC LIMIT $1",
+            codex_antfly::sql_params![i64::try_from(limit).unwrap_or(i64::MAX)],
+        )
+        .await?;
+    let mut turns = Vec::new();
+    for row in rows {
+        let thread_id = row.string("thread_id")?;
+        let start = u64::try_from(row.i64("turn_start")?).unwrap_or_default();
+        let end = u64::try_from(row.i64("turn_end")?).unwrap_or_default();
+        let items = codex_antfly::history::items_from(
+            antfly,
+            &thread_id,
+            start,
+            usize::try_from(end.saturating_sub(start))
+                .unwrap_or(usize::MAX)
+                .max(1),
+        )
+        .await?;
+        if let Some(turn) = super::transcript::turns(&items)
+            .into_iter()
+            .find(|turn| turn.start == start && !turn.text.is_empty())
+        {
+            turns.push(LabeledTurn {
+                turn,
+                had_claims: row.i64("claims")? > 0,
+            });
+        }
+    }
+    Ok(turns)
+}
+
 /// Pipeline-wide state for `codex knowledge status`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KnowledgeStatus {

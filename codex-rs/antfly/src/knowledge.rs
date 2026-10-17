@@ -1003,36 +1003,12 @@ impl Knowledge<'_> {
         if normalized(earlier) == normalized(later) {
             return Ok(true);
         }
-        let request = json!({
-            "model": self.antfly.config().decide_model,
-            "input": format!(
-                "Earlier statement: {}\nLater statement: {}",
-                truncate_chars(earlier, DECIDE_STATEMENT_MAX_CHARS),
-                truncate_chars(later, DECIDE_STATEMENT_MAX_CHARS),
-            ),
-            "questions": [{
-                "name": "relation",
-                "type": "choice",
-                "instructions": "How does the later statement relate to the earlier statement?",
-                "choices": [
-                    {"value": "same", "description": "Asserts the same fact about the same subject, possibly in other words"},
-                    {"value": "updates", "description": "Replaces, reverses or updates the earlier statement about the same subject"},
-                    {"value": "different", "description": "Asserts a different fact about the same subject"},
-                    {"value": "unrelated", "description": "Is about a different subject"},
-                ],
-            }, {
-                "name": "supersedes",
-                "type": "predicate",
-                "instructions": "The later statement replaces, reverses or updates the earlier statement about the same subject.",
-            }],
-        });
+        let request = supersession_request(&self.antfly.config().decide_model, earlier, later);
         let response = self.antfly.decide(&request).await?;
-        let malformed = || crate::AntflyError::Malformed(format!("decide response: {response}"));
-        let probabilities = relation_probabilities(&response).ok_or_else(malformed)?;
-        let predicate = predicate_probability(&response, "supersedes").ok_or_else(malformed)?;
+        let score = supersession_score(&response)
+            .ok_or_else(|| crate::AntflyError::Malformed(format!("decide response: {response}")))?;
         let threshold = self.config.supersede_threshold_bp;
-        let supersedes = predicate * 10_000.0 >= f64::from(threshold)
-            || replaces_earlier(&probabilities, threshold);
+        let supersedes = score * 10_000.0 >= f64::from(threshold);
         let input = request["input"].as_str().unwrap_or_default();
         if let Err(err) = crate::labels::record_decision(
             self.antfly,
@@ -1043,7 +1019,7 @@ impl Knowledge<'_> {
                 input,
                 response: &response,
                 result: Some(supersedes),
-                score: Some(predicate),
+                score: Some(score),
                 threshold_bp: Some(threshold),
             },
         )
@@ -1638,14 +1614,60 @@ fn predicate_probability(response: &Value, name: &str) -> Option<f64> {
         .as_f64()
 }
 
-fn replaces_earlier(probabilities: &HashMap<String, f64>, threshold_bp: u32) -> bool {
+/// The decide request asking whether `later` supersedes `earlier`.
+pub fn supersession_request(model: &str, earlier: &str, later: &str) -> Value {
+    json!({
+        "model": model,
+        "input": format!(
+            "Earlier statement: {}\nLater statement: {}",
+            truncate_chars(earlier, DECIDE_STATEMENT_MAX_CHARS),
+            truncate_chars(later, DECIDE_STATEMENT_MAX_CHARS),
+        ),
+        "questions": [{
+            "name": "relation",
+            "type": "choice",
+            "instructions": "How does the later statement relate to the earlier statement?",
+            "choices": [
+                {"value": "same", "description": "Asserts the same fact about the same subject, possibly in other words"},
+                {"value": "updates", "description": "Replaces, reverses or updates the earlier statement about the same subject"},
+                {"value": "different", "description": "Asserts a different fact about the same subject"},
+                {"value": "unrelated", "description": "Is about a different subject"},
+            ],
+        }, {
+            "name": "supersedes",
+            "type": "predicate",
+            "instructions": "The later statement replaces, reverses or updates the earlier statement about the same subject.",
+        }],
+    })
+}
+
+/// How confidently a supersession response says the later statement
+/// replaces the earlier one: the `supersedes` predicate, or the mass on
+/// `same` and `updates` when one of them is the top relation. A threshold on
+/// this score is Codex's supersession rule.
+pub fn supersession_score(response: &Value) -> Option<f64> {
+    let probabilities = relation_probabilities(response)?;
+    let predicate = predicate_probability(response, "supersedes")?;
+    Some(predicate.max(replacing_score(&probabilities)))
+}
+
+/// `same` + `updates` when one of them is the top relation, else 0.
+fn replacing_score(probabilities: &HashMap<String, f64>) -> f64 {
     let p = |value: &str| probabilities.get(value).copied().unwrap_or_default();
     let top = probabilities
         .iter()
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(value, _)| value.as_str());
-    let replacing = p("same") + p("updates");
-    matches!(top, Some("same" | "updates")) && replacing * 10_000.0 >= f64::from(threshold_bp)
+    if matches!(top, Some("same" | "updates")) {
+        p("same") + p("updates")
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+fn replaces_earlier(probabilities: &HashMap<String, f64>, threshold_bp: u32) -> bool {
+    replacing_score(probabilities) * 10_000.0 >= f64::from(threshold_bp)
 }
 
 fn concept_from(key: String, doc: &Value) -> Option<Concept> {

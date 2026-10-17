@@ -27,7 +27,9 @@ impl std::ops::Deref for TestRuntime {
 
 fn runtime() -> TestRuntime {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

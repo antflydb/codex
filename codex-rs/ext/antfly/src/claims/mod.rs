@@ -23,8 +23,8 @@
 pub mod admin;
 mod concepts;
 mod extract;
-mod transcript;
-mod triage;
+pub(crate) mod transcript;
+pub(crate) mod triage;
 
 use std::collections::HashMap;
 use std::collections::HashSet;

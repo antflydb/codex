@@ -43,6 +43,19 @@ pub enum KnowledgeSubcommand {
     /// Describe concepts from the claims about them, with the local
     /// describe model.
     Describe(DescribeArgs),
+    /// Compare decide models on the labeled questions Codex has logged.
+    Benchmark(BenchmarkArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BenchmarkArgs {
+    /// Decide model to evaluate (repeatable); defaults to the configured
+    /// decide and approval models.
+    #[arg(long = "model")]
+    models: Vec<String>,
+    /// At most this many logged approvals and extraction turns.
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -92,6 +105,21 @@ impl KnowledgeCli {
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
             KnowledgeSubcommand::Backfill(args) => backfill(&antfly, config, args).await,
+            KnowledgeSubcommand::Benchmark(args) => {
+                let mut models = args.models;
+                if models.is_empty() {
+                    models.push(antfly.config().decide_model.clone());
+                    let approvals = antfly.config().approval_decide_model().to_string();
+                    if !models.contains(&approvals) {
+                        models.push(approvals);
+                    }
+                }
+                let results = knowledge_admin::benchmark(&antfly, &models, args.limit)
+                    .await
+                    .context("benchmarking (is the app-server daemon holding the database?)")?;
+                print_benchmark(&results);
+                Ok(())
+            }
             KnowledgeSubcommand::Describe(args) => {
                 let report = knowledge_admin::describe(&antfly, args.limit)
                     .await
@@ -119,6 +147,45 @@ impl KnowledgeCli {
                 );
                 Ok(())
             }
+        }
+    }
+}
+
+fn print_benchmark(results: &[codex_antfly::bench::TaskResult]) {
+    let percent = |value: Option<f64>| {
+        value
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    for result in results {
+        println!(
+            "{} on {}: {} samples ({} positive), AUC {}, median {} ms{}",
+            result.model,
+            result.task,
+            result.samples.len(),
+            result.positives(),
+            result
+                .auc()
+                .map(|auc| format!("{auc:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            result.median_latency_ms().unwrap_or_default(),
+            if result.failures > 0 {
+                format!(
+                    ", {} failed ({})",
+                    result.failures,
+                    result.first_error.as_deref().unwrap_or("")
+                )
+            } else {
+                String::new()
+            }
+        );
+        for threshold in [0.5, 0.8] {
+            let at = result.at(threshold);
+            println!(
+                "  at {threshold:.1}: precision {} recall {}",
+                percent(at.precision()),
+                percent(at.recall())
+            );
         }
     }
 }

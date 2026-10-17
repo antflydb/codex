@@ -6,6 +6,7 @@
 //! same JSON contracts, so stores are written once against the backend trait.
 
 mod backend;
+pub mod bench;
 pub mod claim_progress;
 mod config;
 mod embedded;

@@ -57,7 +57,7 @@ pub(crate) fn request(model: &str, turn: &Turn) -> Value {
 }
 
 /// Probability that the turn holds something durable: anything but routine.
-fn probability(response: &Value) -> Option<f64> {
+pub(crate) fn probability(response: &Value) -> Option<f64> {
     let routine = response
         .get("answers")?
         .as_array()?
