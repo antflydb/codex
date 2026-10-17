@@ -227,6 +227,7 @@ fn render(
     };
     let mut out = json!({
         "concepts": related.seeds.iter().map(concept).collect::<Vec<_>>(),
+        "linked_concepts": related.linked.iter().map(concept).collect::<Vec<_>>(),
         "claims": related.claims.iter().map(|found| {
             let claim = &found.claim;
             let mut out = json!({
@@ -297,6 +298,7 @@ mod tests {
     #[test]
     fn render_strips_concept_prefixes_and_bookkeeping() {
         let related = Related {
+            linked: Vec::new(),
             seeds: vec!["concept/embeddinggemma_2".to_string()],
             claims: vec![RelatedClaim {
                 claim: Claim {
@@ -350,6 +352,7 @@ mod tests {
             render(&related, &std::collections::HashMap::new()),
             json!({
                 "concepts": ["embeddinggemma_2"],
+                "linked_concepts": [],
                 "claims": [{
                     "id": "v2:t:0000",
                     "kind": "decision",

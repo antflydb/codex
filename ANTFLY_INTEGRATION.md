@@ -1007,7 +1007,7 @@ A promoted concept carries only its canonical name, entity type and aliases.
 `Knowledge::describe_concepts` adds a one- or two-sentence description,
 written by a local generator from the current claims about the concept:
 - **Model:** `knowledge.describe_model`, default
-  `ggml-org/gemma-4-e2b-it-gguf`. An empty string turns descriptions off.
+  `ggml-org/gemma-4-E4B-it-GGUF`. An empty string turns descriptions off.
 - **Evidence:** up to 8 claims, settled first and then the newest, gathered
   by traversing the concept's `about` edges.
 - **Storage:** `codex_concept_descriptions`, keyed by concept key. The
@@ -1083,6 +1083,65 @@ yet):
 | `convaiinnovations/laya` | 0.98 | precision 100%, recall 71% |
 | `fastino/GLiNER2.5-Decide-1B` | 0.69 | no positives |
 | `antflydb/gliner2.5-decide-1B-gguf` | 0.69 | no positives; the approval state was rejected as over its 198-token limit |
+
+### Merging with descriptions, and concept links
+
+Every pass first describes concepts whose evidence changed, then merges
+synonyms, then links related concepts. It runs periodically after
+extraction, and on demand with `codex knowledge consolidate`.
+
+**Choosing the judge.** The candidates were measured on hand-labeled
+fixtures:
+- `concept_merge.jsonl`: 64 pairs, 18 of them the same thing. 30 are the
+  curated name pairs, with descriptions generated from project facts; 34
+  are real pairs from the E2E database, with their real descriptions.
+- `concept_relations.jsonl`: 47 directed pairs, 27 related.
+
+| Judge | Merge P / R (AUC) | Relations: detection P / R, type right |
+|---|---|---|
+| Extraction model, names only (before) | 83% / 83% (0.88) | — |
+| **Extraction model, with descriptions** | **94% / 94% (0.96)** | **89% / 93%, 24 of 27** |
+| Gemma 4 E4B (local generator), with descriptions | 67% / 44% (0.68) | 85% / 81%, 17 of 27 |
+| Laya, typed decide | 0.50–0.67 AUC | 0.39 AUC, 6 of 27 |
+| GLiNER2.5-Decide-1B, typed decide | 0.58 AUC | 0.60 AUC, 6 of 27 |
+
+The typed decide models are near chance on both tasks. Laya even gets worse
+with descriptions. So the extraction model judges, now with descriptions;
+this is what `codex knowledge benchmark --llm-judge` measures.
+
+**Merging:**
+- The judge sees each name followed by its description.
+- A concept with no close name neighbor can be paired through its nearest
+  description neighbor, at relative similarity 0.9 or more, with the same
+  number tokens. This catches synonyms with dissimilar names.
+- Description similarity alone is not a merge signal. Descriptions of
+  related things sound alike: "embedder" and "EmbeddingGemma 2" scored 0.98.
+
+**Links:**
+- **Candidates:** pairs of described concepts that are co-mentioned in
+  current claims, or within 0.85 by description.
+- **Judging:** the same model answers `a_is_b`, `b_is_a`, `a_part_b`,
+  `b_part_a`, `alternatives` or `none`, 40 pairs per request. Each pair is
+  judged once (`codex_concept_relation_reviews`).
+- **Storage:** edges go to `codex_concept_links`, one document per source
+  concept with `is_a`, `part_of` and `alternative_to` arrays. A field-derived
+  graph index (`codex_concept_links_v1`) makes them traversable.
+- **Retrieval:** `knowledge.search` expands its seed concepts one link in
+  either direction. Claims about a linked concept rank at half weight, and
+  the result lists `linked_concepts`.
+- **On the E2E database:** two passes judged 72 pairs and made 15 links.
+  About 11 were clearly right ("EmbeddingGemma 2 is_a embedder",
+  "Codex semantic search part_of Codex"). Two were wrong: one reversed, and
+  "threads part_of Codex Antfly importer".
+
+**Descriptions** use Gemma 4 E4B with a prompt that keeps each fact attached
+to the concept it is actually about. E2B, and the first prompt, moved
+properties between concepts ("Antfly … is half the size of Qwen3"). A prompt
+version in the evidence hash rewrites descriptions when the prompt changes.
+
+**Local inference retries:** local inference calls retry Antfly's retryable
+`MODEL_RESOURCE_BUSY` for up to 30 s (a model still loading, or memory held
+by another model).
 
 ### Label logs
 
@@ -1184,98 +1243,10 @@ through `knowledge.search`.
   history items grouped by `thread_id`, ordered by `ordinal`, segmented by
   `turn_id`, extracted per turn, with `about` edges from a thread node.
   Until then, claims carry thread and turn provenance.
-- **Concept relations and description-based merging.** Concepts now have
-  descriptions (see [Concept descriptions](#concept-descriptions)), but no
-  concept-to-concept relations (`is_a`, `part_of`). Consolidation does not
-  compare descriptions yet. Both change behavior, so they wait for numbers on
-  the labeled pairs.
-
-## Plan
-
-### Phase 0: Antfly prerequisites
-
-- Add `Database::sql_json` to the safe Rust crate (`rs/crates/embedded`); the
-  sys crate already declares `antfly_db_sql_json`.
-- Prepare a Laya checkpoint (`scripts/prepare_laya.py`) and smoke-test
-  `Inference::decide`; record cold-load and warm latency.
-- Define schemas, indexes, and enrichments for the data model above.
-- Verify Antfly Cloud's proxy (`colony/go/pkg/colony/cloud/proxy.go`) passes
-  `/db/v1/sql` and `/db/v1/transactions/*`; both fall through
-  `handleNonTableRequest`, where read-only keys cannot `POST` (so cannot run
-  SQL reads).
-
-### Phase 1: `AntflyThreadStore` (embedded backend)
-
-- Scaffold both crates, the `Backend` trait, and the `Embedded` backend.
-- Implement the full `ThreadStore`, using `InMemoryThreadStore` for structure
-  and `LocalThreadStore` for exact semantics.
-- `DualStore` (dev only): writes to `LocalThreadStore` and `AntflyThreadStore`
-  and diffs every read. Run real sessions through it until clean; keep it as a
-  regression harness for upstream changes (for example turn lineage #51415 and
-  partial answers #51260).
-- Gate: `type = "antfly"` passes the thread-manager and app-server thread
-  suites.
-
-### Phase 2: Remaining seams
-
-- `AntflyQueueStore`, `AntflyAgentMessageBoard`, `AntflyAgentGraphStore`,
-  `AntflyMemoriesBackend`.
-
-### Phase 3: `StateRuntime` on Antfly
-
-- Port method groups in order: goals, memories (jobs with lease/ownership
-  semantics via transactions), guardian feedback, polluted flags, shell
-  snapshots, remote control, external-agent imports. Drop backfill and rollout
-  migration. Route logs to `tracing` files.
-- Gate: with a fresh `CODEX_HOME`, new/resume/fork/archive/search/subagent
-  sessions, goals, and memories work, and no `*.sqlite` or rollout JSONL
-  files exist afterwards.
-
-### Phase 4: Laya approvals
-
-- Install `LayaApprovalReviewer` in shadow mode (log decision, return `None`).
-- Calibrate thresholds against actual user choices, then enforce `Allow`
-  above threshold and `Deny` for destructive actions only.
-
-### Phase 5: Migration
-
-- One-shot importer from an existing `CODEX_HOME` (SQLite read-only plus
-  rollout JSONL) into Antfly, including the `rollout_path → thread_id`
-  mapping. This is the last time SQLite is read.
-
-### Phase 6: Remote backend
-
-- `Remote` backend over `antfly-sdk`; run the `DualStore` harness against it.
-- Batch writes per turn or at `flush_thread`; never block a turn on the
-  network.
-- Embedded working copy plus remote replica: a local `.aflite` remains the
-  device store and an outbox replicates to the remote instance, giving offline
-  operation and cross-machine search. Antfly has no built-in Lite→server sync,
-  so the outbox lives in `codex_antfly_store`.
-- Key machine-local state (shell snapshots, project roots, worktree paths,
-  attachments) by machine, or keep it local only.
-
-### Phase 7: Knowledge graph
-
-See [Knowledge graph](#knowledge-graph).
-
-1. ✅ Embedded probe of graph indexes, extraction, resolvers and traversal.
-2. ✅ Claims into `codex_knowledge`: first from stage-1 extraction, now from
-   the per-turn claim pipeline, with turn attribution.
-3. ✅ Supersession: within a thread by the extractor; across threads with a
-   decide predicate when a thread settles.
-4. ✅ Retrieval and the `knowledge.search` tool.
-5. ✅ Memory notes reconciled from disk and linked to the same concepts.
-6. ✅ Synonym resolution (consolidation with lexical, embedding and model
-   gates; configured aliases), claim links, Unicode keys and an evaluation
-   harness. Seeded PageRank is done.
-7. Decide models: benchmark Laya, GLiNER2.5-multi-Decide and
-   GLiNER2.5-Decide-1B on the approval and supersession questions.
-   Gate: a labeled set from real sessions, and precision targets met, before
-   anything is injected into context automatically.
-
-## Operational constraints
-
+- **Concept-link auditing.** Links can be listed (`codex knowledge links`)
+  but not yet removed or corrected by hand. Consolidation reviews each
+  concept once, so concepts reviewed before descriptions existed are not
+  re-judged with them.
 - **Single writer (embedded).** Run Codex through the app-server daemon
   (the TUI probes its socket, or use `--remote`) so one process owns the
   `.aflite` file. Other processes fail fast rather than opening a second

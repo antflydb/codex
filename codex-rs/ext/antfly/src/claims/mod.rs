@@ -616,17 +616,24 @@ impl Worker {
 
     /// The extraction model's verdict on whether each pair of concept names
     /// means the same thing.
+    /// `pairs` are rendered with [`concepts::judged_name`]: each name with
+    /// its description when it has one.
     pub(crate) async fn judge(
         &self,
         job: &Job,
         pairs: Vec<(String, String)>,
     ) -> anyhow::Result<Vec<bool>> {
         let count = pairs.len();
+        let instructions = format!(
+            "{}{}",
+            concepts::JUDGE_INSTRUCTIONS,
+            concepts::DESCRIBED_JUDGE_NOTE
+        );
         let answer = self
             .sample(
                 job,
-                concepts::JUDGE_INSTRUCTIONS,
-                &concepts::judge_input(&pairs),
+                &instructions,
+                &concepts::judge_input_rendered(&pairs),
                 concepts::judge_schema(),
             )
             .await
@@ -635,6 +642,29 @@ impl Worker {
                 Stop::Failed(err) => err,
             })?;
         concepts::parse_judgments(&answer, count)
+    }
+
+    /// The extraction model's relation (`a_is_b`, …, `none`) for each pair
+    /// of concepts, rendered with [`concepts::judged_name`].
+    pub(crate) async fn relate(
+        &self,
+        job: &Job,
+        pairs: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        let count = pairs.len();
+        let answer = self
+            .sample(
+                job,
+                concepts::RELATION_INSTRUCTIONS,
+                &concepts::judge_input_rendered(&pairs),
+                concepts::relation_schema(),
+            )
+            .await
+            .map_err(|stop| match stop {
+                Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
+                Stop::Failed(err) => err,
+            })?;
+        concepts::parse_relations(&answer, count)
     }
 
     /// Takes one request from the budget; false when it is spent.
@@ -651,7 +681,7 @@ impl Worker {
 
     /// One request to the memory extraction model, attributed to a live
     /// thread (see [`Self::host`]).
-    async fn sample(
+    pub(crate) async fn sample(
         &self,
         job: &Job,
         instructions: &str,
@@ -699,15 +729,21 @@ impl Worker {
         let Some(knowledge) = job.claims.antfly.knowledge() else {
             return;
         };
+        // Describe first: the merge judge and the relation pass both read
+        // descriptions.
+        match knowledge.describe_concepts(DESCRIBE_PER_PASS).await {
+            Ok(report) => tracing::info!("antfly: concept descriptions: {report:?}"),
+            Err(err) => tracing::warn!("antfly: describing concepts failed: {err}"),
+        }
         let judge = |pairs: Vec<(String, String)>| self.judge(job, pairs);
         match concepts::consolidate(&knowledge, judge).await {
             Ok(report) => tracing::info!("antfly: concept consolidation: {report:?}"),
             Err(err) => tracing::warn!("antfly: concept consolidation failed: {err}"),
         }
-        // Describe after merging, so merged-away concepts are skipped.
-        match knowledge.describe_concepts(DESCRIBE_PER_PASS).await {
-            Ok(report) => tracing::info!("antfly: concept descriptions: {report:?}"),
-            Err(err) => tracing::warn!("antfly: describing concepts failed: {err}"),
+        let relate = |pairs: Vec<(String, String)>| self.relate(job, pairs);
+        match concepts::relate(&knowledge, relate).await {
+            Ok(report) => tracing::info!("antfly: concept relations: {report:?}"),
+            Err(err) => tracing::warn!("antfly: concept relations failed: {err}"),
         }
     }
 }

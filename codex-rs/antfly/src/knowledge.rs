@@ -100,9 +100,19 @@ const SUPERSEDE_CANDIDATES: usize = 3;
 const DESCRIBE_EVIDENCE: usize = 8;
 /// Longest description kept, in characters.
 const DESCRIPTION_MAX_CHARS: usize = 600;
-const DESCRIBE_INSTRUCTIONS: &str = "You write one or two plain sentences describing a concept from a \
-software project's knowledge graph, using only the facts given. Say what it is and its role. Do \
-not speculate.";
+/// The facts mention the concept but are mostly about other things, and a
+/// small model readily moves their properties onto it ("Antfly is half the
+/// size of Qwen3" from a claim about EmbeddingGemma); the instructions say
+/// to describe the concept itself and attribute each fact correctly.
+const DESCRIBE_INSTRUCTIONS: &str = "You describe one concept from a software project's \
+knowledge graph. The facts are statements that mention the concept; most are about other \
+things too. Write one or two plain sentences about the concept itself: first what kind of thing \
+it is, then its role in the project. Attribute each fact to the thing it is actually about; \
+never move a property of another concept onto this one. Use only the facts given. If they do \
+not say what the concept is, say only how it is used.";
+/// Changes whenever [`DESCRIBE_INSTRUCTIONS`] or the request shape changes,
+/// so existing descriptions are rewritten.
+const DESCRIBE_VERSION: u32 = 2;
 /// `version` of claims written by the per-turn pipeline. Claims from the
 /// earlier stage-1 extraction used the memory version (`v1`, `v2`).
 pub const TURN_CLAIMS_VERSION: &str = "turns";
@@ -110,6 +120,9 @@ pub const TURN_CLAIMS_VERSION: &str = "turns";
 const CLAIM_VERSIONS: &[&str] = &[TURN_CLAIMS_VERSION, "v1", "v2"];
 /// Provisional claims rank at this fraction of their score.
 const PROVISIONAL_WEIGHT: f64 = 0.5;
+/// Weight of claims reached only through a concept link (`is_a`,
+/// `part_of`, `alternative_to`) from a seed, not about a seed itself.
+const LINKED_WEIGHT: f64 = 0.5;
 
 fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -186,6 +199,23 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
         name,
         config,
         replaces_prefix: CONCEPT_GRAPH_PREFIX,
+    }
+}
+
+pub const CONCEPT_LINKS_INDEX: &str = "codex_concept_links_v1";
+const CONCEPT_LINKS_PREFIX: &str = "codex_concept_links";
+/// Edge kinds between concepts, each the name of a field on
+/// [`schema::CONCEPT_LINKS`] documents holding target concept keys.
+pub const CONCEPT_LINK_KINDS: &[&str] = &["is_a", "part_of", "alternative_to"];
+
+pub(crate) fn concept_links_index() -> GraphIndex {
+    GraphIndex {
+        name: CONCEPT_LINKS_INDEX.to_string(),
+        config: json!({"edge_types": CONCEPT_LINK_KINDS
+            .iter()
+            .map(|kind| json!({"name": kind, "field": kind}))
+            .collect::<Vec<_>>()}),
+        replaces_prefix: CONCEPT_LINKS_PREFIX,
     }
 }
 
@@ -456,6 +486,8 @@ pub struct RelatedNote {
 pub struct Related {
     /// Concept keys the search started from.
     pub seeds: Vec<String>,
+    /// Concepts linked to a seed, whose claims were also considered.
+    pub linked: Vec<String>,
     pub claims: Vec<RelatedClaim>,
     pub notes: Vec<RelatedNote>,
 }
@@ -1302,6 +1334,205 @@ impl Knowledge<'_> {
             .collect()
     }
 
+    /// Concepts whose descriptions are nearest to `key`'s, with similarity
+    /// relative to its own (1.0 = as close as itself), most similar first.
+    /// Empty when `key` has no description.
+    pub async fn description_neighbors(
+        &self,
+        key: &str,
+        limit: usize,
+    ) -> AntflyResult<Vec<(String, f64)>> {
+        let table = self.antfly.documents(schema::CONCEPT_DESCRIPTIONS);
+        let Some(text) = table
+            .get(key)
+            .await?
+            .and_then(|doc| doc.get("search_text")?.as_str().map(str::to_string))
+        else {
+            return Ok(Vec::new());
+        };
+        let hits = table.nearest(&text, limit + 1).await?;
+        let own = hits
+            .iter()
+            .find(|hit| hit.key == key)
+            .or(hits.first())
+            .map(|hit| hit.score)
+            .filter(|score| *score > 0.0)
+            .unwrap_or(1.0);
+        Ok(hits
+            .into_iter()
+            .filter(|hit| hit.key != key)
+            .map(|hit| (hit.key, hit.score / own))
+            .take(limit)
+            .collect())
+    }
+
+    /// Other concepts mentioned by the current claims about `key`, with how
+    /// many of those claims mention each.
+    pub async fn co_mentioned(&self, key: &str, limit: usize) -> HashMap<String, usize> {
+        let claims: Vec<String> = self
+            .about_any(schema::KNOWLEDGE, &[key.to_string()], limit)
+            .await
+            .into_iter()
+            .filter(|(_, doc, _)| doc.get("status").and_then(Value::as_str) == Some("current"))
+            .map(|(id, _, _)| id)
+            .collect();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for concepts in self
+            .concepts_of(schema::KNOWLEDGE, &claims)
+            .await
+            .into_values()
+        {
+            for concept in concepts {
+                if concept != key {
+                    *counts.entry(concept).or_default() += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// Every promoted concept, by key.
+    pub async fn concepts_by_key(&self) -> AntflyResult<BTreeMap<String, Concept>> {
+        Ok(self
+            .concepts()
+            .await?
+            .into_iter()
+            .map(|concept| (concept.key.clone(), concept))
+            .collect())
+    }
+
+    /// Concepts consolidation merged into another.
+    pub async fn merged_concept_keys(&self) -> AntflyResult<BTreeSet<String>> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_all(
+                "SELECT key FROM codex_concept_reviews WHERE merged_into IS NOT NULL",
+                vec![],
+            )
+            .await?
+            .iter()
+            .filter_map(|row| row.string("key").ok())
+            .collect())
+    }
+
+    /// Unordered concept pairs the relation pass has judged.
+    pub async fn related_pairs_reviewed(&self) -> AntflyResult<BTreeSet<(String, String)>> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_all("SELECT a, b FROM codex_concept_relation_reviews", vec![])
+            .await?
+            .iter()
+            .filter_map(|row| Some((row.string("a").ok()?, row.string("b").ok()?)))
+            .collect())
+    }
+
+    /// Records the relation judged between concepts `a` and `b`: an edge
+    /// `from kind to` (both among `a`, `b`), or none.
+    pub async fn record_concept_relation(
+        &self,
+        a: &str,
+        b: &str,
+        edge: Option<(&str, &str, &str)>,
+    ) -> AntflyResult<()> {
+        if let Some((from, kind, to)) = edge {
+            let table = self.antfly.documents(schema::CONCEPT_LINKS);
+            let mut doc = table
+                .get(from)
+                .await?
+                .unwrap_or_else(|| json!({"search_text": from}));
+            let targets = doc
+                .as_object_mut()
+                .map(|object| object.entry(kind.to_string()).or_insert_with(|| json!([])));
+            if let Some(Value::Array(targets)) = targets
+                && !targets.iter().any(|target| target.as_str() == Some(to))
+            {
+                targets.push(json!(to));
+            }
+            doc["linked_at_ms"] = json!(now_ms());
+            table.write(vec![Write::put(from.to_string(), doc)]).await?;
+        }
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let sql = self.antfly.sql().await?;
+        sql.execute(
+            "INSERT INTO codex_concept_relation_reviews (a, b, relation, reviewed_at_ms) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (a, b) DO UPDATE SET \
+             relation = excluded.relation, reviewed_at_ms = excluded.reviewed_at_ms",
+            crate::sql_params![
+                a,
+                b,
+                edge.map(|(from, kind, to)| format!("{from} {kind} {to}")),
+                now_ms()
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Every concept link as `(from, kind, to)` concept keys.
+    pub async fn concept_links(&self) -> AntflyResult<Vec<(String, String, String)>> {
+        let mut links = Vec::new();
+        for document in self
+            .antfly
+            .documents(schema::CONCEPT_LINKS)
+            .scan(ScanRequest::prefix(CONCEPT_PREFIX))
+            .await?
+        {
+            for kind in CONCEPT_LINK_KINDS {
+                for target in document.doc[*kind].as_array().into_iter().flatten() {
+                    if let Some(target) = target.as_str() {
+                        links.push((
+                            document.key.clone(),
+                            (*kind).to_string(),
+                            target.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(links)
+    }
+
+    /// Concepts one link away from each of `keys`, in either direction.
+    pub async fn linked_concepts(&self, keys: &[String]) -> HashMap<String, Vec<String>> {
+        let mut linked: HashMap<String, Vec<String>> = HashMap::new();
+        if keys.is_empty() {
+            return linked;
+        }
+        let documents = self.antfly.documents(schema::CONCEPT_LINKS);
+        let index = match documents.serving_graph(CONCEPT_LINKS_INDEX).await {
+            Ok(index) => index,
+            Err(err) => {
+                tracing::debug!("antfly: concept links lookup failed: {err}");
+                return linked;
+            }
+        };
+        let request = json!({
+            "graph_queries": {"links": {"index": index, "traverse": {
+                "start": {"keys": keys},
+                "direction": "both",
+                "edge_types": CONCEPT_LINK_KINDS,
+                "max_depth": 1,
+                "include_documents": false, "include_paths": true,
+                "deduplicate_nodes": false, "limit": 200,
+            }}},
+            "limit": 1,
+        });
+        let response = match documents.query(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!("antfly: concept links traversal failed: {err}");
+                return linked;
+            }
+        };
+        for node in reached_nodes(&response, "links") {
+            let neighbors = linked.entry(node.from.clone()).or_default();
+            if node.key != node.from && !neighbors.contains(&node.key) {
+                neighbors.push(node.key);
+            }
+        }
+        linked
+    }
+
     /// Descriptions of the concepts in `keys` that have one.
     pub async fn concept_descriptions(
         &self,
@@ -1329,18 +1560,7 @@ impl Knowledge<'_> {
         let Some(model) = self.config.describe_model.clone() else {
             return Ok(report);
         };
-        let merged: BTreeSet<String> = self
-            .antfly
-            .sql()
-            .await?
-            .fetch_all(
-                "SELECT key FROM codex_concept_reviews WHERE merged_into IS NOT NULL",
-                vec![],
-            )
-            .await?
-            .iter()
-            .filter_map(|row| row.string("key").ok())
-            .collect();
+        let merged = self.merged_concept_keys().await?;
         let table = self.antfly.documents(schema::CONCEPT_DESCRIPTIONS);
         for concept in self.concepts().await? {
             if report.described >= max {
@@ -1421,6 +1641,18 @@ impl Knowledge<'_> {
             seeds.extend(concepts);
         }
         let seeds: Vec<String> = seeds.into_iter().collect();
+        let linked: Vec<String> = {
+            let mut linked: BTreeSet<String> = self
+                .linked_concepts(&seeds)
+                .await
+                .into_values()
+                .flatten()
+                .collect();
+            for seed in &seeds {
+                linked.remove(seed);
+            }
+            linked.into_iter().collect()
+        };
         let keep = |claim: &Claim| include_superseded || claim.status == ClaimStatus::Current;
 
         // Candidates: direct hits, documents one `about` hop from a seed, and
@@ -1445,6 +1677,20 @@ impl Knowledge<'_> {
                     .1 = shared;
             }
         }
+        // Claims about a linked concept only, at lower weight.
+        let mut via_link: BTreeSet<String> = BTreeSet::new();
+        for (key, doc, shared) in self.about_any(schema::KNOWLEDGE, &linked, limit * 2).await {
+            if candidates.contains_key(&key) {
+                continue;
+            }
+            let Some(claim) = Claim::from_doc(&key, doc) else {
+                continue;
+            };
+            if keep(&claim) {
+                via_link.insert(key.clone());
+                candidates.insert(key, (claim, shared, 0.0));
+            }
+        }
         let ppr = self.ppr_scores(schema::KNOWLEDGE, &seeds, limit * 8).await;
         for key in ppr.keys() {
             if candidates.contains_key(key) {
@@ -1463,6 +1709,10 @@ impl Knowledge<'_> {
                     1.0
                 } else {
                     PROVISIONAL_WEIGHT
+                } * if via_link.contains(&key) {
+                    LINKED_WEIGHT
+                } else {
+                    1.0
                 };
                 RelatedClaim {
                     score: weight * rank_score(&ppr, &key, concepts.len(), direct),
@@ -1503,6 +1753,7 @@ impl Knowledge<'_> {
         notes.truncate(limit);
         Ok(Related {
             seeds,
+            linked,
             claims,
             notes,
         })
@@ -1528,6 +1779,7 @@ fn evidence_hash(model: &str, concept: &Concept, evidence: &[String]) -> String 
     use std::hash::Hash;
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    DESCRIBE_VERSION.hash(&mut hasher);
     model.hash(&mut hasher);
     concept.name.hash(&mut hasher);
     concept.entity_type.hash(&mut hasher);
@@ -1612,6 +1864,114 @@ fn predicate_probability(response: &Value, name: &str) -> Option<f64> {
         .find(|answer| answer.get("name").and_then(Value::as_str) == Some(name))?
         .get("probability")?
         .as_f64()
+}
+
+/// A concept as a judge sees it: its name, and its description when known.
+fn concept_line(name: &str, description: Option<&str>) -> String {
+    match description {
+        Some(description) => format!(
+            "{name} — {}",
+            truncate_chars(description, DECIDE_STATEMENT_MAX_CHARS)
+        ),
+        None => name.to_string(),
+    }
+}
+
+/// The decide request asking how concepts A and B relate, for merging: one
+/// choice whose `same` probability is the merge score. The other choices
+/// give the related-but-different mass somewhere to go; asked alone, "are
+/// these the same?" rates siblings and versions as high as synonyms.
+pub fn concept_merge_request(
+    model: &str,
+    a: &str,
+    a_description: Option<&str>,
+    b: &str,
+    b_description: Option<&str>,
+) -> Value {
+    json!({
+        "model": model,
+        "input": format!(
+            "A: {}\nB: {}",
+            concept_line(a, a_description),
+            concept_line(b, b_description)
+        ),
+        "questions": [{
+            "name": "relation",
+            "type": "choice",
+            "instructions": "Do A and B name the same thing in this software project?",
+            "choices": [
+                {"value": "same", "description": "The same thing under another name, spelling or abbreviation"},
+                {"value": "kind", "description": "One is a kind, version or instance of the other"},
+                {"value": "part", "description": "One is a part, feature or component of the other"},
+                {"value": "related", "description": "Different things that are related or used together"},
+                {"value": "unrelated", "description": "Different, unrelated things"},
+            ],
+        }],
+    })
+}
+
+/// Probability that a [`concept_merge_request`] response names one thing.
+pub fn concept_merge_score(response: &Value) -> Option<f64> {
+    relation_probabilities(response)?.get("same").copied()
+}
+
+/// Directed relations between concepts: `A <relation> B`.
+pub const CONCEPT_RELATIONS_KINDS: &[&str] = &["is_a", "part_of", "alternative_to"];
+
+/// The decide request asking how concept A relates to concept B.
+pub fn concept_relation_request(
+    model: &str,
+    a: &str,
+    a_description: Option<&str>,
+    b: &str,
+    b_description: Option<&str>,
+) -> Value {
+    json!({
+        "model": model,
+        "input": format!(
+            "A: {}\nB: {}",
+            concept_line(a, a_description),
+            concept_line(b, b_description)
+        ),
+        "questions": [{
+            "name": "relation",
+            "type": "choice",
+            "instructions": "How is A related to B?",
+            "choices": [
+                {"value": "a_is_b", "description": "A is a kind, version or instance of B"},
+                {"value": "b_is_a", "description": "B is a kind, version or instance of A"},
+                {"value": "a_part_b", "description": "A is a part, feature or component of B"},
+                {"value": "b_part_a", "description": "B is a part, feature or component of A"},
+                {"value": "alternatives", "description": "A and B are alternatives for the same purpose"},
+                {"value": "none", "description": "None of these"},
+            ],
+        }],
+    })
+}
+
+/// A judged concept edge: `(from, kind, to, probability)`, with `from` and
+/// `to` as `"a"` or `"b"`.
+pub type ConceptEdge = (&'static str, &'static str, &'static str, f64);
+
+/// A concept relation read from a [`concept_relation_request`] response:
+/// `(from, relation, to, probability)` with `from`/`to` as `"a"`/`"b"`,
+/// or `None` when "none" is likeliest. Also returns 1 − p(none).
+pub fn concept_relation_answer(response: &Value) -> Option<(Option<ConceptEdge>, f64)> {
+    let probabilities = relation_probabilities(response)?;
+    let related = 1.0 - probabilities.get("none").copied().unwrap_or_default();
+    let (top, p) = probabilities
+        .iter()
+        .max_by(|x, y| x.1.total_cmp(y.1))
+        .map(|(value, p)| (value.as_str(), *p))?;
+    let edge = match top {
+        "a_is_b" => Some(("a", "is_a", "b", p)),
+        "b_is_a" => Some(("b", "is_a", "a", p)),
+        "a_part_b" => Some(("a", "part_of", "b", p)),
+        "b_part_a" => Some(("b", "part_of", "a", p)),
+        "alternatives" => Some(("a", "alternative_to", "b", p)),
+        _ => None,
+    };
+    Some((edge, related))
 }
 
 /// The decide request asking whether `later` supersedes `earlier`.

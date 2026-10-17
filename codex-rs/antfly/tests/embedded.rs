@@ -1121,3 +1121,63 @@ fn concepts_are_described_from_their_claims() -> Result<(), Box<dyn std::error::
     })?;
     Ok(())
 }
+
+/// Judged concept relations become traversable links, recorded so each
+/// pair is judged once.
+#[test]
+fn concept_links_are_recorded_and_traversable() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let (gemma, embedder, qwen) = (
+            "concept/embeddinggemma_2",
+            "concept/embedder",
+            "concept/qwen3_embedding",
+        );
+        knowledge
+            .record_concept_relation(embedder, gemma, Some((gemma, "is_a", embedder)))
+            .await?;
+        knowledge
+            .record_concept_relation(gemma, qwen, Some((gemma, "alternative_to", qwen)))
+            .await?;
+        knowledge
+            .record_concept_relation(embedder, qwen, None)
+            .await?;
+        let mut links = knowledge.concept_links().await?;
+        links.sort();
+        assert_eq!(
+            links,
+            vec![
+                (
+                    gemma.to_string(),
+                    "alternative_to".to_string(),
+                    qwen.to_string()
+                ),
+                (gemma.to_string(), "is_a".to_string(), embedder.to_string()),
+            ]
+        );
+        let reviewed = knowledge.related_pairs_reviewed().await?;
+        assert_eq!(reviewed.len(), 3);
+        assert!(reviewed.contains(&(embedder.to_string(), qwen.to_string())));
+        // Links are traversed both ways; the graph index is built
+        // asynchronously.
+        let mut linked = std::collections::HashMap::new();
+        for _ in 0..100 {
+            linked = knowledge
+                .linked_concepts(&[embedder.to_string(), gemma.to_string()])
+                .await;
+            if linked.get(gemma).is_some_and(|found| found.len() == 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(linked.get(embedder), Some(&vec![gemma.to_string()]));
+        let mut from_gemma = linked.get(gemma).cloned().unwrap_or_default();
+        from_gemma.sort();
+        assert_eq!(from_gemma, vec![embedder.to_string(), qwen.to_string()]);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

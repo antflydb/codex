@@ -31,6 +31,7 @@ use super::ThreadClaims;
 use super::Worker;
 use super::concepts;
 pub use super::concepts::Consolidation;
+pub use super::concepts::Relations;
 use super::now_ms;
 
 /// Threads [`plan`] examines when no limit is given.
@@ -183,11 +184,12 @@ pub async fn run(
     Ok(report)
 }
 
-/// Runs one concept consolidation pass now.
+/// Runs one concept pass now: describes concepts whose evidence changed,
+/// merges synonyms, then links related concepts.
 pub async fn consolidate(
     thread_manager: &Arc<ThreadManager>,
     config: &Config,
-) -> anyhow::Result<Consolidation> {
+) -> anyhow::Result<(Consolidation, Relations)> {
     let antfly = match &config.experimental_thread_store {
         codex_core::config::ThreadStoreConfig::Antfly(antfly) => codex_antfly::shared(antfly),
         _ => anyhow::bail!("the thread store is not Antfly"),
@@ -212,7 +214,12 @@ pub async fn consolidate(
         claims,
         settle: false,
     };
-    concepts::consolidate(&knowledge, |pairs| worker.judge(&job, pairs)).await
+    if let Err(err) = knowledge.describe_concepts(usize::MAX).await {
+        tracing::warn!("antfly: describing concepts failed: {err}");
+    }
+    let merged = concepts::consolidate(&knowledge, |pairs| worker.judge(&job, pairs)).await?;
+    let related = concepts::relate(&knowledge, |pairs| worker.relate(&job, pairs)).await?;
+    Ok((merged, related))
 }
 
 /// Writes descriptions for up to `max` concepts whose evidence changed,
@@ -242,7 +249,17 @@ pub async fn benchmark(
     let turns = labeled_turns(antfly, limit).await?;
     let mut results = Vec::new();
     for model in models {
+        // Generator models (local Gemma) judge concepts in words, not typed
+        // decisions; benchmark them only with the generator variants.
+        if model.contains("gemma-4") {
+            results.push(codex_antfly::bench::concept_merge_generator(antfly, model).await);
+            results.push(codex_antfly::bench::concept_relation_generator(antfly, model).await);
+            continue;
+        }
         results.push(codex_antfly::bench::supersession(antfly, model).await);
+        results.push(codex_antfly::bench::concept_merge(antfly, model, false).await);
+        results.push(codex_antfly::bench::concept_merge(antfly, model, true).await);
+        results.push(codex_antfly::bench::concept_relation(antfly, model).await);
         let mut deny = codex_antfly::bench::TaskResult::new("approval_deny", model);
         let mut allow = codex_antfly::bench::TaskResult::new("approval_allow", model);
         for approval in &approvals {
@@ -374,6 +391,254 @@ async fn labeled_turns(antfly: &Antfly, limit: usize) -> anyhow::Result<Vec<Labe
         }
     }
     Ok(turns)
+}
+
+/// Candidate concept pairs for labeling merges and relations, with every
+/// signal the judges could use: name and description similarity (relative
+/// to each concept's own score), co-mentions in current claims, lexical
+/// identity, number tokens, and both descriptions.
+pub async fn export_pairs(
+    antfly: &Antfly,
+    neighbors: usize,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use codex_antfly::knowledge::concept_identity;
+    use codex_antfly::knowledge::number_tokens;
+    use std::collections::BTreeMap;
+    let knowledge = antfly
+        .knowledge()
+        .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+    let merged: std::collections::BTreeSet<String> = {
+        let sql = antfly.sql().await?;
+        sql.fetch_all(
+            "SELECT key FROM codex_concept_reviews WHERE merged_into IS NOT NULL",
+            vec![],
+        )
+        .await?
+        .iter()
+        .filter_map(|row| row.string("key").ok())
+        .collect()
+    };
+    let concepts: BTreeMap<String, codex_antfly::knowledge::Concept> = knowledge
+        .concepts()
+        .await?
+        .into_iter()
+        .filter(|concept| !merged.contains(&concept.key))
+        .map(|concept| (concept.key.clone(), concept))
+        .collect();
+    let keys: Vec<String> = concepts.keys().cloned().collect();
+    let descriptions = knowledge.concept_descriptions(&keys).await?;
+    #[derive(Default)]
+    struct Signals {
+        name: Option<f64>,
+        description: Option<f64>,
+        co_mentions: usize,
+    }
+    let mut pairs: BTreeMap<(String, String), Signals> = BTreeMap::new();
+    let ordered = |a: &str, b: &str| {
+        if a < b {
+            (a.to_string(), b.to_string())
+        } else {
+            (b.to_string(), a.to_string())
+        }
+    };
+    for concept in concepts.values() {
+        let hits = knowledge
+            .concept_neighbors(&concept.name, neighbors + 1)
+            .await?;
+        let own = hits
+            .iter()
+            .find(|(neighbor, _)| neighbor.key == concept.key)
+            .or(hits.first())
+            .map(|(_, score)| *score)
+            .filter(|score| *score > 0.0)
+            .unwrap_or(1.0);
+        for (neighbor, score) in hits {
+            if neighbor.key != concept.key && concepts.contains_key(&neighbor.key) {
+                let signals = pairs
+                    .entry(ordered(&concept.key, &neighbor.key))
+                    .or_default();
+                let relative = score / own;
+                signals.name = Some(signals.name.map_or(relative, |s: f64| s.max(relative)));
+            }
+        }
+        for (neighbor, relative) in knowledge
+            .description_neighbors(&concept.key, neighbors)
+            .await?
+        {
+            if concepts.contains_key(&neighbor) {
+                let signals = pairs.entry(ordered(&concept.key, &neighbor)).or_default();
+                signals.description = Some(
+                    signals
+                        .description
+                        .map_or(relative, |s: f64| s.max(relative)),
+                );
+            }
+        }
+        for (neighbor, count) in knowledge.co_mentioned(&concept.key, 50).await {
+            if concepts.contains_key(&neighbor) && neighbor != concept.key {
+                let signals = pairs.entry(ordered(&concept.key, &neighbor)).or_default();
+                signals.co_mentions = signals.co_mentions.max(count);
+            }
+        }
+    }
+    Ok(pairs
+        .into_iter()
+        .filter_map(|((a, b), signals)| {
+            let (ca, cb) = (concepts.get(&a)?, concepts.get(&b)?);
+            Some(serde_json::json!({
+                "a": ca.name,
+                "b": cb.name,
+                "a_key": a,
+                "b_key": b,
+                "a_type": ca.entity_type,
+                "b_type": cb.entity_type,
+                "a_description": descriptions.get(&a),
+                "b_description": descriptions.get(&b),
+                "name_similarity": signals.name,
+                "description_similarity": signals.description,
+                "co_mentions": signals.co_mentions,
+                "lexical_identity": concept_identity(&ca.name) == concept_identity(&cb.name),
+                "same_numbers": number_tokens(&ca.name) == number_tokens(&cb.name),
+            }))
+        })
+        .collect())
+}
+
+/// Benchmarks the extraction model as the concept judge, through a host
+/// session: merges judged on names only and with descriptions, and
+/// relations, on the labeled concept fixtures.
+pub async fn benchmark_llm(
+    thread_manager: &Arc<ThreadManager>,
+    config: &Config,
+) -> anyhow::Result<Vec<codex_antfly::bench::TaskResult>> {
+    use codex_antfly::bench::TaskResult;
+    let claims = claims(config)?;
+    let model = super::extract_model(config);
+    let worker = Worker::standalone(Arc::downgrade(thread_manager), usize::MAX, None);
+    let job = Job {
+        thread_id: String::new(),
+        claims,
+        settle: false,
+    };
+    let cases = |fixture: &str| -> Vec<serde_json::Value> {
+        fixture
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    };
+    let merges = cases(codex_antfly::bench::CONCEPT_MERGE_FIXTURE);
+    let relations = cases(codex_antfly::bench::CONCEPT_RELATIONS_FIXTURE);
+    let side = |case: &serde_json::Value, key: &str, described: bool| {
+        concepts::judged_name(
+            case[key].as_str().unwrap_or_default(),
+            described
+                .then(|| case[format!("{key}_description")].as_str())
+                .flatten(),
+        )
+    };
+    let mut results = Vec::new();
+    for described in [false, true] {
+        let task = if described {
+            "concept_merge_llm"
+        } else {
+            "concept_merge_llm_names"
+        };
+        let mut result = TaskResult::new(task, &model);
+        let instructions = if described {
+            format!(
+                "{}{}",
+                concepts::JUDGE_INSTRUCTIONS,
+                concepts::DESCRIBED_JUDGE_NOTE
+            )
+        } else {
+            concepts::JUDGE_INSTRUCTIONS.to_string()
+        };
+        for chunk in merges.chunks(40) {
+            let pairs: Vec<(String, String)> = chunk
+                .iter()
+                .map(|case| (side(case, "a", described), side(case, "b", described)))
+                .collect();
+            let started = std::time::Instant::now();
+            let verdicts = worker
+                .sample(
+                    &job,
+                    &instructions,
+                    &concepts::judge_input_rendered(&pairs),
+                    concepts::judge_schema(),
+                )
+                .await
+                .map_err(|_| "model request failed".to_string())
+                .and_then(|answer| {
+                    concepts::parse_judgments(&answer, pairs.len()).map_err(|err| err.to_string())
+                });
+            let each = started.elapsed() / u32::try_from(pairs.len().max(1)).unwrap_or(1);
+            for (index, case) in chunk.iter().enumerate() {
+                let label = case["same"].as_bool().unwrap_or(false);
+                let score = verdicts
+                    .as_ref()
+                    .map(|same| Some(if same[index] { 1.0 } else { 0.0 }))
+                    .map_err(Clone::clone);
+                result.record_scored(label, score, each);
+            }
+        }
+        results.push(result);
+    }
+    let mut result = TaskResult::new("concept_relation_llm", &model);
+    let (mut typed, mut related) = (0usize, 0usize);
+    for chunk in relations.chunks(40) {
+        let pairs: Vec<(String, String)> = chunk
+            .iter()
+            .map(|case| (side(case, "a", true), side(case, "b", true)))
+            .collect();
+        let started = std::time::Instant::now();
+        let answers = worker
+            .sample(
+                &job,
+                concepts::RELATION_INSTRUCTIONS,
+                &concepts::judge_input_rendered(&pairs),
+                concepts::relation_schema(),
+            )
+            .await
+            .map_err(|_| "model request failed".to_string())
+            .and_then(|answer| {
+                concepts::parse_relations(&answer, pairs.len()).map_err(|err| err.to_string())
+            });
+        let each = started.elapsed() / u32::try_from(pairs.len().max(1)).unwrap_or(1);
+        for (index, case) in chunk.iter().enumerate() {
+            let expected = case["relation"].as_str().unwrap_or("none");
+            let answer = answers.as_ref().map(|all| all[index].clone());
+            if expected != "none" {
+                related += 1;
+                if answer
+                    .as_deref()
+                    .is_ok_and(|got| relation_matches(expected, got))
+                {
+                    typed += 1;
+                }
+            }
+            result.record_scored(
+                expected != "none",
+                answer
+                    .map(|got| Some(if got == "none" { 0.0 } else { 1.0 }))
+                    .map_err(Clone::clone),
+                each,
+            );
+        }
+    }
+    result.notes.push(format!(
+        "relation and direction right on {typed} of {related} related pairs"
+    ));
+    results.push(result);
+    Ok(results)
+}
+
+/// Whether a judge's `a_is_b`-style answer matches a fixture's
+/// `a <relation> b` label.
+fn relation_matches(expected: &str, answer: &str) -> bool {
+    matches!(
+        (expected, answer),
+        ("is_a", "a_is_b") | ("part_of", "a_part_b") | ("alternative_to", "alternatives")
+    )
 }
 
 /// Pipeline-wide state for `codex knowledge status`.

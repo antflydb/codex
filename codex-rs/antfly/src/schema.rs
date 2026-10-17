@@ -46,6 +46,10 @@ pub const CONCEPTS: &str = "codex_concepts";
 /// about them, one document per concept key. `search_text` holds the
 /// description, so it is full-text searchable and embedded.
 pub const CONCEPT_DESCRIPTIONS: &str = "codex_concept_descriptions";
+/// Judged relations between concepts, one document per source concept key,
+/// with `is_a`, `part_of` and `alternative_to` arrays of target keys that a
+/// field-derived graph index turns into edges.
+pub const CONCEPT_LINKS: &str = "codex_concept_links";
 
 /// Graph indexes a document table carries when the knowledge graph is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub enum TableGraph {
     Concepts,
     /// `supersedes` edges from each claim's `supersedes` field.
     ClaimLinks,
+    /// `is_a`, `part_of` and `alternative_to` edges between concepts.
+    ConceptLinks,
 }
 
 /// A document table with the declared fields SQL can filter and join on.
@@ -127,6 +133,12 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
         graphs: &[],
         // Nearest-name lookup for concept merging.
         dense_field: Some("canonical_name"),
+    },
+    DocumentTable {
+        name: CONCEPT_LINKS,
+        fields: &[("linked_at_ms", "integer")],
+        graphs: &[TableGraph::ConceptLinks],
+        dense_field: None,
     },
     DocumentTable {
         name: CONCEPT_DESCRIPTIONS,
@@ -640,6 +652,19 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
     // The probability a decision's verdict was thresholded on, so verdicts
     // can be re-scored at other thresholds without parsing responses.
     statements: &["ALTER TABLE codex_decision_log ADD COLUMN score DOUBLE PRECISION"],
+}, Migration {
+    version: 27,
+    name: "concept relation reviews",
+    // One row per unordered concept pair the relation pass has judged (`a`
+    // sorts before `b`), so pairs are never judged twice. `relation` is the
+    // judged edge as `<from> <kind> <to>`, or NULL for none.
+    statements: &["CREATE TABLE IF NOT EXISTS codex_concept_relation_reviews (
+        a TEXT NOT NULL,
+        b TEXT NOT NULL,
+        relation TEXT,
+        reviewed_at_ms BIGINT NOT NULL,
+        PRIMARY KEY (a, b)
+    )"],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

@@ -354,6 +354,39 @@ impl EmbeddedBackend {
     }
 }
 
+/// Longest a local inference call waits out `MODEL_RESOURCE_BUSY`.
+const BUSY_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Runs `call`, retrying while the runtime reports a retryable
+/// `MODEL_RESOURCE_BUSY`: a model still loading, or another model holding
+/// the inference memory. Waits as long as the error's `retry_after_ms` asks
+/// (1 s otherwise), up to [`BUSY_RETRY_BUDGET`] in total. Runs on an executor
+/// thread, so sleeping blocks only that thread.
+fn retry_while_busy<T>(
+    mut call: impl FnMut() -> Result<T, antfly_embedded::InferenceError>,
+) -> Result<T, antfly_embedded::InferenceError> {
+    let started = std::time::Instant::now();
+    loop {
+        let err = match call() {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        let body: Value = serde_json::from_str(&err.body).unwrap_or(Value::Null);
+        let busy = body.get("error").and_then(Value::as_str) == Some("MODEL_RESOURCE_BUSY")
+            && body.get("retryable").and_then(Value::as_bool) != Some(false);
+        let wait = Duration::from_millis(
+            body.get("retry_after_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_000)
+                .clamp(100, 5_000),
+        );
+        if !busy || started.elapsed() + wait > BUSY_RETRY_BUDGET {
+            return Err(err);
+        }
+        std::thread::sleep(wait);
+    }
+}
+
 /// Returns the cached inference handle, opening it on first use. Must run on
 /// an executor thread: opening loads the runtime and needs a large stack.
 fn inference_handle(
@@ -866,8 +899,7 @@ impl LocalDecider {
             .executor
             .run(move || {
                 let inference = inference_handle(&slot, models_dir.as_deref())?;
-                inference
-                    .extract(&bytes)
+                retry_while_busy(|| inference.extract(&bytes))
                     .map_err(|err| AntflyError::Embedded(format!("extract: {err}")))
             })
             .await?;
@@ -883,8 +915,7 @@ impl LocalDecider {
             .executor
             .run(move || {
                 let inference = inference_handle(&slot, models_dir.as_deref())?;
-                inference
-                    .generate(&bytes)
+                retry_while_busy(|| inference.generate(&bytes))
                     .map_err(|err| AntflyError::Embedded(format!("generate: {err}")))
             })
             .await?;
@@ -900,8 +931,7 @@ impl LocalDecider {
             .executor
             .run(move || {
                 let inference = inference_handle(&slot, models_dir.as_deref())?;
-                inference
-                    .decide(&bytes)
+                retry_while_busy(|| inference.decide(&bytes))
                     .map_err(|err| AntflyError::Embedded(format!("decide: {err}")))
             })
             .await?;

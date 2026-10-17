@@ -614,7 +614,7 @@ pub struct AntflyStoreToml {
     /// earlier one (default 0.8).
     pub supersede_threshold: Option<f64>,
     /// Local generator that writes concept descriptions from the claims
-    /// about each concept (default `ggml-org/gemma-4-e2b-it-gguf`); an empty
+    /// about each concept (default `ggml-org/gemma-4-E4B-it-GGUF`); an empty
     /// string turns descriptions off.
     pub describe_model: Option<String>,
     /// Extract claims from finished turns with the memory extraction model

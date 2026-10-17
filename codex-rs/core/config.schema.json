@@ -4518,7 +4518,7 @@
               "type": "string"
             },
             "describe_model": {
-              "description": "Local generator that writes concept descriptions from the claims about each concept (default `ggml-org/gemma-4-e2b-it-gguf`); an empty string turns descriptions off.",
+              "description": "Local generator that writes concept descriptions from the claims about each concept (default `ggml-org/gemma-4-E4B-it-GGUF`); an empty string turns descriptions off.",
               "type": "string"
             },
             "embedder_dims": {

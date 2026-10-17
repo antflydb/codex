@@ -47,7 +47,7 @@ impl Default for EmbedderConfig {
 pub const DEFAULT_EXTRACT_MODEL: &str = "fastino/gliner2.5-base-v1";
 
 /// Local generator that writes concept descriptions.
-pub const DEFAULT_DESCRIBE_MODEL: &str = "ggml-org/gemma-4-e2b-it-gguf";
+pub const DEFAULT_DESCRIBE_MODEL: &str = "ggml-org/gemma-4-E4B-it-GGUF";
 
 /// The knowledge graph: claims and memory notes linked to the concepts
 /// they are about (see `crate::knowledge`).

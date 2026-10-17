@@ -45,6 +45,21 @@ pub enum KnowledgeSubcommand {
     Describe(DescribeArgs),
     /// Compare decide models on the labeled questions Codex has logged.
     Benchmark(BenchmarkArgs),
+    /// Write candidate concept pairs (JSONL) for labeling merges and
+    /// relations.
+    ExportPairs(ExportPairsArgs),
+    /// List the links between concepts (is_a, part_of, alternative_to).
+    Links,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExportPairsArgs {
+    /// Name and description neighbors considered per concept.
+    #[arg(long, default_value_t = 5)]
+    neighbors: usize,
+    /// Output file; standard output when omitted.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -56,6 +71,10 @@ pub struct BenchmarkArgs {
     /// At most this many logged approvals and extraction turns.
     #[arg(long, default_value_t = 200)]
     limit: usize,
+    /// Also benchmark the extraction model as the concept judge (a few
+    /// model requests on your account).
+    #[arg(long)]
+    llm_judge: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -105,6 +124,41 @@ impl KnowledgeCli {
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
             KnowledgeSubcommand::Backfill(args) => backfill(&antfly, config, args).await,
+            KnowledgeSubcommand::Links => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let names = knowledge
+                    .concepts_by_key()
+                    .await
+                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                let name = |key: &str| {
+                    names
+                        .get(key)
+                        .map(|concept| concept.name.clone())
+                        .unwrap_or_else(|| key.to_string())
+                };
+                for (from, kind, to) in knowledge.concept_links().await? {
+                    println!("{} {kind} {}", name(&from), name(&to));
+                }
+                Ok(())
+            }
+            KnowledgeSubcommand::ExportPairs(args) => {
+                let pairs = knowledge_admin::export_pairs(&antfly, args.neighbors)
+                    .await
+                    .context(
+                        "exporting concept pairs (is the app-server daemon holding the database?)",
+                    )?;
+                let lines: Vec<String> = pairs.iter().map(ToString::to_string).collect();
+                let text = lines.join("\n") + "\n";
+                match &args.out {
+                    Some(path) => std::fs::write(path, text)
+                        .with_context(|| format!("writing {}", path.display()))?,
+                    None => print!("{text}"),
+                }
+                eprintln!("{} candidate pairs", pairs.len());
+                Ok(())
+            }
             KnowledgeSubcommand::Benchmark(args) => {
                 let mut models = args.models;
                 if models.is_empty() {
@@ -114,9 +168,15 @@ impl KnowledgeCli {
                         models.push(approvals);
                     }
                 }
-                let results = knowledge_admin::benchmark(&antfly, &models, args.limit)
+                let mut results = knowledge_admin::benchmark(&antfly, &models, args.limit)
                     .await
                     .context("benchmarking (is the app-server daemon holding the database?)")?;
+                if args.llm_judge {
+                    let (thread_manager, host) = start_host(&config).await?;
+                    let judged = knowledge_admin::benchmark_llm(&thread_manager, &config).await;
+                    stop_host(&thread_manager, host).await;
+                    results.extend(judged?);
+                }
                 print_benchmark(&results);
                 Ok(())
             }
@@ -140,10 +200,14 @@ impl KnowledgeCli {
                 let (thread_manager, host) = start_host(&config).await?;
                 let report = knowledge_admin::consolidate(&thread_manager, &config).await;
                 stop_host(&thread_manager, host).await;
-                let report = report?;
+                let (report, relations) = report?;
                 println!(
                     "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
                     report.examined, report.lexical_merges, report.judged_merges, report.judged
+                );
+                println!(
+                    "judged {} concept pairs for relations: {} linked",
+                    relations.judged, relations.linked
                 );
                 Ok(())
             }
@@ -179,6 +243,9 @@ fn print_benchmark(results: &[codex_antfly::bench::TaskResult]) {
                 String::new()
             }
         );
+        for note in &result.notes {
+            println!("  {note}");
+        }
         for threshold in [0.5, 0.8] {
             let at = result.at(threshold);
             println!(
