@@ -161,7 +161,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `9dd098d773` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `968f037c9a` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -169,7 +169,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `9dd098d773` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `968f037c9a` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -377,7 +377,7 @@ Fixed in Codex during the run:
   foreign key and then delete through a subquery (`42P01` on `COMMIT`,
   antflydb/antfly#1141, fixed by #1142). Unbounded index lag under steady
   writes (antflydb/antfly#1139) is addressed by #1140. The pin
-  (`9dd098d773`) includes all three.
+  (`968f037c9a`) includes all three.
 
 Remaining gaps:
 
@@ -507,7 +507,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `9dd098d773`, which includes
+against Antfly 1258e8cfcb; the pin is now `968f037c9a`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -515,7 +515,8 @@ replacement), #1127 (NUL diagnostics, statement context in errors), #1135
 #1142 (foreign-key commits after a refresh), #1140 (maintenance progress
 under steady writes), #1145 (graph replacement with an inline resolver) and
 #1158 (inline-resolver enrichment settles, explicit `models_dir` in
-background maintenance, no handle-reopen churn).
+background maintenance, no handle-reopen churn) and #1163 (enrichment and
+resolution no longer stall under writes with an inline resolver).
 
 ### Goal
 
@@ -883,15 +884,13 @@ checks this: a merge made under `slug` still resolves after the upgrade, and
 "Café" keeps its accent. If Antfly does refuse a replacement, the old graph
 keeps serving and table setup logs a warning instead of failing writes.
 
-Open problem: on a live database the replacement can still stall, in
-`catching_up` with `blocked_reason: waiting_for_producer_enrichment`. #1158
-fixed the earlier causes: inline-resolver enrichment that never went idle
-(antflydb/antfly#1159) and background extraction broken by an explicit
-`models_dir` (antflydb/antfly#1160). What remains is antflydb/antfly#1161.
-Under modest writes to a table whose graph has an inline resolver, the
-enrichment worker goes missing (`stall_reason: worker_missing`), even across
-a reopen, and only a foreground `run_until_idle` completes the tail. The old
-graph keeps serving meanwhile.
+On a live database the replacement used to stall, through three Antfly bugs:
+- Inline-resolver enrichment never went idle (antflydb/antfly#1159).
+- An explicit `models_dir` broke background extraction (antflydb/antfly#1160).
+- The enrichment worker went missing under writes (antflydb/antfly#1161).
+
+#1158 and #1163 fixed them. At the current pin, a replacement under one write
+per second swaps in about 20 s, and enrichment stays caught up afterwards.
 
 Since #1158 the embedded tests extract for real. GLiNER needs about 2.4 GB of
 inference live memory, so under memory pressure (other builds running, say)
