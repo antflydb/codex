@@ -91,6 +91,9 @@ pub struct Answers {
     pub external: f64,
     pub destructive: f64,
     pub intent_match: bool,
+    /// Probability that the action matches the request, when the model
+    /// reports per-choice probabilities for the intent question.
+    pub intent_match_probability: Option<f64>,
 }
 
 impl Answers {
@@ -115,6 +118,16 @@ impl Answers {
             external: probability("external")?,
             destructive: probability("destructive")?,
             intent_match: answer("intent")?.get("choice")?.as_str()? == "match",
+            intent_match_probability: answer("intent")
+                .and_then(|intent| intent.get("probabilities"))
+                .and_then(Value::as_array)
+                .and_then(|choices| {
+                    choices
+                        .iter()
+                        .find(|entry| entry.get("value").and_then(Value::as_str) == Some("match"))
+                })
+                .and_then(|entry| entry.get("probability"))
+                .and_then(Value::as_f64),
         })
     }
 
@@ -179,6 +192,7 @@ mod tests {
             external,
             destructive,
             intent_match: true,
+            intent_match_probability: None,
         }
     }
 

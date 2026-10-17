@@ -40,6 +40,7 @@ use codex_antfly::ClaimPipelineConfig;
 use codex_antfly::claim_progress;
 use codex_antfly::history;
 use codex_antfly::knowledge::ClaimStatus;
+use codex_antfly::knowledge::TurnClaim;
 use codex_antfly::knowledge::TurnClaimBatch;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -551,6 +552,18 @@ impl Worker {
                         )
                         .await?;
                     let (claims, retracts) = request.parse(&answer)?;
+                    let model = extract_model(&job.claims.config);
+                    let record = extraction_record(
+                        &job.thread_id,
+                        &model,
+                        &evidence,
+                        &claims,
+                        retracts.len(),
+                    );
+                    if let Err(err) = codex_antfly::labels::record_extraction(antfly, record).await
+                    {
+                        tracing::debug!("failed to record claim extraction: {err}");
+                    }
                     if !claims.is_empty() || !retracts.is_empty() {
                         knowledge
                             .append_turn_claims(TurnClaimBatch {
@@ -673,6 +686,45 @@ impl Worker {
     }
 }
 
+/// The model claim extraction samples, as configured.
+fn extract_model(config: &Config) -> String {
+    config
+        .memories
+        .extract_model
+        .clone()
+        .unwrap_or_else(|| "provider_default".to_string())
+}
+
+/// What one extraction request covered and found, per turn: the label for
+/// triaging turns before extraction.
+fn extraction_record<'a>(
+    thread_id: &'a str,
+    model: &'a str,
+    evidence: &[&Turn],
+    claims: &[TurnClaim],
+    retracts: usize,
+) -> codex_antfly::labels::ExtractionRecord<'a> {
+    codex_antfly::labels::ExtractionRecord {
+        thread_id,
+        model,
+        turns: evidence
+            .iter()
+            .map(|turn| codex_antfly::labels::ExtractedTurn {
+                turn_id: turn.turn_id.clone(),
+                start: turn.start,
+                end: turn.end,
+                chars: turn.text.chars().count(),
+                claims: claims
+                    .iter()
+                    .filter(|claim| claim.turn_ordinal == turn.start)
+                    .count(),
+            })
+            .collect(),
+        claims: claims.len(),
+        retracts,
+    }
+}
+
 /// Consecutive turns grouped so each request stays within the input budget.
 /// A turn over budget is cut to it.
 fn batches<'a>(turns: &[&'a Turn]) -> Vec<Vec<&'a Turn>> {
@@ -773,6 +825,32 @@ mod tests {
             finished: true,
             text: "x".repeat(len),
         }
+    }
+
+    #[test]
+    fn extraction_records_attribute_claims_to_their_turns() {
+        let turns = [turn(0, 10), turn(5, 20), turn(9, 30)];
+        let refs: Vec<&Turn> = turns.iter().collect();
+        let claim = |turn_ordinal| TurnClaim {
+            kind: codex_antfly::knowledge::ClaimKind::Decision,
+            statement: "Codex keeps Laya as the decide model.".to_string(),
+            turn_id: None,
+            turn_ordinal,
+            replaces: Vec::new(),
+            motivates: Vec::new(),
+            rejected_in_favor_of: Vec::new(),
+        };
+        let record = extraction_record(
+            "thread-1",
+            "model",
+            &refs,
+            &[claim(5), claim(5), claim(9)],
+            1,
+        );
+        let claims: Vec<usize> = record.turns.iter().map(|turn| turn.claims).collect();
+        assert_eq!(claims, vec![0, 2, 1]);
+        assert_eq!(record.turns[1].chars, 20);
+        assert_eq!((record.claims, record.retracts), (3, 1));
     }
 
     #[test]

@@ -963,12 +963,42 @@ outside them (`gliner_boundary_qualification.zig`):
 - `fastino/GLiNER2.5-multi-Decide` serves extraction and Decide, but only
   through short single-window profiles. The measured entity row is 663 bytes /
   114 words, and there is no long-document profile.
-- `fastino/GLiNER2.5-Decide-1B` serves Decide only. Its entity and relation
-  heads are not implemented, and Decide is limited to one item and at most 198
-  prepared tokens (antflydb/antfly#1083 and its follow-up comment).
+- `fastino/GLiNER2.5-Decide-1B` in FP32 (about 4.7 GB) serves Decide and,
+  since its span heads landed, entity/relation extraction. Both are limited
+  to 64 prepared sequences of at most 1024 tokens, and there is no
+  long-document (`window`) mode.
+- The Q8 bundle `antflydb/gliner2.5-decide-1B-gguf` (1.74 GB) serves Decide
+  only: one sequence of at most 198 prepared tokens, and no extraction. Its
+  qualification is separate from FP32's.
 
-Supersession predicates are short, so they fit both models' Decide limits; the
-approval prompt (up to 3,000 characters) does not.
+These limits are what Antfly has measured, not architectural ones (the 1B's
+encoder accepts 7999 tokens). antflydb/antfly#1083 tracks the requests to
+lift them: Q8 Decide and extraction at FP32's limits, long-document
+extraction for the 1B, and a fine-tuning path for it.
+
+### Label logs
+
+Every model call that decides something on Codex's behalf is kept as a
+labeled example, for calibrating thresholds, benchmarking decide models and
+fine-tuning (`codex-rs/antfly/src/labels.rs`, migration 25):
+
+- **Approvals** (`codex_approvals`, record version 2). Each record holds:
+  - the effect probabilities and the intent probability;
+  - the verdict, plus the mode, decide model and thresholds that produced it;
+  - the user's resolution (`decision`, `decided_by`, `resolved_at_ms`),
+    written as soon as it happens, so a restart before the tool finishes
+    keeps it;
+  - the tool outcome (`outcome`, `finished_at_ms`).
+
+  The working directory is part of `action`.
+- **Supersession checks** (`codex_decision_log`, `kind = 'supersession'`).
+  Each row holds the decide input and full response, the verdict, the
+  threshold and the model. The equal-text shortcut makes no model call and
+  is not logged.
+- **Claim extraction** (`codex_extraction_log`), one row per turn sent to
+  the extractor. Each row holds the turn's ordinals and characters, the
+  claims attributed to it, the request's totals and the model. A turn with
+  zero claims is a "skip" label for triage before extraction.
 
 ### Antfly findings (from the embedded probe)
 

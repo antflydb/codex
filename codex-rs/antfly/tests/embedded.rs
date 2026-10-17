@@ -922,3 +922,85 @@ fn graph_upgrade_moves_resolver_and_keeps_merges() -> Result<(), Box<dyn std::er
     })?;
     Ok(())
 }
+
+/// Decisions and extractions are logged as labels for calibrating and
+/// benchmarking local models.
+#[test]
+fn label_logs_record_decisions_and_extracted_turns() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::labels;
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let response = json!({"answers": [{"name": "supersedes", "probability": 0.91}]});
+        labels::record_decision(
+            &antfly,
+            labels::DecisionRecord {
+                kind: "supersession",
+                model: "convaiinnovations/laya",
+                subject: None,
+                input: "Earlier statement: a\nLater statement: b",
+                response: &response,
+                result: Some(true),
+                threshold_bp: Some(8_000),
+            },
+        )
+        .await?;
+        let turn = |start: u64, claims: usize| labels::ExtractedTurn {
+            turn_id: Some(format!("turn-{start}")),
+            start,
+            end: start + 4,
+            chars: 120,
+            claims,
+        };
+        let record = |claims: Vec<usize>| labels::ExtractionRecord {
+            thread_id: "thread-1",
+            model: "gpt-5.6-luna",
+            turns: claims
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| turn(i as u64 * 4, n))
+                .collect(),
+            claims: claims.iter().sum(),
+            retracts: 0,
+        };
+        labels::record_extraction(&antfly, record(vec![0, 2])).await?;
+        // Re-extracting a turn replaces its row instead of duplicating it.
+        labels::record_extraction(&antfly, record(vec![1, 2])).await?;
+
+        let sql = antfly.sql().await?;
+        let decisions = sql
+            .fetch_all(
+                "SELECT kind, model, result, threshold_bp, response FROM codex_decision_log",
+                vec![],
+            )
+            .await?;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].string("kind")?, "supersession");
+        assert_eq!(decisions[0].i64("threshold_bp")?, 8_000);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decisions[0].string("response")?)?,
+            response
+        );
+        let turns = sql
+            .fetch_all(
+                "SELECT turn_start, claims, batch_claims FROM codex_extraction_log \
+                 WHERE thread_id = $1 ORDER BY turn_start",
+                codex_antfly::sql_params!["thread-1"],
+            )
+            .await?;
+        let rows: Vec<(i64, i64, i64)> = turns
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.i64("turn_start")?,
+                    row.i64("claims")?,
+                    row.i64("batch_claims")?,
+                ))
+            })
+            .collect::<Result<_, codex_antfly::AntflyError>>()?;
+        assert_eq!(rows, vec![(0, 1, 3), (4, 2, 3)]);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

@@ -86,23 +86,45 @@ fn source_text(source: ApprovalResolutionSource) -> &'static str {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl ToolLifecycleContributor for OutcomeRecorder {
+    /// Records the resolution right away, so a decision survives even if
+    /// the process stops before the tool finishes.
     fn on_approval_resolved(&self, input: ApprovalResolvedInput<'_>) {
-        if let Ok(mut pending) = self.reviewer.pending.lock()
-            && let Some(pending) = pending.get_mut(input.call_id)
-        {
-            pending.approved = Some(is_approval(input.decision));
-            if let Some(map) = pending.doc.as_object_mut() {
-                map.insert(
-                    "decision".to_string(),
-                    Value::String(decision_text(input.decision).to_string()),
-                );
-                map.insert(
-                    "decided_by".to_string(),
-                    Value::String(source_text(input.source).to_string()),
-                );
-            }
+        let Ok(mut pending) = self.reviewer.pending.lock() else {
+            return;
+        };
+        let Some(pending) = pending.get_mut(input.call_id) else {
+            return;
+        };
+        pending.approved = Some(is_approval(input.decision));
+        if let Some(map) = pending.doc.as_object_mut() {
+            map.insert(
+                "decision".to_string(),
+                Value::String(decision_text(input.decision).to_string()),
+            );
+            map.insert(
+                "decided_by".to_string(),
+                Value::String(source_text(input.source).to_string()),
+            );
+            map.insert("resolved_at_ms".to_string(), Value::from(now_ms()));
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let antfly = Arc::clone(&pending.antfly);
+        let write = Write::put(pending.id.clone(), pending.doc.clone());
+        pending.resolution_write = Some(runtime.spawn(async move {
+            if let Err(err) = antfly.documents(schema::APPROVALS).write(vec![write]).await {
+                tracing::warn!("failed to record approval resolution: {err}");
+            }
+        }));
     }
 
     fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
@@ -116,24 +138,18 @@ impl ToolLifecycleContributor for OutcomeRecorder {
             let Some(mut pending) = pending else {
                 return;
             };
-            let Some(thread_id) = pending
-                .doc
-                .get("thread_id")
-                .and_then(Value::as_str)
-                .and_then(|id| codex_protocol::ThreadId::from_string(id).ok())
-            else {
-                return;
-            };
-            let Some(antfly) = self.reviewer.antfly_for(thread_id).await else {
-                return;
-            };
             if let Some(map) = pending.doc.as_object_mut() {
                 map.insert(
                     "outcome".to_string(),
                     Value::String(outcome_label(input.outcome, pending.approved).to_string()),
                 );
+                map.insert("finished_at_ms".to_string(), Value::from(now_ms()));
             }
-            if let Err(err) = antfly
+            if let Some(resolution) = pending.resolution_write.take() {
+                let _ = resolution.await;
+            }
+            if let Err(err) = pending
+                .antfly
                 .documents(schema::APPROVALS)
                 .write(vec![Write::put(pending.id, pending.doc)])
                 .await
@@ -146,10 +162,85 @@ impl ToolLifecycleContributor for OutcomeRecorder {
 
 #[cfg(test)]
 mod tests {
-    use codex_extension_api::ToolCallOutcome;
-    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use std::sync::Weak;
 
+    use codex_antfly::Antfly;
+    use codex_antfly::AntflyConfig;
+    use codex_antfly::schema;
+    use codex_extension_api::ApprovalResolutionSource;
+    use codex_extension_api::ApprovalResolvedInput;
+    use codex_extension_api::ExtensionData;
+    use codex_extension_api::ToolCallOutcome;
+    use codex_extension_api::ToolLifecycleContributor;
+    use codex_protocol::protocol::ReviewDecision;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::OutcomeRecorder;
     use super::outcome_label;
+    use crate::reviewer::LayaApprovalReviewer;
+    use crate::reviewer::PendingOutcome;
+
+    /// The user's decision reaches the database when it is made, not only
+    /// when the tool finishes, so a restart in between keeps it.
+    #[test]
+    fn resolutions_are_recorded_before_the_tool_finishes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let mut config = AntflyConfig::embedded(dir.path().join("codex.aflite"));
+            config.embedder = None;
+            let antfly = Arc::new(Antfly::open(config)?);
+            let reviewer = Arc::new(LayaApprovalReviewer::new(Weak::new()));
+            let doc = json!({"thread_id": "thread-1", "approval_id": "approval-1",
+                "search_text": "Proposed action: rm -rf target", "outcome": "pending"});
+            reviewer.pending.lock().expect("pending").insert(
+                "call-1".to_string(),
+                PendingOutcome {
+                    id: "approval-1".to_string(),
+                    doc,
+                    antfly: Arc::clone(&antfly),
+                    approved: None,
+                    resolution_write: None,
+                },
+            );
+            let recorder = OutcomeRecorder::new(Arc::clone(&reviewer));
+            let store = ExtensionData::new("test");
+            recorder.on_approval_resolved(ApprovalResolvedInput {
+                thread_store: &store,
+                turn_store: &store,
+                turn_id: "turn-1",
+                call_id: "call-1",
+                decision: &ReviewDecision::Approved,
+                source: ApprovalResolutionSource::User,
+            });
+            let write = reviewer
+                .pending
+                .lock()
+                .expect("pending")
+                .get_mut("call-1")
+                .and_then(|pending| pending.resolution_write.take())
+                .expect("resolution write started");
+            write.await?;
+            let stored = antfly
+                .documents(schema::APPROVALS)
+                .get("approval-1")
+                .await?
+                .expect("approval stored");
+            assert_eq!(stored["decision"], json!("approved"));
+            assert_eq!(stored["decided_by"], json!("user"));
+            assert_eq!(stored["outcome"], json!("pending"));
+            assert!(stored["resolved_at_ms"].as_i64().is_some_and(|at| at > 0));
+            antfly.close().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+    }
 
     #[test]
     fn declined_approvals_are_not_failures() {

@@ -583,6 +583,42 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
         )",
         "CREATE INDEX IF NOT EXISTS codex_concept_reviews_identity ON codex_concept_reviews (identity)",
     ],
+}, Migration {
+    version: 25,
+    name: "decision and extraction label logs",
+    // Labels for calibrating and benchmarking local models (see
+    // `crate::labels`). `codex_decision_log` keeps every typed decision a
+    // model made outside approvals, with its full response;
+    // `codex_extraction_log` keeps one row per turn sent for claim
+    // extraction, with how many claims the extractor attributed to it.
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS codex_decision_log (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            model TEXT NOT NULL,
+            subject TEXT,
+            input TEXT NOT NULL,
+            response TEXT NOT NULL,
+            result BOOLEAN,
+            threshold_bp BIGINT,
+            created_at_ms BIGINT NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS codex_decision_log_kind ON codex_decision_log (kind, created_at_ms)",
+        "CREATE TABLE IF NOT EXISTS codex_extraction_log (
+            thread_id TEXT NOT NULL,
+            turn_start BIGINT NOT NULL,
+            turn_end BIGINT NOT NULL,
+            turn_id TEXT,
+            chars BIGINT NOT NULL,
+            claims BIGINT NOT NULL,
+            batch_turns BIGINT NOT NULL,
+            batch_claims BIGINT NOT NULL,
+            batch_retracts BIGINT NOT NULL,
+            model TEXT NOT NULL,
+            extracted_at_ms BIGINT NOT NULL,
+            PRIMARY KEY (thread_id, turn_start)
+        )",
+    ],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

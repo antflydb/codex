@@ -1024,8 +1024,26 @@ impl Knowledge<'_> {
         let probabilities = relation_probabilities(&response).ok_or_else(malformed)?;
         let predicate = predicate_probability(&response, "supersedes").ok_or_else(malformed)?;
         let threshold = self.config.supersede_threshold_bp;
-        Ok(predicate * 10_000.0 >= f64::from(threshold)
-            || replaces_earlier(&probabilities, threshold))
+        let supersedes = predicate * 10_000.0 >= f64::from(threshold)
+            || replaces_earlier(&probabilities, threshold);
+        let input = request["input"].as_str().unwrap_or_default();
+        if let Err(err) = crate::labels::record_decision(
+            self.antfly,
+            crate::labels::DecisionRecord {
+                kind: "supersession",
+                model: &self.antfly.config().decide_model,
+                subject: None,
+                input,
+                response: &response,
+                result: Some(supersedes),
+                threshold_bp: Some(threshold),
+            },
+        )
+        .await
+        {
+            tracing::debug!("failed to record supersession decision: {err}");
+        }
+        Ok(supersedes)
     }
 
     /// Canonical concept keys for the mentions in `text`. Antfly's

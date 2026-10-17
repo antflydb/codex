@@ -32,6 +32,10 @@ use crate::request::verdict;
 /// Similar earlier decisions included in the model's context.
 const PRECEDENTS: usize = 3;
 
+/// Version of the fields recorded with each decision, so calibration can
+/// tell records with the full model context from older ones.
+const RECORD_VERSION: u32 = 2;
+
 /// Latest user request in a thread, captured from turn input.
 struct LatestUserRequest(String);
 
@@ -40,8 +44,12 @@ pub(crate) struct PendingOutcome {
     /// Document id in [`schema::APPROVALS`]; the approval's own id.
     pub(crate) id: String,
     pub(crate) doc: Value,
+    pub(crate) antfly: Arc<Antfly>,
     /// Whether the approval was granted, once it has resolved.
     pub(crate) approved: Option<bool>,
+    /// Write of the resolution, which the outcome write waits for so it
+    /// cannot be overtaken.
+    pub(crate) resolution_write: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) struct LayaApprovalReviewer {
@@ -174,7 +182,7 @@ impl LayaApprovalReviewer {
     /// other document table.
     async fn record(
         &self,
-        antfly: &Antfly,
+        antfly: &Arc<Antfly>,
         input: &ApprovalDecisionInput<'_>,
         state: &str,
         answers: &Answers,
@@ -183,6 +191,7 @@ impl LayaApprovalReviewer {
     ) {
         let now = chrono_millis();
         let id = input.approval_id.to_string();
+        let settings = antfly.config().approvals;
         let outcome = match (applied, decided) {
             (true, Verdict::Deny { .. }) => "denied_by_review",
             _ => "pending",
@@ -201,11 +210,18 @@ impl LayaApprovalReviewer {
                 "external": answers.external,
                 "destructive": answers.destructive,
                 "intent_match": answers.intent_match,
+                "intent_match_probability": answers.intent_match_probability,
             },
             "verdict": format!("{decided:?}"),
             "applied": applied,
             "outcome": outcome,
             "decided_at_ms": now,
+            // What produced the verdict, for calibration across settings.
+            "mode": settings.mode,
+            "decide_model": antfly.config().decide_model,
+            "allow_threshold_bp": settings.allow_threshold_bp,
+            "deny_threshold_bp": settings.deny_threshold_bp,
+            "record_version": RECORD_VERSION,
         });
         if outcome == "pending"
             && let Some(call_id) = input.tool_call_id
@@ -216,7 +232,9 @@ impl LayaApprovalReviewer {
                 PendingOutcome {
                     id: id.clone(),
                     doc: doc.clone(),
+                    antfly: Arc::clone(antfly),
                     approved: None,
+                    resolution_write: None,
                 },
             );
         }
