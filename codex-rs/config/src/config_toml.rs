@@ -613,6 +613,10 @@ pub struct AntflyStoreToml {
     /// Minimum decide-model probability before a new claim supersedes an
     /// earlier one (default 0.8).
     pub supersede_threshold: Option<f64>,
+    /// Local generator that writes concept descriptions from the claims
+    /// about each concept (default `ggml-org/gemma-4-e2b-it-gguf`); an empty
+    /// string turns descriptions off.
+    pub describe_model: Option<String>,
     /// Extract claims from finished turns with the memory extraction model
     /// (default `true` when the knowledge graph is on).
     pub claim_extraction: Option<bool>,

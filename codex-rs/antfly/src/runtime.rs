@@ -280,6 +280,11 @@ impl Antfly {
         self.decider()?.decide(request).await
     }
 
+    /// Generates text with a local generator model.
+    pub async fn generate(&self, request: &Value) -> AntflyResult<Value> {
+        self.decider()?.generate(request).await
+    }
+
     /// Answers an `ExtractRequest` with the local runtime.
     pub async fn extract(&self, request: &Value) -> AntflyResult<Value> {
         self.decider()?.extract(request).await

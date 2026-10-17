@@ -77,6 +77,8 @@ const SWEEP_DELAY: Duration = Duration::from_secs(60);
 const SWEEP_LIMIT: usize = 16;
 /// Minimum time between concept consolidation passes on one database.
 const CONSOLIDATION_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Concepts described per periodic pass, to bound local generation time.
+const DESCRIBE_PER_PASS: usize = 20;
 /// Finished turns that trigger extraction without waiting for quiet.
 const MAX_PENDING_TURNS: u32 = 4;
 
@@ -682,6 +684,11 @@ impl Worker {
         match concepts::consolidate(&knowledge, judge).await {
             Ok(report) => tracing::info!("antfly: concept consolidation: {report:?}"),
             Err(err) => tracing::warn!("antfly: concept consolidation failed: {err}"),
+        }
+        // Describe after merging, so merged-away concepts are skipped.
+        match knowledge.describe_concepts(DESCRIBE_PER_PASS).await {
+            Ok(report) => tracing::info!("antfly: concept descriptions: {report:?}"),
+            Err(err) => tracing::warn!("antfly: describing concepts failed: {err}"),
         }
     }
 }

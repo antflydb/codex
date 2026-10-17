@@ -35,6 +35,7 @@ pub use config::ApprovalSettings;
 pub use config::BackendConfig;
 pub use config::ClaimPipelineConfig;
 pub use config::DEFAULT_DECIDE_MODEL;
+pub use config::DEFAULT_DESCRIBE_MODEL;
 pub use config::DEFAULT_EXTRACT_MODEL;
 pub use config::EmbedderConfig;
 pub use config::KnowledgeConfig;

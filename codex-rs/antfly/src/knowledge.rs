@@ -96,6 +96,13 @@ const QUERY_EXTRACT_MAX_BYTES: usize = 600;
 /// Laya rejects over-long inputs; keep each statement well inside them.
 const DECIDE_STATEMENT_MAX_CHARS: usize = 600;
 const SUPERSEDE_CANDIDATES: usize = 3;
+/// Claims about a concept given to the generator that describes it.
+const DESCRIBE_EVIDENCE: usize = 8;
+/// Longest description kept, in characters.
+const DESCRIPTION_MAX_CHARS: usize = 600;
+const DESCRIBE_INSTRUCTIONS: &str = "You write one or two plain sentences describing a concept from a \
+software project's knowledge graph, using only the facts given. Say what it is and its role. Do \
+not speculate.";
 /// `version` of claims written by the per-turn pipeline. Claims from the
 /// earlier stage-1 extraction used the memory version (`v1`, `v2`).
 pub const TURN_CLAIMS_VERSION: &str = "turns";
@@ -1290,6 +1297,128 @@ impl Knowledge<'_> {
             .collect()
     }
 
+    /// The local generator that describes concepts, when descriptions are on.
+    pub fn describe_model(&self) -> Option<&str> {
+        self.config.describe_model.as_deref()
+    }
+
+    /// Statements of the current claims about the concept `key`, settled
+    /// claims first, then the newest.
+    pub async fn concept_evidence(&self, key: &str, limit: usize) -> Vec<String> {
+        let mut claims: Vec<Claim> = self
+            .about_any(schema::KNOWLEDGE, &[key.to_string()], limit * 4)
+            .await
+            .into_iter()
+            .filter_map(|(id, doc, _)| Claim::from_doc(&id, doc))
+            .filter(|claim| claim.status == ClaimStatus::Current)
+            .collect();
+        claims.sort_by(|a, b| {
+            b.settled
+                .cmp(&a.settled)
+                .then(b.source_updated_at_ms.cmp(&a.source_updated_at_ms))
+                .then(a.id.cmp(&b.id))
+        });
+        claims
+            .into_iter()
+            .take(limit)
+            .map(|claim| claim.statement)
+            .collect()
+    }
+
+    /// Descriptions of the concepts in `keys` that have one.
+    pub async fn concept_descriptions(
+        &self,
+        keys: &[String],
+    ) -> AntflyResult<HashMap<String, String>> {
+        let table = self.antfly.documents(schema::CONCEPT_DESCRIPTIONS);
+        let mut found = HashMap::new();
+        for key in keys {
+            if let Some(description) = table
+                .get(key)
+                .await?
+                .and_then(|doc| doc.get("description")?.as_str().map(str::to_string))
+            {
+                found.insert(key.clone(), description);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Writes or refreshes descriptions for up to `max` concepts whose
+    /// evidence changed since they were last described. Concepts merged into
+    /// another are skipped, and so are concepts no current claim is about.
+    pub async fn describe_concepts(&self, max: usize) -> AntflyResult<DescribeReport> {
+        let mut report = DescribeReport::default();
+        let Some(model) = self.config.describe_model.clone() else {
+            return Ok(report);
+        };
+        let merged: BTreeSet<String> = self
+            .antfly
+            .sql()
+            .await?
+            .fetch_all(
+                "SELECT key FROM codex_concept_reviews WHERE merged_into IS NOT NULL",
+                vec![],
+            )
+            .await?
+            .iter()
+            .filter_map(|row| row.string("key").ok())
+            .collect();
+        let table = self.antfly.documents(schema::CONCEPT_DESCRIPTIONS);
+        for concept in self.concepts().await? {
+            if report.described >= max {
+                break;
+            }
+            if merged.contains(&concept.key) {
+                continue;
+            }
+            report.examined += 1;
+            let evidence = self.concept_evidence(&concept.key, DESCRIBE_EVIDENCE).await;
+            if evidence.is_empty() {
+                report.without_evidence += 1;
+                continue;
+            }
+            let hash = evidence_hash(&model, &concept, &evidence);
+            let existing = table.get(&concept.key).await?;
+            if existing
+                .as_ref()
+                .and_then(|doc| doc.get("evidence_hash")?.as_str())
+                == Some(hash.as_str())
+            {
+                report.unchanged += 1;
+                continue;
+            }
+            let request = describe_request(&model, &concept, &evidence);
+            let description = match self.antfly.generate(&request).await {
+                Ok(response) => generated_text(&response),
+                Err(err) => {
+                    tracing::warn!("antfly: describing {} failed: {err}", concept.key);
+                    None
+                }
+            };
+            let Some(description) = description else {
+                report.failed += 1;
+                continue;
+            };
+            let description = truncate_chars(&description, DESCRIPTION_MAX_CHARS);
+            table
+                .write(vec![Write::put(
+                    concept.key.clone(),
+                    json!({
+                        "canonical_name": concept.name,
+                        "description": description,
+                        "search_text": format!("{}: {description}", concept.name),
+                        "evidence_hash": hash,
+                        "model": model,
+                        "described_at_ms": now_ms(),
+                    }),
+                )])
+                .await?;
+            report.described += 1;
+        }
+        Ok(report)
+    }
+
     /// Current claims and memory notes related to `query`: seeded by the
     /// concepts in the query and in its direct search hits, then expanded
     /// through every document sharing those concepts. Superseded claims are
@@ -1401,6 +1530,71 @@ impl Knowledge<'_> {
             notes,
         })
     }
+}
+
+/// What [`Knowledge::describe_concepts`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DescribeReport {
+    /// Concepts considered (merged concepts are not).
+    pub examined: usize,
+    pub described: usize,
+    /// Concepts whose evidence had not changed since their description.
+    pub unchanged: usize,
+    /// Concepts no current claim is about.
+    pub without_evidence: usize,
+    pub failed: usize,
+}
+
+/// Identity of what a description was written from, so it is rewritten
+/// only when the model, the name or the evidence changes.
+fn evidence_hash(model: &str, concept: &Concept, evidence: &[String]) -> String {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    model.hash(&mut hasher);
+    concept.name.hash(&mut hasher);
+    concept.entity_type.hash(&mut hasher);
+    evidence.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The generate request that describes `concept` from `evidence`.
+fn describe_request(model: &str, concept: &Concept, evidence: &[String]) -> Value {
+    let label = concept
+        .entity_type
+        .as_deref()
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default();
+    let facts = evidence
+        .iter()
+        .map(|statement| {
+            format!(
+                "- {}",
+                truncate_chars(statement, DECIDE_STATEMENT_MAX_CHARS)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "model": model,
+        "max_tokens": 160,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": DESCRIBE_INSTRUCTIONS},
+            {"role": "user", "content": format!("Concept: {}{label}\nFacts:\n{facts}", concept.name)},
+        ],
+    })
+}
+
+/// The text of a generate response, without surrounding quotes.
+fn generated_text(response: &Value) -> Option<String> {
+    let text = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)?
+        .trim()
+        .trim_matches('"')
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// `text` lowercased with whitespace collapsed and a final period dropped.

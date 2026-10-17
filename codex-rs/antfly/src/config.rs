@@ -46,6 +46,9 @@ impl Default for EmbedderConfig {
 /// Default GLiNER extractor that links knowledge to concepts.
 pub const DEFAULT_EXTRACT_MODEL: &str = "fastino/gliner2.5-base-v1";
 
+/// Local generator that writes concept descriptions.
+pub const DEFAULT_DESCRIBE_MODEL: &str = "ggml-org/gemma-4-e2b-it-gguf";
+
 /// The knowledge graph: claims and memory notes linked to the concepts
 /// they are about (see `crate::knowledge`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +63,9 @@ pub struct KnowledgeConfig {
     pub claims: Option<ClaimPipelineConfig>,
     /// Concept names to merge, as `(alias, canonical name)`.
     pub concept_aliases: Vec<(String, String)>,
+    /// Local generator that describes concepts; `None` turns descriptions
+    /// off.
+    pub describe_model: Option<String>,
 }
 
 impl Default for KnowledgeConfig {
@@ -69,6 +75,7 @@ impl Default for KnowledgeConfig {
             supersede_threshold_bp: 8_000,
             claims: Some(ClaimPipelineConfig::default()),
             concept_aliases: Vec::new(),
+            describe_model: Some(DEFAULT_DESCRIBE_MODEL.to_string()),
         }
     }
 }
@@ -170,6 +177,7 @@ pub struct AntflyTomlSettings {
     pub deny_threshold: Option<f64>,
     pub knowledge_graph: Option<bool>,
     pub extract_model: Option<String>,
+    pub describe_model: Option<String>,
     pub supersede_threshold: Option<f64>,
     pub claim_extraction: Option<bool>,
     pub claim_debounce_seconds: Option<u64>,
@@ -257,6 +265,11 @@ impl AntflyConfig {
             let default = KnowledgeConfig::default();
             Some(KnowledgeConfig {
                 extract_model: settings.extract_model.unwrap_or(default.extract_model),
+                describe_model: match settings.describe_model.clone() {
+                    Some(model) if model.trim().is_empty() => None,
+                    Some(model) => Some(model),
+                    None => default.describe_model,
+                },
                 supersede_threshold_bp: basis_points(
                     "supersede_threshold",
                     settings.supersede_threshold,

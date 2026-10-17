@@ -40,6 +40,16 @@ pub enum KnowledgeSubcommand {
     Backfill(BackfillArgs),
     /// Merge concepts that name the same thing now.
     Consolidate,
+    /// Describe concepts from the claims about them, with the local
+    /// describe model.
+    Describe(DescribeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DescribeArgs {
+    /// Describe at most this many concepts; rerun to continue.
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -82,6 +92,22 @@ impl KnowledgeCli {
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
             KnowledgeSubcommand::Backfill(args) => backfill(&antfly, config, args).await,
+            KnowledgeSubcommand::Describe(args) => {
+                let report = knowledge_admin::describe(&antfly, args.limit)
+                    .await
+                    .context(
+                        "describing concepts (is the app-server daemon holding the database?)",
+                    )?;
+                println!(
+                    "examined {} concepts: {} described, {} unchanged, {} without current claims, {} failed",
+                    report.examined,
+                    report.described,
+                    report.unchanged,
+                    report.without_evidence,
+                    report.failed
+                );
+                Ok(())
+            }
             KnowledgeSubcommand::Consolidate => {
                 let (thread_manager, host) = start_host(&config).await?;
                 let report = knowledge_admin::consolidate(&thread_manager, &config).await;

@@ -215,6 +215,21 @@ pub async fn consolidate(
     concepts::consolidate(&knowledge, |pairs| worker.judge(&job, pairs)).await
 }
 
+/// Writes descriptions for up to `max` concepts whose evidence changed,
+/// with the local describe model.
+pub async fn describe(
+    antfly: &Antfly,
+    max: usize,
+) -> anyhow::Result<codex_antfly::knowledge::DescribeReport> {
+    let knowledge = antfly
+        .knowledge()
+        .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+    if knowledge.describe_model().is_none() {
+        anyhow::bail!("concept descriptions are off (describe_model is empty)");
+    }
+    Ok(knowledge.describe_concepts(max).await?)
+}
+
 /// Pipeline-wide state for `codex knowledge status`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KnowledgeStatus {

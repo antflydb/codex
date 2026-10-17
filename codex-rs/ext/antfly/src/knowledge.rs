@@ -200,21 +200,32 @@ impl<'call> ToolExecutor<ToolCall<'call>> for SearchTool {
                 .map_err(|err| {
                     FunctionCallError::RespondToModel(format!("search failed: {err}"))
                 })?;
-            Ok(Box::new(JsonToolOutput::new(render(&related)))
-                as Box<dyn codex_extension_api::ToolOutput>)
+            // Descriptions are context, not results: a lookup failure only
+            // leaves them out.
+            let descriptions = knowledge
+                .concept_descriptions(&related.seeds)
+                .await
+                .unwrap_or_default();
+            Ok(
+                Box::new(JsonToolOutput::new(render(&related, &descriptions)))
+                    as Box<dyn codex_extension_api::ToolOutput>,
+            )
         })
     }
 }
 
 /// The model-facing result: concepts without their key prefix, and claims
 /// without storage bookkeeping.
-fn render(related: &codex_antfly::knowledge::Related) -> Value {
+fn render(
+    related: &codex_antfly::knowledge::Related,
+    descriptions: &std::collections::HashMap<String, String>,
+) -> Value {
     let concept = |key: &String| {
         key.strip_prefix(codex_antfly::knowledge::CONCEPT_PREFIX)
             .unwrap_or(key)
             .to_string()
     };
-    json!({
+    let mut out = json!({
         "concepts": related.seeds.iter().map(concept).collect::<Vec<_>>(),
         "claims": related.claims.iter().map(|found| {
             let claim = &found.claim;
@@ -260,7 +271,16 @@ fn render(related: &codex_antfly::knowledge::Related) -> Value {
             "path": note.path,
             "shared_concepts": note.concepts.iter().map(concept).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-    })
+    });
+    let described: serde_json::Map<String, Value> = related
+        .seeds
+        .iter()
+        .filter_map(|key| Some((concept(key), json!(descriptions.get(key)?))))
+        .collect();
+    if !described.is_empty() {
+        out["concept_descriptions"] = Value::Object(described);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -327,7 +347,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            render(&related),
+            render(&related, &std::collections::HashMap::new()),
             json!({
                 "concepts": ["embeddinggemma_2"],
                 "claims": [{

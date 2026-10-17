@@ -4504,6 +4504,10 @@
               "description": "Typed-decision model used to review approvals (default `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).",
               "type": "string"
             },
+            "describe_model": {
+              "description": "Local generator that writes concept descriptions from the claims about each concept (default `ggml-org/gemma-4-e2b-it-gguf`); an empty string turns descriptions off.",
+              "type": "string"
+            },
             "embedder_dims": {
               "format": "uint32",
               "minimum": 0.0,

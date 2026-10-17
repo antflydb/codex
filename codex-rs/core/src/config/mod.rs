@@ -2594,6 +2594,7 @@ fn thread_store_config(
                 knowledge_graph: antfly.knowledge_graph,
                 extract_model: antfly.extract_model,
                 supersede_threshold: antfly.supersede_threshold,
+                describe_model: antfly.describe_model,
                 claim_extraction: antfly.claim_extraction,
                 claim_debounce_seconds: antfly.claim_debounce_seconds,
                 claim_settle_minutes: antfly.claim_settle_minutes,

@@ -1004,3 +1004,70 @@ fn label_logs_record_decisions_and_extracted_turns() -> Result<(), Box<dyn std::
     })?;
     Ok(())
 }
+
+/// Concepts get descriptions grounded in the claims about them, rewritten
+/// only when that evidence changes.
+#[test]
+fn concepts_are_described_from_their_claims() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::knowledge::ClaimKind;
+    use codex_antfly::knowledge::TurnClaim;
+    use codex_antfly::knowledge::TurnClaimBatch;
+    if !has_models("fastino") || !has_models("ggml-org") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let claim = |statement: &str| TurnClaim {
+            kind: ClaimKind::Decision,
+            statement: statement.to_string(),
+            turn_id: Some("turn-1".to_string()),
+            turn_ordinal: 0,
+            replaces: Vec::new(),
+            motivates: Vec::new(),
+            rejected_in_favor_of: Vec::new(),
+        };
+        knowledge
+            .append_turn_claims(TurnClaimBatch {
+                thread_id: "thread-a".to_string(),
+                cwd: None,
+                source_updated_at_ms: 1,
+                claims: vec![
+                    claim("Codex stores threads and history in an embedded Antfly Lite file through libantfly."),
+                    claim("Only one process may write the embedded Antfly Lite file, so Codex runs through the app-server daemon."),
+                ],
+                retracts: Vec::new(),
+            })
+            .await?;
+        // Concept extraction is asynchronous; wait for a concept the claims
+        // are about.
+        let mut key = None;
+        'wait: for _ in 0..300 {
+            for concept in knowledge.concepts().await? {
+                if !knowledge.concept_evidence(&concept.key, 8).await.is_empty() {
+                    key = Some(concept.key);
+                    break 'wait;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let key = key.ok_or("no concept with claims about it")?;
+
+        let report = knowledge.describe_concepts(50).await?;
+        assert!(report.described >= 1, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+        let descriptions = knowledge.concept_descriptions(std::slice::from_ref(&key)).await?;
+        let description = descriptions.get(&key).ok_or("no description")?;
+        println!("{key}: {description}");
+        assert!(!description.is_empty());
+
+        // Unchanged evidence is not described again.
+        let again = knowledge.describe_concepts(50).await?;
+        assert_eq!(again.described, 0, "{again:?}");
+        assert!(again.unchanged >= 1, "{again:?}");
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

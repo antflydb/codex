@@ -995,6 +995,35 @@ encoder accepts 7999 tokens). antflydb/antfly#1083 tracks the requests to
 lift them: Q8 Decide and extraction at FP32's limits, long-document
 extraction for the 1B, and a fine-tuning path for it.
 
+### Concept descriptions
+
+A promoted concept carries only its canonical name, entity type and aliases.
+`Knowledge::describe_concepts` adds a one- or two-sentence description,
+written by a local generator from the current claims about the concept:
+- **Model:** `knowledge.describe_model`, default
+  `ggml-org/gemma-4-e2b-it-gguf`. An empty string turns descriptions off.
+- **Evidence:** up to 8 claims, settled first and then the newest, gathered
+  by traversing the concept's `about` edges.
+- **Storage:** `codex_concept_descriptions`, keyed by concept key. The
+  description is its `search_text`, so it is full-text searchable and
+  embedded.
+- **Rewriting:** a description is rewritten only when its evidence hash
+  (model, name, type and claims) changes. Concepts merged into another are
+  skipped.
+- **When it runs:** after each periodic consolidation pass (20 concepts per
+  pass), and on demand with `codex knowledge describe [--limit N]`.
+- **Where it shows:** `knowledge.search` returns descriptions for its seed
+  concepts as `concept_descriptions`.
+- **Example output** (from `concepts_are_described_from_their_claims`): "The
+  app-server daemon is a process that Codex runs through, as only one
+  process may write the embedded Antfly Lite file."
+
+Antfly's own conceptualizer recipe (a `generator` enrichment with
+`neighbor_context`) doesn't fit Codex's layout:
+- `neighbor_context` samples only a graph index on the concept table itself.
+  Codex's `about` edges live in the claims and notes tables.
+- It renders neighbor keys, not the claim text a description needs.
+
 ### Label logs
 
 Every model call that decides something on Codex's behalf is kept as a
@@ -1095,10 +1124,11 @@ through `knowledge.search`.
   history items grouped by `thread_id`, ordered by `ordinal`, segmented by
   `turn_id`, extracted per turn, with `about` edges from a thread node.
   Until then, claims carry thread and turn provenance.
-- **Entity documents beyond the resolver's.** Promoted concepts carry only
-  `canonical_name`, `entity_type` and `aliases`. Descriptions or
-  concept→concept summaries would need a conceptualizer
-  (`LITE_KNOWLEDGE_GRAPH.md`).
+- **Concept relations and description-based merging.** Concepts now have
+  descriptions (see [Concept descriptions](#concept-descriptions)), but no
+  concept-to-concept relations (`is_a`, `part_of`). Consolidation does not
+  compare descriptions yet. Both change behavior, so they wait for numbers on
+  the labeled pairs.
 
 ## Plan
 

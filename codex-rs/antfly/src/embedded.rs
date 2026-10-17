@@ -874,6 +874,23 @@ impl LocalDecider {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    /// Answers a `GenerateRequest` (chat messages to a local generator).
+    pub async fn generate(&self, request: &Value) -> AntflyResult<Value> {
+        let slot = Arc::clone(&self.slot);
+        let models_dir = self.models_dir.clone();
+        let bytes = serde_json::to_vec(request)?;
+        let raw = self
+            .executor
+            .run(move || {
+                let inference = inference_handle(&slot, models_dir.as_deref())?;
+                inference
+                    .generate(&bytes)
+                    .map_err(|err| AntflyError::Embedded(format!("generate: {err}")))
+            })
+            .await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
     /// Answers a `DecideRequest`.
     pub async fn decide(&self, request: &Value) -> AntflyResult<Value> {
         let slot = Arc::clone(&self.slot);

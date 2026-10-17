@@ -42,6 +42,10 @@ pub const KNOWLEDGE: &str = "codex_knowledge";
 /// Canonical concepts promoted by the concept resolver, one document per
 /// `concept/<slug>` key. Antfly writes these; Codex only reads them.
 pub const CONCEPTS: &str = "codex_concepts";
+/// Descriptions of concepts written by a local generator from the claims
+/// about them, one document per concept key. `search_text` holds the
+/// description, so it is full-text searchable and embedded.
+pub const CONCEPT_DESCRIPTIONS: &str = "codex_concept_descriptions";
 
 /// Graph indexes a document table carries when the knowledge graph is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +127,17 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
         graphs: &[],
         // Nearest-name lookup for concept merging.
         dense_field: Some("canonical_name"),
+    },
+    DocumentTable {
+        name: CONCEPT_DESCRIPTIONS,
+        fields: &[
+            ("canonical_name", "string"),
+            ("evidence_hash", "string"),
+            ("model", "string"),
+            ("described_at_ms", "integer"),
+        ],
+        graphs: &[],
+        dense_field: None,
     },
 ];
 
