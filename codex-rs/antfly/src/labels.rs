@@ -29,6 +29,8 @@ pub struct DecisionRecord<'a> {
     /// The decide response, as returned.
     pub response: &'a Value,
     pub result: Option<bool>,
+    /// The probability the verdict was thresholded on.
+    pub score: Option<f64>,
     pub threshold_bp: Option<u32>,
 }
 
@@ -41,8 +43,8 @@ pub async fn record_decision(antfly: &Antfly, record: DecisionRecord<'_>) -> Ant
     let sql = antfly.sql().await?;
     sql.execute(
         "INSERT INTO codex_decision_log \
-         (id, kind, model, subject, input, response, result, threshold_bp, created_at_ms) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING",
+         (id, kind, model, subject, input, response, result, score, threshold_bp, created_at_ms) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO NOTHING",
         sql_params![
             id,
             record.kind,
@@ -51,6 +53,7 @@ pub async fn record_decision(antfly: &Antfly, record: DecisionRecord<'_>) -> Ant
             record.input,
             record.response.to_string(),
             record.result,
+            record.score,
             record.threshold_bp,
             now
         ],
@@ -113,6 +116,75 @@ pub async fn record_extraction(antfly: &Antfly, record: ExtractionRecord<'_>) ->
         .await?;
     }
     Ok(())
+}
+
+/// How triage at one threshold would have done against extraction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriagePoint {
+    pub threshold: f64,
+    /// Turns that produced claims and would still be extracted.
+    pub kept_with_claims: usize,
+    pub with_claims: usize,
+    /// Turns that would be skipped.
+    pub skipped: usize,
+}
+
+/// Triage verdicts scored against what extraction found for the same turns.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TriageReport {
+    /// Turns with both a triage score and an extraction result.
+    pub turns: usize,
+    pub points: Vec<TriagePoint>,
+}
+
+/// Scores logged triage verdicts against extraction results at
+/// `thresholds`: recall on turns that produced claims, and turns skipped.
+pub async fn triage_report(antfly: &Antfly, thresholds: &[f64]) -> AntflyResult<TriageReport> {
+    let sql = antfly.sql().await?;
+    let mut scores = std::collections::HashMap::new();
+    for row in sql
+        .fetch_all(
+            "SELECT subject, score FROM codex_decision_log WHERE kind = 'triage'",
+            vec![],
+        )
+        .await?
+    {
+        if let (Some(subject), Some(score)) = (row.opt_string("subject")?, row.opt_f64("score")?) {
+            scores.insert(subject, score);
+        }
+    }
+    let mut labeled: Vec<(f64, bool)> = Vec::new();
+    for row in sql
+        .fetch_all(
+            "SELECT thread_id, turn_start, claims FROM codex_extraction_log",
+            vec![],
+        )
+        .await?
+    {
+        let subject = format!("{}:{}", row.string("thread_id")?, row.i64("turn_start")?);
+        if let Some(score) = scores.get(&subject) {
+            labeled.push((*score, row.i64("claims")? > 0));
+        }
+    }
+    let with_claims = labeled.iter().filter(|(_, claims)| *claims).count();
+    Ok(TriageReport {
+        turns: labeled.len(),
+        points: thresholds
+            .iter()
+            .map(|&threshold| TriagePoint {
+                threshold,
+                kept_with_claims: labeled
+                    .iter()
+                    .filter(|(score, claims)| *claims && *score >= threshold)
+                    .count(),
+                with_claims,
+                skipped: labeled
+                    .iter()
+                    .filter(|(score, _)| *score < threshold)
+                    .count(),
+            })
+            .collect(),
+    })
 }
 
 fn count(value: impl TryInto<i64>) -> i64 {

@@ -2598,6 +2598,8 @@ fn thread_store_config(
                 claim_extraction: antfly.claim_extraction,
                 claim_debounce_seconds: antfly.claim_debounce_seconds,
                 claim_settle_minutes: antfly.claim_settle_minutes,
+                claim_triage: antfly.claim_triage,
+                claim_triage_threshold: antfly.claim_triage_threshold,
                 concept_aliases: antfly.concept_aliases,
             })
             .map_err(|err| {

@@ -9,13 +9,34 @@ use codex_antfly::schema;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-fn runtime() -> tokio::runtime::Runtime {
+/// A test's runtime, holding a lock that runs these tests one at a time.
+/// Many load local models (GLiNER, Laya, Gemma, embedders); several at
+/// once can exceed inference memory admission and fail spuriously.
+struct TestRuntime {
+    runtime: tokio::runtime::Runtime,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for TestRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+fn runtime() -> TestRuntime {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime,
+        Ok(runtime) => TestRuntime {
+            runtime,
+            _serial: serial,
+        },
         Err(err) => panic!("tokio runtime: {err}"),
     }
 }
@@ -941,6 +962,7 @@ fn label_logs_record_decisions_and_extracted_turns() -> Result<(), Box<dyn std::
                 input: "Earlier statement: a\nLater statement: b",
                 response: &response,
                 result: Some(true),
+                score: Some(0.91),
                 threshold_bp: Some(8_000),
             },
         )
@@ -999,6 +1021,32 @@ fn label_logs_record_decisions_and_extracted_turns() -> Result<(), Box<dyn std::
             })
             .collect::<Result<_, codex_antfly::AntflyError>>()?;
         assert_eq!(rows, vec![(0, 1, 3), (4, 2, 3)]);
+
+        // Triage verdicts join extraction results by `<thread>:<turn start>`.
+        for (start, score) in [(0, 0.9), (4, 0.3)] {
+            labels::record_decision(
+                &antfly,
+                labels::DecisionRecord {
+                    kind: "triage",
+                    model: "convaiinnovations/laya",
+                    subject: Some(format!("thread-1:{start}")),
+                    input: "turn",
+                    response: &json!({}),
+                    result: Some(score >= 0.5),
+                    score: Some(score),
+                    threshold_bp: Some(5_000),
+                },
+            )
+            .await?;
+        }
+        let report = labels::triage_report(&antfly, &[0.2, 0.5]).await?;
+        assert_eq!(report.turns, 2);
+        let at = |i: usize| {
+            let point = &report.points[i];
+            (point.kept_with_claims, point.with_claims, point.skipped)
+        };
+        // Both turns produced claims; at 0.5 the second would be lost.
+        assert_eq!((at(0), at(1)), ((2, 2, 0), (1, 2, 1)));
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

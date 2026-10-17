@@ -634,6 +634,12 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY (thread_id, turn_start)
         )",
     ],
+}, Migration {
+    version: 26,
+    name: "decision log scores",
+    // The probability a decision's verdict was thresholded on, so verdicts
+    // can be re-scored at other thresholds without parsing responses.
+    statements: &["ALTER TABLE codex_decision_log ADD COLUMN score DOUBLE PRECISION"],
 }];
 
 const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS codex_schema_migrations (

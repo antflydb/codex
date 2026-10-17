@@ -626,6 +626,13 @@ pub struct AntflyStoreToml {
     /// Idle time after which a thread's provisional claims are settled
     /// (default 30 minutes).
     pub claim_settle_minutes: Option<u64>,
+    /// Screen turns with the decide model before claim extraction: `off`,
+    /// `shadow` (log the verdict next to what extraction found; the default),
+    /// or `enforce` (skip turns below `claim_triage_threshold`).
+    pub claim_triage: Option<String>,
+    /// Minimum probability that a turn holds something durable before it is
+    /// sent for extraction in enforce mode (default 0.5).
+    pub claim_triage_threshold: Option<f64>,
     /// Concept names to merge in the knowledge graph, as `alias = "canonical
     /// name"` (for example `KG = "knowledge graph"`).
     pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,

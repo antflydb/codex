@@ -87,6 +87,11 @@ pub struct ClaimPipelineConfig {
     pub debounce_seconds: u64,
     /// A thread idle this long has its provisional claims settled.
     pub settle_minutes: u64,
+    /// Whether the decide model screens turns before extraction.
+    pub triage: TriageMode,
+    /// In enforce mode, turns less likely than this to hold anything
+    /// durable are not sent for extraction, in basis points.
+    pub triage_threshold_bp: u32,
 }
 
 impl Default for ClaimPipelineConfig {
@@ -94,8 +99,23 @@ impl Default for ClaimPipelineConfig {
         Self {
             debounce_seconds: 120,
             settle_minutes: 30,
+            triage: TriageMode::Shadow,
+            triage_threshold_bp: 5_000,
         }
     }
+}
+
+/// Screening turns with the decide model before claim extraction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageMode {
+    Off,
+    /// Every turn is screened and the verdict logged next to what
+    /// extraction found; nothing is skipped.
+    #[default]
+    Shadow,
+    /// Turns below the threshold are skipped.
+    Enforce,
 }
 
 /// Default typed-decision model for approval review: a prepared Laya
@@ -182,6 +202,8 @@ pub struct AntflyTomlSettings {
     pub claim_extraction: Option<bool>,
     pub claim_debounce_seconds: Option<u64>,
     pub claim_settle_minutes: Option<u64>,
+    pub claim_triage: Option<String>,
+    pub claim_triage_threshold: Option<f64>,
     pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
 }
 
@@ -281,17 +303,37 @@ impl AntflyConfig {
                     .unwrap_or_default()
                     .into_iter()
                     .collect(),
-                claims: (settings.claim_extraction != Some(false)).then(|| {
-                    let default = ClaimPipelineConfig::default();
-                    ClaimPipelineConfig {
-                        debounce_seconds: settings
-                            .claim_debounce_seconds
-                            .unwrap_or(default.debounce_seconds),
-                        settle_minutes: settings
-                            .claim_settle_minutes
-                            .unwrap_or(default.settle_minutes),
+                claims: match settings.claim_extraction {
+                    Some(false) => None,
+                    _ => {
+                        let default = ClaimPipelineConfig::default();
+                        let triage = match settings.claim_triage.as_deref() {
+                            None => default.triage,
+                            Some("off") => TriageMode::Off,
+                            Some("shadow") => TriageMode::Shadow,
+                            Some("enforce") => TriageMode::Enforce,
+                            Some(other) => {
+                                return Err(AntflyError::Config(format!(
+                                    "claim_triage must be off, shadow, or enforce; got {other}"
+                                )));
+                            }
+                        };
+                        Some(ClaimPipelineConfig {
+                            debounce_seconds: settings
+                                .claim_debounce_seconds
+                                .unwrap_or(default.debounce_seconds),
+                            settle_minutes: settings
+                                .claim_settle_minutes
+                                .unwrap_or(default.settle_minutes),
+                            triage,
+                            triage_threshold_bp: basis_points(
+                                "claim_triage_threshold",
+                                settings.claim_triage_threshold,
+                                default.triage_threshold_bp,
+                            )?,
+                        })
                     }
-                }),
+                },
             })
         };
         Ok(Self {

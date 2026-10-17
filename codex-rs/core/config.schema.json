@@ -4493,6 +4493,15 @@
               "minimum": 0.0,
               "type": "integer"
             },
+            "claim_triage": {
+              "description": "Screen turns with the decide model before claim extraction: `off`, `shadow` (log the verdict next to what extraction found; the default), or `enforce` (skip turns below `claim_triage_threshold`).",
+              "type": "string"
+            },
+            "claim_triage_threshold": {
+              "description": "Minimum probability that a turn holds something durable before it is sent for extraction in enforce mode (default 0.5).",
+              "format": "double",
+              "type": "number"
+            },
             "concept_aliases": {
               "additionalProperties": {
                 "type": "string"

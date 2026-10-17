@@ -231,7 +231,7 @@ pub async fn describe(
 }
 
 /// Pipeline-wide state for `codex knowledge status`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct KnowledgeStatus {
     pub progress: claim_progress::ProgressSummary,
     /// Eligible threads with unextracted history or unsettled claims.
@@ -240,7 +240,12 @@ pub struct KnowledgeStatus {
     pub concepts: usize,
     /// Concepts merged into another by consolidation.
     pub merged_concepts: u64,
+    /// Shadow triage verdicts scored against extraction results.
+    pub triage: codex_antfly::labels::TriageReport,
 }
+
+/// Thresholds `codex knowledge status` reports triage at.
+pub const TRIAGE_THRESHOLDS: &[f64] = &[0.2, 0.5, 0.8];
 
 pub async fn status(antfly: &Antfly) -> anyhow::Result<KnowledgeStatus> {
     let knowledge = antfly
@@ -260,5 +265,6 @@ pub async fn status(antfly: &Antfly) -> anyhow::Result<KnowledgeStatus> {
         claims: knowledge.claim_counts().await?,
         concepts: knowledge.concepts().await?.len(),
         merged_concepts: knowledge.merged_concept_count().await?,
+        triage: codex_antfly::labels::triage_report(antfly, TRIAGE_THRESHOLDS).await?,
     })
 }

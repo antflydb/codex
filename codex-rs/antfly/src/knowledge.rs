@@ -1043,6 +1043,7 @@ impl Knowledge<'_> {
                 input,
                 response: &response,
                 result: Some(supersedes),
+                score: Some(predicate),
                 threshold_bp: Some(threshold),
             },
         )

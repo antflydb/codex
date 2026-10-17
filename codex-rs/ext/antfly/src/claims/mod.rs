@@ -24,6 +24,7 @@ pub mod admin;
 mod concepts;
 mod extract;
 mod transcript;
+mod triage;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -532,6 +533,24 @@ impl Worker {
                     .copied()
                     .filter(|turn| !turn.text.is_empty())
                     .collect();
+                let evidence = match antfly
+                    .config()
+                    .knowledge
+                    .as_ref()
+                    .and_then(|k| k.claims.as_ref())
+                {
+                    Some(pipeline) if !evidence.is_empty() => {
+                        triage::screen(
+                            antfly,
+                            &job.thread_id,
+                            pipeline.triage,
+                            pipeline.triage_threshold_bp,
+                            evidence,
+                        )
+                        .await
+                    }
+                    _ => evidence,
+                };
                 if !evidence.is_empty() {
                     if requests == self.per_job_requests || !self.take_budget() {
                         return Ok((requests, false));

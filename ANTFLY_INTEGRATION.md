@@ -1024,6 +1024,34 @@ Antfly's own conceptualizer recipe (a `generator` enrichment with
   Codex's `about` edges live in the claims and notes tables.
 - It renders neighbor keys, not the claim text a description needs.
 
+### Triage before extraction
+
+Each extraction request is a model call, and most turns hold nothing
+durable. Before a batch is sent, the decide model screens each turn
+(`codex-rs/ext/antfly/src/claims/triage.rs`):
+- **Input:** the turn's first 1,200 and last 800 characters.
+- **Question:** a single choice: what does the turn mainly contain? The
+  choices are a decision, a preference, a lesson, an open question, or
+  routine work.
+- **Score:** p(durable) is 1 − p(routine).
+- **Why a choice and not a yes/no:** on ten hand-labeled turns with Laya,
+  the yes/no predicate scored near chance (13/25 durable–routine pairs
+  ordered correctly). The choice ordered all 25: durable turns scored
+  0.91–0.98, routine ones 0.20–0.67. GLiNER2.5-Decide-1B did worse on every
+  design (best 20/25).
+
+`claim_triage` sets the mode:
+- `shadow` (the default) logs every verdict to `codex_decision_log` (kind
+  `triage`, subject `<thread>:<turn start>`) and still extracts every turn.
+- `enforce` skips turns below `claim_triage_threshold` (default 0.5). A turn
+  the model fails on is always extracted.
+- `off` turns triage off.
+
+`codex knowledge status` scores the shadow verdicts against
+`codex_extraction_log`: at thresholds 0.2, 0.5 and 0.8, how many turns that
+produced claims would still be extracted, and how many turns would be
+skipped.
+
 ### Label logs
 
 Every model call that decides something on Codex's behalf is kept as a
@@ -1111,11 +1139,11 @@ through `knowledge.search`.
 
 ### Not built yet
 
-- **Triage before extraction.** A local decide-model check that a turn holds
-  durable knowledge, to skip extraction requests. It isn't built. Laya
-  separates neither name equivalence nor restatements on its own (see
-  above), so it would need its own labelled set first. Debouncing and
-  batching already keep extraction at about one request per quiet period.
+- **Enforcing triage.** Triage runs in shadow mode (see
+  [Triage before extraction](#triage-before-extraction)). Enforcing it waits
+  until `codex knowledge status` shows recall of about 0.95 or better on
+  turns that produced claims, at a threshold that skips a useful share of
+  turns.
 - **Concept extraction on history.** Per-item extraction costs one GLiNER
   call per rollout item, most of them tool output, and attaches edges to
   items rather than turns or sessions. Materializing per-turn documents in

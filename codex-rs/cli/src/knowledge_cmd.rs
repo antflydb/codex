@@ -142,6 +142,15 @@ async fn print_status(antfly: &codex_antfly::Antfly) -> Result<()> {
         "concepts: {} ({} merged into another)",
         status.concepts, status.merged_concepts
     );
+    if status.triage.turns > 0 {
+        println!("triage: {} extracted turns scored", status.triage.turns);
+        for point in &status.triage.points {
+            println!(
+                "  at {:.1}: keeps {} of {} turns with claims, skips {}",
+                point.threshold, point.kept_with_claims, point.with_claims, point.skipped
+            );
+        }
+    }
     for (thread, failures, error) in &status.progress.failing {
         println!("  failing {thread} ({failures}x): {error}");
     }
