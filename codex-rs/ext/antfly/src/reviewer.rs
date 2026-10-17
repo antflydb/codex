@@ -135,7 +135,7 @@ impl LayaApprovalReviewer {
             input.action,
             &precedents,
         );
-        let request = build_decide_request(&antfly.config().decide_model, &state);
+        let request = build_decide_request(antfly.config().approval_decide_model(), &state);
         let response = match antfly.decide(&request).await {
             Ok(response) => response,
             Err(err) => {
@@ -218,7 +218,7 @@ impl LayaApprovalReviewer {
             "decided_at_ms": now,
             // What produced the verdict, for calibration across settings.
             "mode": settings.mode,
-            "decide_model": antfly.config().decide_model,
+            "decide_model": antfly.config().approval_decide_model(),
             "allow_threshold_bp": settings.allow_threshold_bp,
             "deny_threshold_bp": settings.deny_threshold_bp,
             "record_version": RECORD_VERSION,

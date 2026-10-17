@@ -953,7 +953,8 @@ a configuration change, not a code change:
 |---|---|---|
 | Embeddings | `embedder_model` | `google/embeddinggemma-2` |
 | Extraction | `extract_model` | `fastino/gliner2.5-base-v1` (long-document qualified) |
-| Decide (approvals, supersession) | `decide_model` | `convaiinnovations/laya` |
+| Decide (supersession; approvals unless overridden) | `decide_model` | `convaiinnovations/laya` |
+| Decide (approvals) | `approvals.model` | `decide_model` |
 | Claim distillation | `memories.extract_model` | the memories pipeline's model |
 
 **Why not one GLiNER2.5 Decide model for both, yet.** Antfly gates every
@@ -970,6 +971,24 @@ outside them (`gliner_boundary_qualification.zig`):
 - The Q8 bundle `antflydb/gliner2.5-decide-1B-gguf` (1.74 GB) serves Decide
   only: one sequence of at most 198 prepared tokens, and no extraction. Its
   qualification is separate from FP32's.
+
+Measured on Codex's own requests (antflydb/antfly#1083 has the table):
+- **Approvals:** the FP32 1B handles realistic approval states (about 1,000
+  characters, 169 ms). It separates effects more sharply than Laya on short
+  examples (p(destructive) 0.72 vs 0.58 for `rm -rf ~/`).
+- **Supersession:** its probabilities are flat. It finds 0 of 7
+  supersessions at the 0.8 threshold, where Laya scores 11 of 13 with
+  precision 5/5.
+- **Q8:** it matches FP32 wherever it fits.
+
+To try the 1B for approvals:
+- Set `approvals.model = "fastino/GLiNER2.5-Decide-1B"`, and leave
+  `decide_model` on Laya for supersession.
+- Pull it at Antfly's qualified revision
+  (`fastino/GLiNER2.5-Decide-1B:auto@688cd7ba8917a0855ad3ce929cba5a9998932e79`).
+  Fastino's `main` has moved on, and Antfly refuses that revision.
+- The split GGUF bundles can't be pulled yet; download them with
+  `hf download` instead.
 
 These limits are what Antfly has measured, not architectural ones (the 1B's
 encoder accepts 7999 tokens). antflydb/antfly#1083 tracks the requests to

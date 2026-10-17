@@ -2588,6 +2588,7 @@ fn thread_store_config(
                 semantic_search: antfly.semantic_search,
                 decide_model: antfly.decide_model,
                 approvals_mode: antfly.approvals.as_ref().and_then(|a| a.mode.clone()),
+                approvals_model: antfly.approvals.as_ref().and_then(|a| a.model.clone()),
                 allow_threshold: antfly.approvals.as_ref().and_then(|a| a.allow_threshold),
                 deny_threshold: antfly.approvals.as_ref().and_then(|a| a.deny_threshold),
                 knowledge_graph: antfly.knowledge_graph,

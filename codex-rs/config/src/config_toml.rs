@@ -633,6 +633,9 @@ pub struct AntflyStoreToml {
 pub struct AntflyApprovalsToml {
     /// `off`, `shadow` (log decisions only), or `enforce`.
     pub mode: Option<String>,
+    /// Typed-decision model for approvals, when it differs from
+    /// `decide_model` (which also answers claim supersession).
+    pub model: Option<String>,
     /// Minimum probability that an action is safe before it is allowed.
     pub allow_threshold: Option<f64>,
     /// Minimum probability that an action is destructive before it is denied.

@@ -140,6 +140,10 @@
         "mode": {
           "description": "`off`, `shadow` (log decisions only), or `enforce`.",
           "type": "string"
+        },
+        "model": {
+          "description": "Typed-decision model for approvals, when it differs from `decide_model` (which also answers claim supersession).",
+          "type": "string"
         }
       },
       "type": "object"

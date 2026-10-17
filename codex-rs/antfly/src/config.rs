@@ -105,9 +105,13 @@ pub struct AntflyConfig {
     /// Embedder for semantic search. `None` disables dense indexing and
     /// search falls back to full text only.
     pub embedder: Option<EmbedderConfig>,
-    /// Typed-decision model used for approvals and claim supersession.
+    /// Typed-decision model used for claim supersession, and for approvals
+    /// unless `approvals_model` is set.
     pub decide_model: String,
     pub approvals: ApprovalSettings,
+    /// Typed-decision model for approvals, when it differs from
+    /// `decide_model`.
+    pub approvals_model: Option<String>,
     /// `None` disables concept extraction and the knowledge graph indexes.
     pub knowledge: Option<KnowledgeConfig>,
 }
@@ -161,6 +165,7 @@ pub struct AntflyTomlSettings {
     pub semantic_search: Option<bool>,
     pub decide_model: Option<String>,
     pub approvals_mode: Option<String>,
+    pub approvals_model: Option<String>,
     pub allow_threshold: Option<f64>,
     pub deny_threshold: Option<f64>,
     pub knowledge_graph: Option<bool>,
@@ -201,6 +206,7 @@ impl AntflyConfig {
             embedder: Some(EmbedderConfig::default()),
             decide_model: DEFAULT_DECIDE_MODEL.to_string(),
             approvals: ApprovalSettings::default(),
+            approvals_model: None,
             knowledge: Some(KnowledgeConfig::default()),
         }
     }
@@ -296,6 +302,37 @@ impl AntflyConfig {
                     defaults.deny_threshold_bp,
                 )?,
             },
+            approvals_model: settings.approvals_model,
         })
+    }
+
+    /// The typed-decision model that reviews approvals.
+    pub fn approval_decide_model(&self) -> &str {
+        self.approvals_model
+            .as_deref()
+            .unwrap_or(&self.decide_model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::AntflyConfig;
+    use super::AntflyTomlSettings;
+    use super::DEFAULT_DECIDE_MODEL;
+
+    #[test]
+    fn approvals_can_use_their_own_decide_model() -> Result<(), Box<dyn std::error::Error>> {
+        let shared = AntflyConfig::from_toml(AntflyTomlSettings::default())?;
+        assert_eq!(shared.approval_decide_model(), DEFAULT_DECIDE_MODEL);
+
+        let split = AntflyConfig::from_toml(AntflyTomlSettings {
+            approvals_model: Some("fastino/GLiNER2.5-Decide-1B".to_string()),
+            ..AntflyTomlSettings::default()
+        })?;
+        assert_eq!(split.approval_decide_model(), "fastino/GLiNER2.5-Decide-1B");
+        assert_eq!(split.decide_model, DEFAULT_DECIDE_MODEL);
+        Ok(())
     }
 }
