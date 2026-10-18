@@ -113,7 +113,9 @@ followed by a description of what it refers to in this project), say how A relat
 `a_is_b` when A is a kind, version or instance of B; `b_is_a` for the reverse; `a_part_b` when A \
 is a part, feature or component of B; `b_part_a` for the reverse; `alternatives` when A and B \
 are alternatives for the same purpose; `none` otherwise, including when they are merely used \
-together. When unsure, answer `none`.";
+together. Also answer `none` when A or B is a generic word (\"note\", \"content\", \
+\"information\", \"add\") rather than a specific thing in this project. When unsure, answer \
+`none`.";
 
 pub(crate) const RELATION_CHOICES: &[&str] = &[
     "a_is_b",

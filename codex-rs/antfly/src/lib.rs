@@ -39,6 +39,7 @@ pub use config::DEFAULT_DECIDE_MODEL;
 pub use config::DEFAULT_DESCRIBE_MODEL;
 pub use config::DEFAULT_EXTRACT_MODEL;
 pub use config::EmbedderConfig;
+pub use config::FALLBACK_DESCRIBE_MODEL;
 pub use config::KnowledgeConfig;
 pub use config::TriageMode;
 pub use embedded::EmbeddedBackend;

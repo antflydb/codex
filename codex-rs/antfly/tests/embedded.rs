@@ -1176,6 +1176,21 @@ fn concept_links_are_recorded_and_traversable() -> Result<(), Box<dyn std::error
         let mut from_gemma = linked.get(gemma).cloned().unwrap_or_default();
         from_gemma.sort();
         assert_eq!(from_gemma, vec![embedder.to_string(), qwen.to_string()]);
+
+        // Unlinking removes the edge whichever way it points, and the pair
+        // stays judged so it is not linked again.
+        assert!(knowledge.unlink_concepts(qwen, gemma).await?);
+        assert!(!knowledge.unlink_concepts(qwen, gemma).await?);
+        assert_eq!(
+            knowledge.concept_links().await?,
+            vec![(gemma.to_string(), "is_a".to_string(), embedder.to_string())]
+        );
+        assert!(
+            knowledge
+                .related_pairs_reviewed()
+                .await?
+                .contains(&(gemma.to_string(), qwen.to_string()))
+        );
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

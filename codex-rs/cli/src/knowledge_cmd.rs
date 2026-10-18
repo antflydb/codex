@@ -38,8 +38,8 @@ pub enum KnowledgeSubcommand {
     Status,
     /// Extract and settle claims from history the live pipeline never saw.
     Backfill(BackfillArgs),
-    /// Merge concepts that name the same thing now.
-    Consolidate,
+    /// Describe, merge and link concepts now.
+    Consolidate(ConsolidateArgs),
     /// Describe concepts from the claims about them, with the local
     /// describe model.
     Describe(DescribeArgs),
@@ -50,6 +50,25 @@ pub enum KnowledgeSubcommand {
     ExportPairs(ExportPairsArgs),
     /// List the links between concepts (is_a, part_of, alternative_to).
     Links,
+    /// List the concepts consolidation merged, and what into.
+    Merges,
+    /// Remove the links between two concepts, by name or `concept/` key,
+    /// and keep them from being linked again.
+    Unlink(UnlinkArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ConsolidateArgs {
+    /// Judge every unmerged concept again, including ones examined before
+    /// they had descriptions; runs passes until none are left.
+    #[arg(long)]
+    rejudge: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct UnlinkArgs {
+    a: String,
+    b: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -124,6 +143,55 @@ impl KnowledgeCli {
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
             KnowledgeSubcommand::Backfill(args) => backfill(&antfly, config, args).await,
+            KnowledgeSubcommand::Unlink(args) => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let names = knowledge
+                    .concepts_by_key()
+                    .await
+                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                let resolve = |given: &str| -> Option<String> {
+                    if names.contains_key(given) {
+                        return Some(given.to_string());
+                    }
+                    names
+                        .values()
+                        .find(|concept| concept.name.eq_ignore_ascii_case(given))
+                        .map(|concept| concept.key.clone())
+                };
+                let (Some(a), Some(b)) = (resolve(&args.a), resolve(&args.b)) else {
+                    anyhow::bail!("no concept named {:?} or {:?}", args.a, args.b);
+                };
+                if knowledge.unlink_concepts(&a, &b).await? {
+                    println!("unlinked {} and {}", args.a, args.b);
+                } else {
+                    println!(
+                        "{} and {} were not linked; they won't be linked later",
+                        args.a, args.b
+                    );
+                }
+                Ok(())
+            }
+            KnowledgeSubcommand::Merges => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let names = knowledge
+                    .concepts_by_key()
+                    .await
+                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                let name = |key: &str| {
+                    names
+                        .get(key)
+                        .map(|concept| concept.name.clone())
+                        .unwrap_or_else(|| key.to_string())
+                };
+                for (merged, into) in knowledge.concept_merges().await? {
+                    println!("{} -> {}", name(&merged), name(&into));
+                }
+                Ok(())
+            }
             KnowledgeSubcommand::Links => {
                 let knowledge = antfly
                     .knowledge()
@@ -187,7 +255,7 @@ impl KnowledgeCli {
                         "describing concepts (is the app-server daemon holding the database?)",
                     )?;
                 println!(
-                    "examined {} concepts: {} described, {} unchanged, {} without current claims, {} failed",
+                    "examined {} concepts: {} described, {} unchanged, {} without claims or notes, {} failed",
                     report.examined,
                     report.described,
                     report.unchanged,
@@ -196,19 +264,46 @@ impl KnowledgeCli {
                 );
                 Ok(())
             }
-            KnowledgeSubcommand::Consolidate => {
+            KnowledgeSubcommand::Consolidate(args) => {
+                if args.rejudge {
+                    let knowledge = antfly
+                        .knowledge()
+                        .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                    let forgotten = knowledge.forget_concept_reviews().await.context(
+                        "resetting concept reviews (is the app-server daemon holding the database?)",
+                    )?;
+                    println!("judging {forgotten} unmerged concepts again");
+                }
                 let (thread_manager, host) = start_host(&config).await?;
-                let report = knowledge_admin::consolidate(&thread_manager, &config).await;
+                // One pass examines a bounded number of concepts; a rejudge
+                // runs passes until none are left.
+                let mut outcome = Ok(());
+                for _ in 0..if args.rejudge { 100 } else { 1 } {
+                    match knowledge_admin::consolidate(&thread_manager, &config).await {
+                        Ok((report, relations)) => {
+                            println!(
+                                "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
+                                report.examined,
+                                report.lexical_merges,
+                                report.judged_merges,
+                                report.judged
+                            );
+                            println!(
+                                "judged {} concept pairs for relations: {} linked",
+                                relations.judged, relations.linked
+                            );
+                            if report.examined == 0 && relations.judged == 0 {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            outcome = Err(err);
+                            break;
+                        }
+                    }
+                }
                 stop_host(&thread_manager, host).await;
-                let (report, relations) = report?;
-                println!(
-                    "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
-                    report.examined, report.lexical_merges, report.judged_merges, report.judged
-                );
-                println!(
-                    "judged {} concept pairs for relations: {} linked",
-                    relations.judged, relations.linked
-                );
+                outcome?;
                 Ok(())
             }
         }

@@ -98,6 +98,10 @@ const DECIDE_STATEMENT_MAX_CHARS: usize = 600;
 const SUPERSEDE_CANDIDATES: usize = 3;
 /// Claims about a concept given to the generator that describes it.
 const DESCRIBE_EVIDENCE: usize = 8;
+/// Excerpts from memory notes added to a concept's evidence when claims
+/// leave room, and the longest each may be.
+const NOTE_EXCERPTS: usize = 3;
+const NOTE_EXCERPT_MAX_CHARS: usize = 300;
 /// Longest description kept, in characters.
 const DESCRIPTION_MAX_CHARS: usize = 600;
 /// The facts mention the concept but are mostly about other things, and a
@@ -1468,6 +1472,68 @@ impl Knowledge<'_> {
         Ok(())
     }
 
+    /// Removes every link between concepts `a` and `b`, in either
+    /// direction, and records the pair as judged unrelated so the relation
+    /// pass does not add it back. `false` when there was no link.
+    pub async fn unlink_concepts(&self, a: &str, b: &str) -> AntflyResult<bool> {
+        let table = self.antfly.documents(schema::CONCEPT_LINKS);
+        let mut removed = false;
+        for (from, to) in [(a, b), (b, a)] {
+            let Some(mut doc) = table.get(from).await? else {
+                continue;
+            };
+            let mut changed = false;
+            for kind in CONCEPT_LINK_KINDS {
+                if let Some(Value::Array(targets)) = doc.get_mut(*kind) {
+                    let before = targets.len();
+                    targets.retain(|target| target.as_str() != Some(to));
+                    changed |= targets.len() != before;
+                }
+            }
+            if changed {
+                table.write(vec![Write::put(from.to_string(), doc)]).await?;
+                removed = true;
+            }
+        }
+        self.record_concept_relation(a, b, None).await?;
+        Ok(removed)
+    }
+
+    /// Forgets which concepts consolidation has examined, keeping its
+    /// merges, so every unmerged concept is judged again (with the
+    /// descriptions written since). Returns how many were forgotten.
+    pub async fn forget_concept_reviews(&self) -> AntflyResult<usize> {
+        let sql = self.antfly.sql().await?;
+        let forgotten = sql
+            .fetch_all(
+                "SELECT key FROM codex_concept_reviews WHERE merged_into IS NULL",
+                vec![],
+            )
+            .await?
+            .len();
+        sql.execute(
+            "DELETE FROM codex_concept_reviews WHERE merged_into IS NULL",
+            vec![],
+        )
+        .await?;
+        Ok(forgotten)
+    }
+
+    /// Every merge consolidation made, as `(merged, into)` concept keys.
+    pub async fn concept_merges(&self) -> AntflyResult<Vec<(String, String)>> {
+        let sql = self.antfly.sql().await?;
+        Ok(sql
+            .fetch_all(
+                "SELECT key, merged_into FROM codex_concept_reviews \
+                 WHERE merged_into IS NOT NULL ORDER BY key",
+                vec![],
+            )
+            .await?
+            .iter()
+            .filter_map(|row| Some((row.string("key").ok()?, row.string("merged_into").ok()?)))
+            .collect())
+    }
+
     /// Every concept link as `(from, kind, to)` concept keys.
     pub async fn concept_links(&self) -> AntflyResult<Vec<(String, String, String)>> {
         let mut links = Vec::new();
@@ -1533,6 +1599,36 @@ impl Knowledge<'_> {
         linked
     }
 
+    /// Lines of the memory notes about `concept` that mention it by name,
+    /// for concepts that notes mention but no current claim is about.
+    pub async fn note_evidence(&self, concept: &Concept, limit: usize) -> Vec<String> {
+        let name = concept.name.to_lowercase();
+        let mut excerpts = Vec::new();
+        for (_, doc, _) in self
+            .about_any(
+                schema::MEMORY_NOTES,
+                std::slice::from_ref(&concept.key),
+                limit * 2,
+            )
+            .await
+        {
+            let text = doc
+                .get(crate::SEARCH_TEXT_FIELD)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for line in note_lines_mentioning(text, &name) {
+                let excerpt = truncate_chars(line, NOTE_EXCERPT_MAX_CHARS).to_string();
+                if !excerpts.contains(&excerpt) {
+                    excerpts.push(excerpt);
+                }
+                if excerpts.len() >= limit {
+                    return excerpts;
+                }
+            }
+        }
+        excerpts
+    }
+
     /// Descriptions of the concepts in `keys` that have one.
     pub async fn concept_descriptions(
         &self,
@@ -1553,11 +1649,13 @@ impl Knowledge<'_> {
     }
 
     /// Writes or refreshes descriptions for up to `max` concepts whose
-    /// evidence changed since they were last described. Concepts merged into
-    /// another are skipped, and so are concepts no current claim is about.
+    /// evidence changed since they were last described. Evidence is the
+    /// current claims about the concept, then lines of memory notes that
+    /// mention it. Concepts merged into another are skipped, and so are
+    /// concepts with no evidence.
     pub async fn describe_concepts(&self, max: usize) -> AntflyResult<DescribeReport> {
         let mut report = DescribeReport::default();
-        let Some(model) = self.config.describe_model.clone() else {
+        let Some(mut model) = self.config.describe_model.clone() else {
             return Ok(report);
         };
         let merged = self.merged_concept_keys().await?;
@@ -1570,7 +1668,13 @@ impl Knowledge<'_> {
                 continue;
             }
             report.examined += 1;
-            let evidence = self.concept_evidence(&concept.key, DESCRIBE_EVIDENCE).await;
+            let mut evidence = self.concept_evidence(&concept.key, DESCRIBE_EVIDENCE).await;
+            let room = DESCRIBE_EVIDENCE
+                .saturating_sub(evidence.len())
+                .min(NOTE_EXCERPTS);
+            if room > 0 {
+                evidence.extend(self.note_evidence(&concept, room).await);
+            }
             if evidence.is_empty() {
                 report.without_evidence += 1;
                 continue;
@@ -1585,8 +1689,36 @@ impl Knowledge<'_> {
                 report.unchanged += 1;
                 continue;
             }
-            let request = describe_request(&model, &concept, &evidence);
-            let description = match self.antfly.generate(&request).await {
+            let mut response = self
+                .antfly
+                .generate(&describe_request(&model, &concept, &evidence))
+                .await;
+            // A model too large for the inference memory left by extraction
+            // and decide models: use the smaller one for the rest of this
+            // pass. Its descriptions are rewritten once the configured model
+            // loads, since the model is part of the evidence hash.
+            if response.is_err() && model != crate::config::FALLBACK_DESCRIBE_MODEL {
+                tracing::info!(
+                    "antfly: describe model {model} unavailable; falling back to {}",
+                    crate::config::FALLBACK_DESCRIBE_MODEL
+                );
+                model = crate::config::FALLBACK_DESCRIBE_MODEL.to_string();
+                let fallback_hash = evidence_hash(&model, &concept, &evidence);
+                if existing
+                    .as_ref()
+                    .and_then(|doc| doc.get("evidence_hash")?.as_str())
+                    == Some(fallback_hash.as_str())
+                {
+                    report.unchanged += 1;
+                    continue;
+                }
+                response = self
+                    .antfly
+                    .generate(&describe_request(&model, &concept, &evidence))
+                    .await;
+            }
+            let hash = evidence_hash(&model, &concept, &evidence);
+            let description = match response {
                 Ok(response) => generated_text(&response),
                 Err(err) => {
                     tracing::warn!("antfly: describing {} failed: {err}", concept.key);
@@ -1760,6 +1892,14 @@ impl Knowledge<'_> {
     }
 }
 
+/// Lines of a Markdown note that mention `name` (lowercase), with list
+/// markers and heading hashes stripped.
+fn note_lines_mentioning<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    text.lines()
+        .map(|line| line.trim().trim_start_matches(['#', '-', '*', '>']).trim())
+        .filter(move |line| !line.is_empty() && line.to_lowercase().contains(name))
+}
+
 /// What [`Knowledge::describe_concepts`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DescribeReport {
@@ -1768,7 +1908,7 @@ pub struct DescribeReport {
     pub described: usize,
     /// Concepts whose evidence had not changed since their description.
     pub unchanged: usize,
-    /// Concepts no current claim is about.
+    /// Concepts no current claim or memory note is about.
     pub without_evidence: usize,
     pub failed: usize,
 }
@@ -2118,6 +2258,18 @@ mod tests {
         // A different fact about the same subject never replaces.
         assert_eq!(decide(response(0.30, 0.25, 0.42)), Some(false));
         assert_eq!(decide(json!({"answers": []})), None);
+    }
+
+    #[test]
+    fn note_excerpts_are_the_lines_naming_the_concept() {
+        let note = "# Embedders\n\n- EmbeddingGemma 2 is the default embedder.\n- Qwen3 was dropped.\n> embeddinggemma 2 detects 768 dimensions\n";
+        assert_eq!(
+            note_lines_mentioning(note, "embeddinggemma 2").collect::<Vec<_>>(),
+            vec![
+                "EmbeddingGemma 2 is the default embedder.",
+                "embeddinggemma 2 detects 768 dimensions"
+            ]
+        );
     }
 
     #[test]

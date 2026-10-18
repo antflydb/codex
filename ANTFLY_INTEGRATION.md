@@ -1009,7 +1009,9 @@ written by a local generator from the current claims about the concept:
 - **Model:** `knowledge.describe_model`, default
   `ggml-org/gemma-4-E4B-it-GGUF`. An empty string turns descriptions off.
 - **Evidence:** up to 8 claims, settled first and then the newest, gathered
-  by traversing the concept's `about` edges.
+  by traversing the concept's `about` edges. When claims leave room, up to 3
+  lines from memory notes that name the concept are added; this lifted
+  coverage on the E2E database from 45 to 87 of 111 concepts.
 - **Storage:** `codex_concept_descriptions`, keyed by concept key. The
   description is its `search_text`, so it is full-text searchable and
   embedded.
@@ -1137,7 +1139,27 @@ this is what `codex knowledge benchmark --llm-judge` measures.
 **Descriptions** use Gemma 4 E4B with a prompt that keeps each fact attached
 to the concept it is actually about. E2B, and the first prompt, moved
 properties between concepts ("Antfly … is half the size of Qwen3"). A prompt
-version in the evidence hash rewrites descriptions when the prompt changes.
+version in the evidence hash rewrites descriptions when the prompt changes. When E4B
+can't be admitted, Codex falls back to E2B for the rest of the pass, and a
+later pass that loads E4B rewrites those descriptions. Admission depends on
+macOS memory pressure (Antfly keeps about 9.7 GB in reserve) and on memory
+already held by extraction and decide models; E4B needs about 6.7 GB at
+peak.
+
+**Maintenance commands:**
+- `codex knowledge links` lists the links.
+- `codex knowledge unlink <A> <B>` removes a wrong link in either direction
+  and keeps the pair from being linked again.
+- `codex knowledge merges` lists merges.
+- `codex knowledge consolidate --rejudge` forgets which concepts were
+  examined (merges are kept) and judges them all again with their
+  descriptions, running passes until none are left. On the E2E database it
+  merged 7 more concepts and grew the links from 13 to 26.
+
+**Generic words:** the relation judge is told to answer `none` for generic
+words. Memory notes made junk links such as "note is_a content" before this;
+the change kept fixture detection at 89% precision and 93% recall, with the
+type right on 25 of 27.
 
 **Local inference retries:** local inference calls retry Antfly's retryable
 `MODEL_RESOURCE_BUSY` for up to 30 s (a model still loading, or memory held
@@ -1243,10 +1265,12 @@ through `knowledge.search`.
   history items grouped by `thread_id`, ordered by `ordinal`, segmented by
   `turn_id`, extracted per turn, with `about` edges from a thread node.
   Until then, claims carry thread and turn provenance.
-- **Concept-link auditing.** Links can be listed (`codex knowledge links`)
-  but not yet removed or corrected by hand. Consolidation reviews each
-  concept once, so concepts reviewed before descriptions existed are not
-  re-judged with them.
+- **Undoing merges.** `codex knowledge merges` lists every merge, but a
+  merge can't be undone. On the E2E database one is doubtful:
+  "killall -HUP mDNSResponder" was folded into "killall".
+- **Generic concepts.** Extraction turns generic words in memory notes into
+  concepts ("note", "content", "add"). The relation judge is told to answer
+  `none` for them, but they still get descriptions and can still be merged.
 - **Single writer (embedded).** Run Codex through the app-server daemon
   (the TUI probes its socket, or use `--remote`) so one process owns the
   `.aflite` file. Other processes fail fast rather than opening a second
