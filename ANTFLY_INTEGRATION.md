@@ -1265,6 +1265,18 @@ through `knowledge.search`.
   history items grouped by `thread_id`, ordered by `ordinal`, segmented by
   `turn_id`, extracted per turn, with `about` edges from a thread node.
   Until then, claims carry thread and turn provenance.
+- **Moving the merge judge into Antfly.** antflydb/antfly#1186 adds REVIEW-band
+  adjudication with a typed decider, plus reversible curation and entity
+  APIs. The local typed models are near chance on the concept fixtures, so
+  Codex keeps its own judge for now.
+  - **Next step:** run the fixtures through the OpenAI Decisions API (the
+    decider's `openai` provider). Add it as a `codex knowledge benchmark`
+    model; this needs an OpenAI API key.
+  - **If it matches the 94% generative judge,** Codex moves merge judging
+    into resolution.
+  - **If not,** Antfly needs generator-backed adjudication.
+  - **Either way,** adjudication would need concept descriptions as an asset
+    on the concept documents, not a separate table.
 - **Undoing merges.** `codex knowledge merges` lists every merge, but a
   merge can't be undone. On the E2E database one is doubtful:
   "killall -HUP mDNSResponder" was folded into "killall".
