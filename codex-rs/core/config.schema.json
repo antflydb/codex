@@ -4576,6 +4576,10 @@
               "description": "Concept names to merge in the knowledge graph, as `alias = \"canonical name\"` (for example `KG = \"knowledge graph\"`).",
               "type": "object"
             },
+            "concept_screening": {
+              "description": "Screen concepts for generic words (\"note\", \"content\") during consolidation: `off`, `shadow` (log proposals to review with `codex knowledge proposals`; the default), or `enforce` (ignore them).",
+              "type": "string"
+            },
             "decide_model": {
               "description": "Typed-decision model used to review approvals (default `convaiinnovations/laya`, an `<owner>/<name>` path under the models dir).",
               "type": "string"

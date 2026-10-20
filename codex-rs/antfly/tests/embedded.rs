@@ -1237,9 +1237,18 @@ fn concept_curation_merges_unmerges_and_suppresses() -> Result<(), Box<dyn std::
             Some(agents)
         );
 
-        assert!(knowledge.suppress_concept(note).await?);
+        // Antfly refuses to suppress a merge target, so what was merged
+        // into it is unmerged and suppressed too.
+        let notes = "concept/notes";
+        assert!(knowledge.merge_concept(notes, note).await?);
+        assert_eq!(
+            knowledge.suppress_concept(note).await?,
+            Some(vec![notes.to_string()])
+        );
         let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
         assert!(curation.suppressed.contains(note), "{curation:?}");
+        assert!(curation.suppressed.contains(notes), "{curation:?}");
+        assert!(!curation.redirects.contains_key(notes), "{curation:?}");
         assert!(knowledge.unsuppress_concept(note).await?);
         let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
         assert!(!curation.suppressed.contains(note), "{curation:?}");

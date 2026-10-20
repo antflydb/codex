@@ -946,13 +946,92 @@ impl Knowledge<'_> {
     }
 
     /// Suppresses concept `key`: its mentions mint no concept and no `about`
-    /// edge, and existing edges are removed on replay. `false` when the
+    /// edge, and existing edges are removed on replay. Antfly rejects
+    /// suppressing a merge target, so concepts merged into `key` are
+    /// unmerged and suppressed with it; they are returned. `None` when the
     /// backend cannot curate.
-    pub async fn suppress_concept(&self, key: &str) -> AntflyResult<bool> {
+    pub async fn suppress_concept(&self, key: &str) -> AntflyResult<Option<Vec<String>>> {
+        let absorbed: Vec<String> = match self.concept_curation().await? {
+            Some(curation) => curation
+                .redirects
+                .iter()
+                .filter(|(_, target)| target.as_str() == key)
+                .map(|(source, _)| source.clone())
+                .collect(),
+            None => return Ok(None),
+        };
+        for source in &absorbed {
+            self.unmerge_concept(source, /*pin_distinct*/ false).await?;
+            self.curate_concept(source, json!({"action": "suppress"}))
+                .await?;
+            crate::labels::record_decision(
+                self.antfly,
+                crate::labels::DecisionRecord {
+                    kind: crate::labels::CONCEPT_SUPPRESSED_WITH,
+                    model: "codex",
+                    subject: Some(source.clone()),
+                    input: key,
+                    response: &json!({"suppressed_with": key}),
+                    result: Some(true),
+                    score: None,
+                    threshold_bp: None,
+                },
+            )
+            .await?;
+        }
         Ok(self
             .curate_concept(key, json!({"action": "suppress"}))
             .await?
-            .is_some())
+            .map(|_| absorbed))
+    }
+
+    /// How consolidation screens concepts for generic words.
+    pub fn concept_screening(&self) -> crate::TriageMode {
+        self.config.concept_screening
+    }
+
+    /// Records the user's review of concept `key`'s generic screening:
+    /// `accepted` when it is ignored, not when it is kept. A reviewed concept
+    /// is no longer proposed.
+    pub async fn review_generic(&self, key: &str, accepted: bool) -> AntflyResult<()> {
+        crate::labels::record_decision(
+            self.antfly,
+            crate::labels::DecisionRecord {
+                kind: crate::labels::GENERIC_CONCEPT_REVIEW,
+                model: "user",
+                subject: Some(key.to_string()),
+                input: key,
+                response: &json!({"accepted": accepted}),
+                result: Some(accepted),
+                score: None,
+                threshold_bp: None,
+            },
+        )
+        .await
+    }
+
+    /// Concepts screening called generic that are not ignored, merged away,
+    /// or reviewed yet: the open proposals.
+    pub async fn generic_proposals(&self) -> AntflyResult<Vec<String>> {
+        let Some(curation) = self.concept_curation().await? else {
+            return Ok(Vec::new());
+        };
+        let reviewed =
+            crate::labels::latest_results(self.antfly, crate::labels::GENERIC_CONCEPT_REVIEW)
+                .await?;
+        Ok(
+            crate::labels::latest_results(self.antfly, crate::labels::GENERIC_CONCEPT)
+                .await?
+                .into_iter()
+                .filter(|(key, generic)| {
+                    *generic
+                        && !reviewed.contains_key(key)
+                        && !curation.suppressed.contains(key)
+                        && !curation.redirects.contains_key(key)
+                })
+                .map(|(key, _)| key)
+                .collect(),
+        )
     }
 
     /// Reverses [`Knowledge::suppress_concept`].

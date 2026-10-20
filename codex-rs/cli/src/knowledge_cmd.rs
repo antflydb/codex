@@ -62,8 +62,13 @@ pub enum KnowledgeSubcommand {
     /// Suppress a concept that is noise (a generic word): its mentions stop
     /// minting it and its graph edges are removed.
     Ignore(ConceptArg),
-    /// Undo `ignore`.
+    /// Keep a concept: undo `ignore`, or reject a proposal to ignore it.
+    #[command(visible_alias = "keep")]
     Unignore(ConceptArg),
+    /// List ignored concepts, and why they are ignored.
+    Ignored,
+    /// List concepts generic screening proposes to ignore (shadow mode).
+    Proposals,
 }
 
 #[derive(Debug, clap::Args)]
@@ -220,6 +225,51 @@ impl KnowledgeCli {
                 }
                 Ok(())
             }
+            KnowledgeSubcommand::Ignored => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let Some(curation) = knowledge.concept_curation().await? else {
+                    println!("this Antfly backend can't suppress concepts");
+                    return Ok(());
+                };
+                let keys: Vec<String> = curation.suppressed.iter().cloned().collect();
+                let screened = codex_antfly::labels::latest_results(
+                    &antfly,
+                    codex_antfly::labels::GENERIC_CONCEPT,
+                )
+                .await?;
+                let with = codex_antfly::labels::latest_inputs(
+                    &antfly,
+                    codex_antfly::labels::CONCEPT_SUPPRESSED_WITH,
+                )
+                .await?;
+                print_concepts(&knowledge, &keys, |key, name| {
+                    if let Some(target) = with.get(key) {
+                        format!("ignored with {}", name(target))
+                    } else if screened.get(key) == Some(&true) {
+                        "screened as generic".to_string()
+                    } else {
+                        "ignored".to_string()
+                    }
+                })
+                .await
+            }
+            KnowledgeSubcommand::Proposals => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let keys = knowledge.generic_proposals().await?;
+                if keys.is_empty() {
+                    println!("no open proposals");
+                    return Ok(());
+                }
+                print_concepts(&knowledge, &keys, |_, _| "looks generic".to_string()).await?;
+                println!(
+                    "\naccept with `codex knowledge ignore <concept>`, reject with `codex knowledge keep <concept>`"
+                );
+                Ok(())
+            }
             KnowledgeSubcommand::Unmerge(args) => {
                 let knowledge = antfly
                     .knowledge()
@@ -245,11 +295,18 @@ impl KnowledgeCli {
                     .knowledge()
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
-                if knowledge.suppress_concept(&key).await? {
+                if let Some(absorbed) = knowledge.suppress_concept(&key).await? {
+                    knowledge.review_generic(&key, /*accepted*/ true).await?;
                     println!(
                         "ignoring {}; its graph edges are removed on replay",
                         args.concept
                     );
+                    if !absorbed.is_empty() {
+                        println!(
+                            "also unmerged and ignoring what was merged into it: {}",
+                            absorbed.join(", ")
+                        );
+                    }
                 } else {
                     println!("this Antfly backend can't suppress concepts");
                 }
@@ -261,7 +318,8 @@ impl KnowledgeCli {
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
                 if knowledge.unsuppress_concept(&key).await? {
-                    println!("no longer ignoring {}", args.concept);
+                    knowledge.review_generic(&key, /*accepted*/ false).await?;
+                    println!("keeping {}", args.concept);
                 } else {
                     println!("this Antfly backend can't suppress concepts");
                 }
@@ -357,9 +415,12 @@ impl KnowledgeCli {
                     match knowledge_admin::consolidate(&thread_manager, &config).await {
                         Ok((screened, report, relations)) => {
                             println!(
-                                "screened {} concepts: {} generic, ignored",
-                                screened.screened, screened.suppressed
+                                "screened {} concepts: {} look generic, {} ignored",
+                                screened.screened, screened.generic, screened.suppressed
                             );
+                            if screened.generic > screened.suppressed {
+                                println!("review them with `codex knowledge proposals`");
+                            }
                             println!(
                                 "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
                                 report.examined,
@@ -390,6 +451,34 @@ impl KnowledgeCli {
             }
         }
     }
+}
+
+/// Prints `keys` as `name (why): description`, `why` given the key and a
+/// key-to-name lookup.
+async fn print_concepts(
+    knowledge: &codex_antfly::knowledge::Knowledge<'_>,
+    keys: &[String],
+    why: impl Fn(&str, &dyn Fn(&str) -> String) -> String,
+) -> Result<()> {
+    let names = knowledge
+        .concepts_by_key()
+        .await
+        .context("reading concepts (is the app-server daemon holding the database?)")?;
+    let name = |key: &str| {
+        names
+            .get(key)
+            .map(|concept| concept.name.clone())
+            .unwrap_or_else(|| key.to_string())
+    };
+    let descriptions = knowledge.concept_descriptions(keys).await?;
+    for key in keys {
+        let why = why(key, &name);
+        match descriptions.get(key) {
+            Some(description) => println!("{} ({why}): {description}", name(key)),
+            None => println!("{} ({why})", name(key)),
+        }
+    }
+    Ok(())
 }
 
 /// The concept key a user means: a `concept/` key as given, otherwise the

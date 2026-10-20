@@ -62,21 +62,60 @@ pub async fn record_decision(antfly: &Antfly, record: DecisionRecord<'_>) -> Ant
     Ok(())
 }
 
-/// Subjects already decided for `kind` (e.g. concepts screened as generic).
-pub async fn decided_subjects(
+/// A concept's generic screening: `result` true when the model called it
+/// a generic word.
+pub const GENERIC_CONCEPT: &str = "generic_concept";
+/// The user's review of a generic screening: `result` true when accepted
+/// (the concept is ignored), false when rejected (it is kept).
+pub const GENERIC_CONCEPT_REVIEW: &str = "generic_concept_review";
+/// A concept suppressed because it was merged into a concept that was
+/// ignored; `input` is that concept's key.
+pub const CONCEPT_SUPPRESSED_WITH: &str = "concept_suppressed_with";
+
+/// The latest verdict per subject for `kind`.
+pub async fn latest_results(
     antfly: &Antfly,
     kind: &str,
-) -> AntflyResult<std::collections::BTreeSet<String>> {
+) -> AntflyResult<std::collections::BTreeMap<String, bool>> {
+    Ok(latest_rows(antfly, kind)
+        .await?
+        .into_iter()
+        .filter_map(|(subject, row)| Some((subject, row.bool("result").ok()?)))
+        .collect())
+}
+
+/// The latest input per subject for `kind`.
+pub async fn latest_inputs(
+    antfly: &Antfly,
+    kind: &str,
+) -> AntflyResult<std::collections::BTreeMap<String, String>> {
+    Ok(latest_rows(antfly, kind)
+        .await?
+        .into_iter()
+        .filter_map(|(subject, row)| Some((subject, row.string("input").ok()?)))
+        .collect())
+}
+
+async fn latest_rows(
+    antfly: &Antfly,
+    kind: &str,
+) -> AntflyResult<std::collections::BTreeMap<String, crate::sql::SqlRow>> {
     let sql = antfly.sql().await?;
-    Ok(sql
+    let mut latest = std::collections::BTreeMap::new();
+    // Ascending, so later rows replace earlier ones.
+    for row in sql
         .fetch_all(
-            "SELECT subject FROM codex_decision_log WHERE kind = $1 AND subject IS NOT NULL",
+            "SELECT subject, input, result FROM codex_decision_log \
+             WHERE kind = $1 AND subject IS NOT NULL ORDER BY created_at_ms, id",
             sql_params![kind],
         )
         .await?
-        .iter()
-        .filter_map(|row| row.string("subject").ok())
-        .collect())
+    {
+        if let Ok(subject) = row.string("subject") {
+            latest.insert(subject, row);
+        }
+    }
+    Ok(latest)
 }
 
 /// A turn sent for claim extraction.

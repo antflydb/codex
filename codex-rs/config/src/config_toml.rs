@@ -636,6 +636,10 @@ pub struct AntflyStoreToml {
     /// Concept names to merge in the knowledge graph, as `alias = "canonical
     /// name"` (for example `KG = "knowledge graph"`).
     pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
+    /// Screen concepts for generic words ("note", "content") during
+    /// consolidation: `off`, `shadow` (log proposals to review with `codex
+    /// knowledge proposals`; the default), or `enforce` (ignore them).
+    pub concept_screening: Option<String>,
 }
 
 /// Local typed-decision review of approval requests.

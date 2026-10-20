@@ -70,6 +70,9 @@ pub struct KnowledgeConfig {
     /// Local generator that describes concepts; `None` turns descriptions
     /// off.
     pub describe_model: Option<String>,
+    /// Whether consolidation screens concepts for generic words: `Shadow`
+    /// (the default) logs proposals for review, `Enforce` ignores them.
+    pub concept_screening: TriageMode,
 }
 
 impl Default for KnowledgeConfig {
@@ -80,6 +83,7 @@ impl Default for KnowledgeConfig {
             claims: Some(ClaimPipelineConfig::default()),
             concept_aliases: Vec::new(),
             describe_model: Some(DEFAULT_DESCRIBE_MODEL.to_string()),
+            concept_screening: TriageMode::Shadow,
         }
     }
 }
@@ -109,7 +113,8 @@ impl Default for ClaimPipelineConfig {
     }
 }
 
-/// Screening turns with the decide model before claim extraction.
+/// Screening with a model before acting: turns before claim extraction,
+/// concepts before they are ignored as generic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriageMode {
@@ -215,6 +220,7 @@ pub struct AntflyTomlSettings {
     pub claim_triage: Option<String>,
     pub claim_triage_threshold: Option<f64>,
     pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
+    pub concept_screening: Option<String>,
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -308,6 +314,17 @@ impl AntflyConfig {
                     settings.supersede_threshold,
                     default.supersede_threshold_bp,
                 )?,
+                concept_screening: match settings.concept_screening.as_deref() {
+                    None => default.concept_screening,
+                    Some("off") => TriageMode::Off,
+                    Some("shadow") => TriageMode::Shadow,
+                    Some("enforce") => TriageMode::Enforce,
+                    Some(other) => {
+                        return Err(AntflyError::Config(format!(
+                            "concept_screening must be off, shadow, or enforce; got {other}"
+                        )));
+                    }
+                },
                 concept_aliases: settings
                     .concept_aliases
                     .clone()

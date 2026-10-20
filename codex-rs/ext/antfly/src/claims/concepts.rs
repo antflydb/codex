@@ -344,15 +344,17 @@ where
 
 pub(crate) const GENERIC_INSTRUCTIONS: &str = "You clean the concept index of a knowledge graph \
 built from software engineering sessions. Each numbered concept is a name, often followed by a \
-short description of what it refers to in this project. Answer `generic: true` only when the name \
-is a common word or phrase that does not name a specific thing in this project, such as \
-\"note\", \"content\", \"information\", \"add\", \"summary\" or \"you\". Names of specific \
-tools, technologies, products, files, components, commands or project ideas are not generic, \
-even when short or common (\"DNS\", \"killall\", \"embedder\", \"rollout\"). When unsure, \
-answer false.";
-
-/// Decision-log kind recording each concept's generic screening.
-pub(crate) const GENERIC_KIND: &str = "generic_concept";
+short description of what it refers to in this project. Answer `generic: true` only for filler: \
+a pronoun, a bare verb, or a single everyday word that could appear in any conversation and names \
+nothing in particular, such as \"you\", \"add\", \"delete\", \"note\", \"content\", \
+\"information\" or \"summary\". Everything else is not generic: \
+- names of tools, technologies, products, files, components, commands or settings, even when short \
+(\"DNS\", \"killall\", \"embedder\", \"rollout\"); \
+- domain terms of software engineering or of this project, even when made of common words \
+(\"agent\", \"benchmarks\", \"dimensions\", \"DNS resolution\", \"sandbox permission\", \
+\"elevated permissions\"); \
+- any phrase of two or more words that refers to an idea, practice or rule in this project. \
+A vague description does not make a concept generic; judge the name. When unsure, answer false.";
 /// Concepts screened per pass (one model request).
 const MAX_SCREENED_PER_PASS: usize = 40;
 
@@ -419,15 +421,19 @@ pub(crate) fn parse_generic(answer: &str, count: usize) -> anyhow::Result<Vec<bo
 pub struct GenericScreen {
     /// Concepts screened this pass.
     pub screened: usize,
-    /// Concepts judged generic and suppressed.
+    /// Concepts judged generic.
+    pub generic: usize,
+    /// Generic concepts suppressed (enforce mode only).
     pub suppressed: usize,
 }
 
 /// One screening pass: concepts never screened before go to `judge`, which
 /// says per concept whether it is a generic word rather than a specific
-/// thing; generic ones are suppressed, so their mentions stop minting them
-/// and their edges are removed. Each concept is screened once (the verdict
-/// is a `generic_concept` label). `codex knowledge unignore` reverses one.
+/// thing. Each verdict is a `generic_concept` label, and each concept is
+/// screened once. In shadow mode (the default) generic ones are proposals,
+/// listed by `codex knowledge proposals`; in enforce mode they are
+/// suppressed, so their mentions stop minting them and their edges are
+/// removed. `codex knowledge unignore` reverses one.
 pub(crate) async fn screen_generic<J, F>(
     knowledge: &Knowledge<'_>,
     antfly: &codex_antfly::Antfly,
@@ -438,18 +444,23 @@ where
     J: FnOnce(Vec<String>) -> F,
     F: Future<Output = anyhow::Result<Vec<bool>>>,
 {
+    let mode = knowledge.concept_screening();
+    if mode == codex_antfly::TriageMode::Off {
+        return Ok(GenericScreen::default());
+    }
     let Some(curation) = knowledge.concept_curation().await? else {
         // The backend cannot suppress; nothing to act on.
         return Ok(GenericScreen::default());
     };
-    let screened = codex_antfly::labels::decided_subjects(antfly, GENERIC_KIND).await?;
+    let screened =
+        codex_antfly::labels::latest_results(antfly, codex_antfly::labels::GENERIC_CONCEPT).await?;
     let merged = knowledge.merged_concept_keys().await?;
     let pending: Vec<Concept> = knowledge
         .concepts()
         .await?
         .into_iter()
         .filter(|concept| {
-            !screened.contains(&concept.key)
+            !screened.contains_key(&concept.key)
                 && !merged.contains(&concept.key)
                 && !curation.suppressed.contains(&concept.key)
         })
@@ -472,16 +483,21 @@ where
     let verdicts = judge(rendered.clone()).await?;
     let mut report = GenericScreen {
         screened: pending.len(),
-        suppressed: 0,
+        ..GenericScreen::default()
     };
     for ((concept, rendered), generic) in pending.iter().zip(&rendered).zip(verdicts) {
-        if generic && knowledge.suppress_concept(&concept.key).await? {
-            report.suppressed += 1;
+        if generic {
+            report.generic += 1;
+            if mode == codex_antfly::TriageMode::Enforce
+                && knowledge.suppress_concept(&concept.key).await?.is_some()
+            {
+                report.suppressed += 1;
+            }
         }
         codex_antfly::labels::record_decision(
             antfly,
             codex_antfly::labels::DecisionRecord {
-                kind: GENERIC_KIND,
+                kind: codex_antfly::labels::GENERIC_CONCEPT,
                 model,
                 subject: Some(concept.key.clone()),
                 input: rendered,
@@ -715,22 +731,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn generic_concepts_are_screened_once_and_suppressed() -> anyhow::Result<()> {
-        if !has_models("fastino") {
-            return Ok(());
-        }
-        let _serial = crate::MODEL_TESTS.acquire().await?;
-        let dir = tempfile::tempdir()?;
-        let config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
-        let antfly = codex_antfly::Antfly::open(config)?;
-        let knowledge = antfly
-            .knowledge()
-            .ok_or_else(|| anyhow::anyhow!("no knowledge"))?;
+    async fn write_concepts(antfly: &codex_antfly::Antfly, names: &[&str]) -> anyhow::Result<()> {
         antfly
             .documents(codex_antfly::schema::CONCEPTS)
             .write(
-                ["note", "Antfly"]
+                names
                     .iter()
                     .map(|name| {
                         let key = codex_antfly::knowledge::concept_key(name).unwrap_or_default();
@@ -742,25 +747,79 @@ mod tests {
                     .collect(),
             )
             .await?;
-        let judge = |concepts: Vec<String>| async move {
-            Ok(concepts
-                .iter()
-                .map(|concept| concept.starts_with("\"note\""))
-                .collect())
-        };
-        let report = screen_generic(&knowledge, &antfly, "test", judge).await?;
+        Ok(())
+    }
+
+    async fn note_is_generic(concepts: Vec<String>) -> anyhow::Result<Vec<bool>> {
+        Ok(concepts
+            .iter()
+            .map(|concept| concept.starts_with("\"note\""))
+            .collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_concepts_are_proposed_once_in_shadow_mode() -> anyhow::Result<()> {
+        if !has_models("fastino") {
+            return Ok(());
+        }
+        let _serial = crate::MODEL_TESTS.acquire().await?;
+        let dir = tempfile::tempdir()?;
+        let config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
+        let antfly = codex_antfly::Antfly::open(config)?;
+        let knowledge = antfly
+            .knowledge()
+            .ok_or_else(|| anyhow::anyhow!("no knowledge"))?;
+        write_concepts(&antfly, &["note", "Antfly"]).await?;
+        let report = screen_generic(&knowledge, &antfly, "test", note_is_generic).await?;
         assert_eq!(
             report,
             GenericScreen {
                 screened: 2,
+                generic: 1,
+                suppressed: 0
+            }
+        );
+        let curation = knowledge.concept_curation().await?.unwrap_or_default();
+        assert!(curation.suppressed.is_empty(), "{curation:?}");
+        assert_eq!(knowledge.generic_proposals().await?, vec!["concept/note"]);
+        // Each concept is screened once, and a reviewed one is no longer
+        // proposed.
+        let again = screen_generic(&knowledge, &antfly, "test", note_is_generic).await?;
+        assert_eq!(again, GenericScreen::default());
+        knowledge.review_generic("concept/note", false).await?;
+        assert_eq!(knowledge.generic_proposals().await?, Vec::<String>::new());
+        antfly.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_concepts_are_suppressed_in_enforce_mode() -> anyhow::Result<()> {
+        if !has_models("fastino") {
+            return Ok(());
+        }
+        let _serial = crate::MODEL_TESTS.acquire().await?;
+        let dir = tempfile::tempdir()?;
+        let mut config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
+        if let Some(knowledge) = config.knowledge.as_mut() {
+            knowledge.concept_screening = codex_antfly::TriageMode::Enforce;
+        }
+        let antfly = codex_antfly::Antfly::open(config)?;
+        let knowledge = antfly
+            .knowledge()
+            .ok_or_else(|| anyhow::anyhow!("no knowledge"))?;
+        write_concepts(&antfly, &["note", "Antfly"]).await?;
+        let report = screen_generic(&knowledge, &antfly, "test", note_is_generic).await?;
+        assert_eq!(
+            report,
+            GenericScreen {
+                screened: 2,
+                generic: 1,
                 suppressed: 1
             }
         );
         let curation = knowledge.concept_curation().await?.unwrap_or_default();
         assert!(curation.suppressed.contains("concept/note"), "{curation:?}");
-        // Each concept is screened once.
-        let again = screen_generic(&knowledge, &antfly, "test", judge).await?;
-        assert_eq!(again, GenericScreen::default());
+        assert_eq!(knowledge.generic_proposals().await?, Vec::<String>::new());
         antfly.close().await?;
         Ok(())
     }

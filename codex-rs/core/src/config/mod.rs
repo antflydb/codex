@@ -2608,6 +2608,7 @@ fn thread_store_config(
                 claim_triage: antfly.claim_triage,
                 claim_triage_threshold: antfly.claim_triage_threshold,
                 concept_aliases: antfly.concept_aliases,
+                concept_screening: antfly.concept_screening,
             })
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())

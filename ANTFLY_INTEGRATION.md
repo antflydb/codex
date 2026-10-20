@@ -469,6 +469,7 @@ decide_model = "convaiinnovations/laya"
 # semantic_search = false            # full text only, no embedder needed
 # knowledge_graph = false            # skip concept extraction and the knowledge graph
 # extract_model = "fastino/gliner2.5-base-v1"  # default
+# concept_screening = "shadow"       # off | shadow (propose generic concepts; default) | enforce (ignore them)
 # supersede_threshold = 0.8          # decide-model confidence before a claim supersedes another
 
 [experimental_thread_store.approvals]
@@ -917,8 +918,10 @@ fans out to every resolver writing into `codex_concepts`:
 | `codex knowledge merges` | resolver state | Lists redirects from every concept resolver |
 | `codex knowledge unmerge <concept>` | `unmerge`, `pin_distinct: true` | Restores the concept and pins the pair distinct |
 | `codex knowledge unmerge --allow-remerge <concept>` | `unmerge` | Restores it; a later pass may merge it again |
-| `codex knowledge ignore <concept>` | `suppress` | Mentions stop minting the concept; its edges are removed |
-| `codex knowledge unignore <concept>` | `unsuppress` | Reverses `ignore` |
+| `codex knowledge ignore <concept>` | `suppress` | Mentions stop minting the concept; its edges are removed. Accepts a proposal |
+| `codex knowledge keep <concept>` (or `unignore`) | `unsuppress` | Reverses `ignore`, or rejects a proposal |
+| `codex knowledge ignored` | resolver state | Lists ignored concepts and why: by hand, screened as generic, or ignored with a concept it was merged into |
+| `codex knowledge proposals` | none | Lists concepts generic screening proposes to ignore |
 
 A concept argument is a `concept/…` key, or a name rendered through the
 resolver (`:render`, whose `minted_key` is the key before redirects, so an
@@ -928,12 +931,38 @@ Consolidation reads the curation state (`Knowledge::concept_curation`) and
 never proposes a pair that is pinned distinct, whether lexical twins, name
 neighbors or description neighbors.
 
+**Ignoring a merge target.** Antfly refuses to suppress a key that other
+keys redirect to (`SuppressedResolverRedirectTarget`). `ignore` therefore
+first unmerges every concept merged into it, suppresses those too, and logs
+each as `concept_suppressed_with`. These are separate calls, so the sequence
+is not atomic; antflydb/antfly#1230 asks for an `absorbed` option on
+`:suppress` that does it atomically.
+
 **Generic concepts.** Extraction turns generic words in memory notes into
 concepts ("note", "content", "add"). Each consolidation pass first screens up
 to 40 unscreened concepts in one request to the extraction model, with their
-descriptions. Concepts it calls generic are suppressed. Each verdict is
-logged in `codex_decision_log` (kind `generic_concept`) and the concept is
-never screened again; `unignore` reverses a wrong call.
+descriptions. Each verdict is logged in `codex_decision_log` (kind
+`generic_concept`), and a concept is screened once. `concept_screening`
+chooses what happens next:
+- `shadow` (default): generic verdicts are proposals, listed by
+  `codex knowledge proposals`. `ignore` accepts one and `keep` rejects it;
+  both are logged (`generic_concept_review`), and a reviewed concept is not
+  proposed again.
+- `enforce`: generic concepts are suppressed right away.
+- `off`: no screening.
+
+Shadow is the default because enforcing was too aggressive. On the E2E
+database the first prompt hid 20 of 40 concepts, about 7 of them real
+project concepts ("agent", "DNS resolution", "elevated sandbox
+permission"). The tightened prompt counts only filler words (pronouns, bare
+verbs, single everyday words) as generic and treats domain terms and
+multi-word phrases as specific. It proposed 6 of the same 40: "add",
+"assistant", "content", "creation", "delete" and "edit".
+
+antflydb/antfly#1230 also proposes curation provenance (why each redirect,
+pin or suppression exists) and an entity-level proposal queue. Once those
+land, these proposals move into Antfly and the decision-log bookkeeping goes
+away.
 
 The remote backend maps the same operations to HTTP:
 `POST /tables/{t}/entities/{key}:{merge|unmerge|suppress|unsuppress}`,
