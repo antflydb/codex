@@ -233,10 +233,14 @@ where
         .filter(|concept| !reviewed.contains(&concept.key))
         .collect();
     pending.truncate(MAX_CONCEPTS_PER_PASS);
+    // Pairs a curator unmerged with a pin are never merged again.
+    let curation = knowledge.concept_curation().await?.unwrap_or_default();
     let mut report = Consolidation::default();
     let mut pairs: Vec<(Concept, Concept)> = Vec::new();
     for concept in pending {
-        if let Some(twin) = knowledge.lexical_twin(&concept).await? {
+        if let Some(twin) = knowledge.lexical_twin(&concept).await?
+            && !curation.is_distinct(&concept.key, &twin)
+        {
             if knowledge.merge_concept(&concept.key, &twin).await? {
                 knowledge
                     .record_concept_review(&concept, Some(&twin))
@@ -264,6 +268,7 @@ where
                 || score / own < SIMILARITY_FLOOR
                 || number_tokens(&neighbor.name) != numbers
                 || concept_identity(&neighbor.name) == concept_identity(&concept.name)
+                || curation.is_distinct(&concept.key, &neighbor.key)
             {
                 continue;
             }
@@ -281,7 +286,9 @@ where
                 let Some(neighbor) = names.get(&key) else {
                     continue;
                 };
-                if similarity < DESCRIPTION_MERGE_FLOOR || number_tokens(&neighbor.name) != numbers
+                if similarity < DESCRIPTION_MERGE_FLOOR
+                    || number_tokens(&neighbor.name) != numbers
+                    || curation.is_distinct(&concept.key, &key)
                 {
                     continue;
                 }
@@ -331,6 +338,160 @@ where
                 .await?;
             report.judged_merges += 1;
         }
+    }
+    Ok(report)
+}
+
+pub(crate) const GENERIC_INSTRUCTIONS: &str = "You clean the concept index of a knowledge graph \
+built from software engineering sessions. Each numbered concept is a name, often followed by a \
+short description of what it refers to in this project. Answer `generic: true` only when the name \
+is a common word or phrase that does not name a specific thing in this project, such as \
+\"note\", \"content\", \"information\", \"add\", \"summary\" or \"you\". Names of specific \
+tools, technologies, products, files, components, commands or project ideas are not generic, \
+even when short or common (\"DNS\", \"killall\", \"embedder\", \"rollout\"). When unsure, \
+answer false.";
+
+/// Decision-log kind recording each concept's generic screening.
+pub(crate) const GENERIC_KIND: &str = "generic_concept";
+/// Concepts screened per pass (one model request).
+const MAX_SCREENED_PER_PASS: usize = 40;
+
+pub(crate) fn generic_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item": {"type": "integer"},
+                        "generic": {"type": "boolean"},
+                    },
+                    "required": ["item", "generic"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": ["items"],
+        "additionalProperties": false,
+    })
+}
+
+/// The screening request: numbered concepts rendered with [`judged_name`].
+pub(crate) fn generic_input(concepts: &[String]) -> String {
+    concepts
+        .iter()
+        .enumerate()
+        .map(|(index, concept)| format!("{}. {concept}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Deserialize)]
+struct GenericJudgments {
+    items: Vec<GenericJudgment>,
+}
+
+#[derive(Deserialize)]
+struct GenericJudgment {
+    item: usize,
+    generic: bool,
+}
+
+/// The model's verdict per concept; concepts it skipped are specific.
+pub(crate) fn parse_generic(answer: &str, count: usize) -> anyhow::Result<Vec<bool>> {
+    let judgments: GenericJudgments = serde_json::from_str(answer.trim())?;
+    let mut generic = vec![false; count];
+    for judgment in judgments.items {
+        if let Some(slot) = judgment
+            .item
+            .checked_sub(1)
+            .and_then(|index| generic.get_mut(index))
+        {
+            *slot = judgment.generic;
+        }
+    }
+    Ok(generic)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GenericScreen {
+    /// Concepts screened this pass.
+    pub screened: usize,
+    /// Concepts judged generic and suppressed.
+    pub suppressed: usize,
+}
+
+/// One screening pass: concepts never screened before go to `judge`, which
+/// says per concept whether it is a generic word rather than a specific
+/// thing; generic ones are suppressed, so their mentions stop minting them
+/// and their edges are removed. Each concept is screened once (the verdict
+/// is a `generic_concept` label). `codex knowledge unignore` reverses one.
+pub(crate) async fn screen_generic<J, F>(
+    knowledge: &Knowledge<'_>,
+    antfly: &codex_antfly::Antfly,
+    model: &str,
+    judge: J,
+) -> anyhow::Result<GenericScreen>
+where
+    J: FnOnce(Vec<String>) -> F,
+    F: Future<Output = anyhow::Result<Vec<bool>>>,
+{
+    let Some(curation) = knowledge.concept_curation().await? else {
+        // The backend cannot suppress; nothing to act on.
+        return Ok(GenericScreen::default());
+    };
+    let screened = codex_antfly::labels::decided_subjects(antfly, GENERIC_KIND).await?;
+    let merged = knowledge.merged_concept_keys().await?;
+    let pending: Vec<Concept> = knowledge
+        .concepts()
+        .await?
+        .into_iter()
+        .filter(|concept| {
+            !screened.contains(&concept.key)
+                && !merged.contains(&concept.key)
+                && !curation.suppressed.contains(&concept.key)
+        })
+        .take(MAX_SCREENED_PER_PASS)
+        .collect();
+    if pending.is_empty() {
+        return Ok(GenericScreen::default());
+    }
+    let keys: Vec<String> = pending.iter().map(|concept| concept.key.clone()).collect();
+    let descriptions = knowledge.concept_descriptions(&keys).await?;
+    let rendered: Vec<String> = pending
+        .iter()
+        .map(|concept| {
+            judged_name(
+                &concept.name,
+                descriptions.get(&concept.key).map(String::as_str),
+            )
+        })
+        .collect();
+    let verdicts = judge(rendered.clone()).await?;
+    let mut report = GenericScreen {
+        screened: pending.len(),
+        suppressed: 0,
+    };
+    for ((concept, rendered), generic) in pending.iter().zip(&rendered).zip(verdicts) {
+        if generic && knowledge.suppress_concept(&concept.key).await? {
+            report.suppressed += 1;
+        }
+        codex_antfly::labels::record_decision(
+            antfly,
+            codex_antfly::labels::DecisionRecord {
+                kind: GENERIC_KIND,
+                model,
+                subject: Some(concept.key.clone()),
+                input: rendered,
+                response: &json!({"generic": generic}),
+                result: Some(generic),
+                score: None,
+                threshold_bp: None,
+            },
+        )
+        .await?;
     }
     Ok(report)
 }
@@ -551,6 +712,67 @@ mod tests {
         let again = consolidate(&knowledge, |_| async { Ok(Vec::new()) }).await?;
         assert_eq!(again, Consolidation::default());
         antfly.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_concepts_are_screened_once_and_suppressed() -> anyhow::Result<()> {
+        if !has_models("fastino") {
+            return Ok(());
+        }
+        let _serial = crate::MODEL_TESTS.acquire().await?;
+        let dir = tempfile::tempdir()?;
+        let config = codex_antfly::AntflyConfig::embedded(dir.path().join("codex.aflite"));
+        let antfly = codex_antfly::Antfly::open(config)?;
+        let knowledge = antfly
+            .knowledge()
+            .ok_or_else(|| anyhow::anyhow!("no knowledge"))?;
+        antfly
+            .documents(codex_antfly::schema::CONCEPTS)
+            .write(
+                ["note", "Antfly"]
+                    .iter()
+                    .map(|name| {
+                        let key = codex_antfly::knowledge::concept_key(name).unwrap_or_default();
+                        codex_antfly::Write::put(
+                            key,
+                            json!({"canonical_name": name, "entity_type": "technology"}),
+                        )
+                    })
+                    .collect(),
+            )
+            .await?;
+        let judge = |concepts: Vec<String>| async move {
+            Ok(concepts
+                .iter()
+                .map(|concept| concept.starts_with("\"note\""))
+                .collect())
+        };
+        let report = screen_generic(&knowledge, &antfly, "test", judge).await?;
+        assert_eq!(
+            report,
+            GenericScreen {
+                screened: 2,
+                suppressed: 1
+            }
+        );
+        let curation = knowledge.concept_curation().await?.unwrap_or_default();
+        assert!(curation.suppressed.contains("concept/note"), "{curation:?}");
+        // Each concept is screened once.
+        let again = screen_generic(&knowledge, &antfly, "test", judge).await?;
+        assert_eq!(again, GenericScreen::default());
+        antfly.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn generic_verdicts_default_to_specific() -> anyhow::Result<()> {
+        assert_eq!(
+            generic_input(&["\"note\"".to_string(), "\"DNS\"".to_string()]),
+            "1. \"note\"\n2. \"DNS\""
+        );
+        let answer = json!({"items": [{"item": 1, "generic": true}, {"item": 7, "generic": true}]});
+        assert_eq!(parse_generic(&answer.to_string(), 2)?, vec![true, false]);
         Ok(())
     }
 

@@ -25,10 +25,11 @@ sqlx-postgres = { workspace = true }
 # linked SQLx driver must enable it too, including the SQLite one sqlx pulls in.
 sqlx-sqlite = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+wiremock = { workspace = true }

@@ -828,6 +828,58 @@ impl Backend for EmbeddedBackend {
         })
     }
 
+    fn curate_entity(
+        &self,
+        entity_table: String,
+        key: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call(move |db| {
+                    retry_busy(|| db.curate_entity_json(&entity_table, &key, &bytes))
+                        .map_err(embedded("curate entity"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
+    fn resolver_curation(
+        &self,
+        table: String,
+        resolver: String,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let raw = self
+                .call_in(table, move |db| {
+                    retry_busy(|| db.resolver_curation_json(&resolver))
+                        .map_err(embedded("resolver curation"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
+    fn render_resolver(
+        &self,
+        table: String,
+        resolver: String,
+        mention: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&mention)?;
+            let raw = self
+                .call_in(table, move |db| {
+                    retry_busy(|| db.render_resolver_key_json(&resolver, &bytes))
+                        .map_err(embedded("render resolver key"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
     fn embedded_database(&self) -> Option<Arc<Database>> {
         self.db.as_ref().map(Arc::clone)
     }

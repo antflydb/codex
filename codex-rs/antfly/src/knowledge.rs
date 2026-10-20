@@ -893,6 +893,15 @@ impl Knowledge<'_> {
     /// so later and replayed mentions resolve to `to`. `false` when the
     /// backend cannot merge.
     pub async fn merge_concept(&self, from: &str, to: &str) -> AntflyResult<bool> {
+        // One entity-level call reaches every resolver writing concepts (the
+        // claims and memory-note graphs alike), validated before any applies.
+        if self
+            .curate_concept(from, json!({"action": "merge", "into": to}))
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
         let mut merged = true;
         for table in [schema::KNOWLEDGE, schema::MEMORY_NOTES] {
             merged &= self
@@ -902,6 +911,87 @@ impl Knowledge<'_> {
                 .await?;
         }
         Ok(merged)
+    }
+
+    /// Curates concept `key` in every resolver that writes concepts. `None`
+    /// when the backend cannot curate entities.
+    async fn curate_concept(&self, key: &str, request: Value) -> AntflyResult<Option<Value>> {
+        self.antfly
+            .curate_entity(schema::CONCEPTS, key, request)
+            .await
+    }
+
+    /// Undoes the merge of concept `key` (the key it had before the merge),
+    /// so its mentions resolve to it again. With `pin_distinct`, it can never
+    /// be merged into its former target again. `false` when the backend
+    /// cannot curate.
+    pub async fn unmerge_concept(&self, key: &str, pin_distinct: bool) -> AntflyResult<bool> {
+        if self
+            .curate_concept(
+                key,
+                json!({"action": "unmerge", "pin_distinct": pin_distinct}),
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let sql = self.antfly.sql().await?;
+        sql.execute(
+            "UPDATE codex_concept_reviews SET merged_into = NULL WHERE key = $1",
+            crate::sql_params![key],
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Suppresses concept `key`: its mentions mint no concept and no `about`
+    /// edge, and existing edges are removed on replay. `false` when the
+    /// backend cannot curate.
+    pub async fn suppress_concept(&self, key: &str) -> AntflyResult<bool> {
+        Ok(self
+            .curate_concept(key, json!({"action": "suppress"}))
+            .await?
+            .is_some())
+    }
+
+    /// Reverses [`Knowledge::suppress_concept`].
+    pub async fn unsuppress_concept(&self, key: &str) -> AntflyResult<bool> {
+        Ok(self
+            .curate_concept(key, json!({"action": "unsuppress"}))
+            .await?
+            .is_some())
+    }
+
+    /// Redirects, distinct pins and suppressions of the concept resolvers,
+    /// as Antfly records them. `None` when the backend cannot report them.
+    pub async fn concept_curation(&self) -> AntflyResult<Option<ConceptCuration>> {
+        let mut curation = ConceptCuration::default();
+        let mut reported = false;
+        for table in [schema::KNOWLEDGE, schema::MEMORY_NOTES] {
+            let Some(state) = self
+                .antfly
+                .documents(table)
+                .resolver_curation(CONCEPT_RESOLVER)
+                .await?
+            else {
+                continue;
+            };
+            reported = true;
+            curation.absorb(&state);
+        }
+        Ok(reported.then_some(curation))
+    }
+
+    /// The key the resolver mints for `name` before any redirect: the key
+    /// to unmerge or suppress. `None` when the backend cannot render.
+    pub async fn concept_minted_key(&self, name: &str) -> AntflyResult<Option<String>> {
+        Ok(self
+            .antfly
+            .documents(schema::KNOWLEDGE)
+            .render_resolver(CONCEPT_RESOLVER, json!({"text": name, "label": "concept"}))
+            .await?
+            .and_then(|rendered| rendered.get("minted_key")?.as_str().map(str::to_string)))
     }
 
     /// The concept key the resolver gives `name`, following aliases and
@@ -1898,6 +1988,60 @@ fn note_lines_mentioning<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item
     text.lines()
         .map(|line| line.trim().trim_start_matches(['#', '-', '*', '>']).trim())
         .filter(move |line| !line.is_empty() && line.to_lowercase().contains(name))
+}
+
+/// Durable curation of the concept resolvers (see
+/// [`Knowledge::concept_curation`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConceptCuration {
+    /// Merged concept key → the key it resolves to now.
+    pub redirects: BTreeMap<String, String>,
+    /// Unordered pairs pinned never to merge, smaller key first.
+    pub distinct: BTreeSet<(String, String)>,
+    /// Suppressed concept keys.
+    pub suppressed: BTreeSet<String>,
+}
+
+impl ConceptCuration {
+    /// Adds one resolver's state (`resolver_curation_json`).
+    fn absorb(&mut self, state: &Value) {
+        let state = state.get("resolver").unwrap_or(state);
+        for redirect in state["redirects"].as_array().into_iter().flatten() {
+            if let (Some(key), Some(target)) =
+                (redirect["key"].as_str(), redirect["target"].as_str())
+            {
+                self.redirects.insert(key.to_string(), target.to_string());
+            }
+        }
+        let curation = &state["curation"];
+        for pair in curation["distinct"].as_array().into_iter().flatten() {
+            if let (Some(from), Some(to)) = (pair["from"].as_str(), pair["to"].as_str()) {
+                self.distinct.insert(ordered_pair(from, to));
+            }
+        }
+        for key in curation["suppress"]["keys"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(key) = key.as_str() {
+                self.suppressed.insert(key.to_string());
+            }
+        }
+    }
+
+    /// Whether `a` and `b` are pinned never to merge.
+    pub fn is_distinct(&self, a: &str, b: &str) -> bool {
+        self.distinct.contains(&ordered_pair(a, b))
+    }
+}
+
+fn ordered_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
 }
 
 /// What [`Knowledge::describe_concepts`] did.

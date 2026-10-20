@@ -55,6 +55,28 @@ pub enum KnowledgeSubcommand {
     /// Remove the links between two concepts, by name or `concept/` key,
     /// and keep them from being linked again.
     Unlink(UnlinkArgs),
+    /// Undo a merge: the named concept (by name or `concept/` key) gets its
+    /// own key back, and is pinned so it is never merged into the same
+    /// concept again.
+    Unmerge(UnmergeArgs),
+    /// Suppress a concept that is noise (a generic word): its mentions stop
+    /// minting it and its graph edges are removed.
+    Ignore(ConceptArg),
+    /// Undo `ignore`.
+    Unignore(ConceptArg),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct UnmergeArgs {
+    concept: String,
+    /// Allow consolidation to merge the pair again later.
+    #[arg(long)]
+    allow_remerge: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ConceptArg {
+    concept: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -187,8 +209,58 @@ impl KnowledgeCli {
                         .map(|concept| concept.name.clone())
                         .unwrap_or_else(|| key.to_string())
                 };
-                for (merged, into) in knowledge.concept_merges().await? {
+                // Antfly's redirects are authoritative; Codex's own records
+                // stand in when the backend cannot report them.
+                let merges: Vec<(String, String)> = match knowledge.concept_curation().await? {
+                    Some(curation) => curation.redirects.into_iter().collect(),
+                    None => knowledge.concept_merges().await?,
+                };
+                for (merged, into) in merges {
                     println!("{} -> {}", name(&merged), name(&into));
+                }
+                Ok(())
+            }
+            KnowledgeSubcommand::Unmerge(args) => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let key = concept_key_arg(&knowledge, &args.concept).await?;
+                if knowledge.unmerge_concept(&key, !args.allow_remerge).await? {
+                    println!(
+                        "unmerged {}{}",
+                        args.concept,
+                        if args.allow_remerge {
+                            ""
+                        } else {
+                            "; it won't be merged into the same concept again"
+                        }
+                    );
+                } else {
+                    println!("this Antfly backend can't unmerge concepts");
+                }
+                Ok(())
+            }
+            KnowledgeSubcommand::Ignore(args) => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let key = concept_key_arg(&knowledge, &args.concept).await?;
+                if knowledge.suppress_concept(&key).await? {
+                    println!("ignoring {}; its graph edges are removed on replay", args.concept);
+                } else {
+                    println!("this Antfly backend can't suppress concepts");
+                }
+                Ok(())
+            }
+            KnowledgeSubcommand::Unignore(args) => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let key = concept_key_arg(&knowledge, &args.concept).await?;
+                if knowledge.unsuppress_concept(&key).await? {
+                    println!("no longer ignoring {}", args.concept);
+                } else {
+                    println!("this Antfly backend can't suppress concepts");
                 }
                 Ok(())
             }
@@ -280,7 +352,11 @@ impl KnowledgeCli {
                 let mut outcome = Ok(());
                 for _ in 0..if args.rejudge { 100 } else { 1 } {
                     match knowledge_admin::consolidate(&thread_manager, &config).await {
-                        Ok((report, relations)) => {
+                        Ok((screened, report, relations)) => {
+                            println!(
+                                "screened {} concepts: {} generic, ignored",
+                                screened.screened, screened.suppressed
+                            );
                             println!(
                                 "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
                                 report.examined,
@@ -292,7 +368,7 @@ impl KnowledgeCli {
                                 "judged {} concept pairs for relations: {} linked",
                                 relations.judged, relations.linked
                             );
-                            if report.examined == 0 && relations.judged == 0 {
+                            if screened.screened == 0 && report.examined == 0 && relations.judged == 0 {
                                 break;
                             }
                         }
@@ -308,6 +384,32 @@ impl KnowledgeCli {
             }
         }
     }
+}
+
+/// The concept key a user means: a `concept/` key as given, otherwise the
+/// key the resolver mints for the name before any merge redirect, so a
+/// merged-away concept can still be named.
+async fn concept_key_arg(
+    knowledge: &codex_antfly::knowledge::Knowledge<'_>,
+    given: &str,
+) -> Result<String> {
+    if given.starts_with(codex_antfly::knowledge::CONCEPT_PREFIX) {
+        return Ok(given.to_string());
+    }
+    if let Some(key) = knowledge
+        .concept_minted_key(given)
+        .await
+        .context("rendering the concept key (is the app-server daemon holding the database?)")?
+    {
+        return Ok(key);
+    }
+    knowledge
+        .concepts()
+        .await?
+        .into_iter()
+        .find(|concept| concept.name.eq_ignore_ascii_case(given))
+        .map(|concept| concept.key)
+        .ok_or_else(|| anyhow::anyhow!("no concept named {given:?}"))
 }
 
 fn print_benchmark(results: &[codex_antfly::bench::TaskResult]) {

@@ -1196,3 +1196,55 @@ fn concept_links_are_recorded_and_traversable() -> Result<(), Box<dyn std::error
     })?;
     Ok(())
 }
+
+/// Concept curation goes through Antfly's entity API: merges, unmerges with
+/// a distinct pin, and suppressions are recorded once for every resolver
+/// that writes concepts, and reported back.
+#[test]
+fn concept_curation_merges_unmerges_and_suppresses() -> Result<(), Box<dyn std::error::Error>> {
+    if !has_models("fastino") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let (agents, agent, note) = ("concept/agents", "concept/agent", "concept/note");
+
+        assert!(knowledge.merge_concept(agents, agent).await?);
+        let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
+        assert_eq!(
+            curation.redirects.get(agents).map(String::as_str),
+            Some(agent),
+            "{curation:?}"
+        );
+        assert_eq!(
+            knowledge.concept_key_for("Agents").await?.as_deref(),
+            Some(agent)
+        );
+        // The minted key is the one before the redirect: what a user unmerges.
+        assert_eq!(
+            knowledge.concept_minted_key("Agents").await?.as_deref(),
+            Some(agents)
+        );
+
+        assert!(knowledge.unmerge_concept(agents, true).await?);
+        let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
+        assert!(!curation.redirects.contains_key(agents), "{curation:?}");
+        assert!(curation.is_distinct(agent, agents), "{curation:?}");
+        assert_eq!(
+            knowledge.concept_key_for("Agents").await?.as_deref(),
+            Some(agents)
+        );
+
+        assert!(knowledge.suppress_concept(note).await?);
+        let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
+        assert!(curation.suppressed.contains(note), "{curation:?}");
+        assert!(knowledge.unsuppress_concept(note).await?);
+        let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
+        assert!(!curation.suppressed.contains(note), "{curation:?}");
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

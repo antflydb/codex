@@ -62,6 +62,23 @@ pub async fn record_decision(antfly: &Antfly, record: DecisionRecord<'_>) -> Ant
     Ok(())
 }
 
+/// Subjects already decided for `kind` (e.g. concepts screened as generic).
+pub async fn decided_subjects(
+    antfly: &Antfly,
+    kind: &str,
+) -> AntflyResult<std::collections::BTreeSet<String>> {
+    let sql = antfly.sql().await?;
+    Ok(sql
+        .fetch_all(
+            "SELECT subject FROM codex_decision_log WHERE kind = $1 AND subject IS NOT NULL",
+            sql_params![kind],
+        )
+        .await?
+        .iter()
+        .filter_map(|row| row.string("subject").ok())
+        .collect())
+}
+
 /// A turn sent for claim extraction.
 #[derive(Clone, Debug)]
 pub struct ExtractedTurn {

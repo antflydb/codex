@@ -66,6 +66,53 @@ impl RemoteBackend {
             .map_err(|err| AntflyError::Remote(err.to_string()))
     }
 
+    /// Sends a JSON request (`body` for POST), retrying while the server
+    /// reports the resolver owner busy (429) or unavailable (503), as
+    /// Antfly's curation contract asks. Returns the parsed body; `None` on 404.
+    async fn json_call(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        body: Option<&Value>,
+    ) -> AntflyResult<Option<Value>> {
+        let mut delay = RETRY_INITIAL_DELAY;
+        let mut attempt = 0;
+        loop {
+            let mut builder = self.request(method.clone(), url.clone());
+            if let Some(body) = body {
+                builder = builder.json(body);
+            }
+            let response = self.send(builder).await?;
+            let status = response.status();
+            if matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ) && attempt < RETRY_ATTEMPTS
+            {
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX_DELAY);
+                continue;
+            }
+            if status == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            return Self::checked(response)
+                .await?
+                .json::<Value>()
+                .await
+                .map(Some)
+                .map_err(|err| AntflyError::Malformed(err.to_string()));
+        }
+    }
+
+    fn resolver_url(&self, table: &str, resolver: &str, suffix: &str) -> String {
+        self.table_url(
+            table,
+            &format!("/resolvers/{}{suffix}", encode_path_segment(resolver)),
+        )
+    }
+
     async fn checked(response: reqwest::Response) -> AntflyResult<reqwest::Response> {
         let status = response.status();
         if status.is_success() {
@@ -132,6 +179,10 @@ impl RemoteBackend {
         Ok(())
     }
 }
+
+const RETRY_ATTEMPTS: u32 = 8;
+const RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Percent-encodes one URL path segment.
 fn encode_path_segment(segment: &str) -> String {
@@ -289,5 +340,224 @@ impl Backend for RemoteBackend {
             }
             Ok(())
         })
+    }
+
+    fn resolve_query(
+        &self,
+        table: String,
+        resolver: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            self.json_call(
+                reqwest::Method::POST,
+                self.resolver_url(&table, &resolver, ":resolve"),
+                Some(&request),
+            )
+            .await
+        })
+    }
+
+    fn merge_resolver_keys(
+        &self,
+        table: String,
+        resolver: String,
+        from: String,
+        to: String,
+    ) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            let request = json!({"from": from, "to": to});
+            let merged = self
+                .json_call(
+                    reqwest::Method::POST,
+                    self.resolver_url(&table, &resolver, "/redirects"),
+                    Some(&request),
+                )
+                .await?;
+            Ok(merged.is_some())
+        })
+    }
+
+    fn curate_entity(
+        &self,
+        entity_table: String,
+        key: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let mut body = request;
+            let action = body
+                .as_object_mut()
+                .and_then(|fields| fields.remove("action"))
+                .and_then(|action| action.as_str().map(str::to_string))
+                .ok_or_else(|| AntflyError::Config("curation request needs an action".into()))?;
+            let entity = format!("/entities/{}", encode_path_segment(&key));
+            let (method, url, body) = match action.as_str() {
+                "redirects" => (
+                    reqwest::Method::GET,
+                    self.table_url(&entity_table, &format!("{entity}/redirects")),
+                    None,
+                ),
+                "merge" | "unmerge" | "suppress" | "unsuppress" => (
+                    reqwest::Method::POST,
+                    self.table_url(&entity_table, &format!("{entity}:{action}")),
+                    Some(body),
+                ),
+                other => {
+                    return Err(AntflyError::Config(format!(
+                        "unknown entity curation action `{other}`"
+                    )));
+                }
+            };
+            self.json_call(method, url, body.as_ref()).await
+        })
+    }
+
+    fn resolver_curation(
+        &self,
+        table: String,
+        resolver: String,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            self.json_call(
+                reqwest::Method::GET,
+                self.resolver_url(&table, &resolver, ""),
+                None,
+            )
+            .await
+        })
+    }
+
+    fn render_resolver(
+        &self,
+        table: String,
+        resolver: String,
+        mention: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            self.json_call(
+                reqwest::Method::POST,
+                self.resolver_url(&table, &resolver, ":render"),
+                Some(&mention),
+            )
+            .await
+        })
+    }
+
+    fn render_resolver_key(
+        &self,
+        table: String,
+        resolver: String,
+        mention: Value,
+    ) -> BackendFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let rendered = self.render_resolver(table, resolver, mention).await?;
+            Ok(rendered.and_then(|rendered| {
+                rendered
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_json;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    #[tokio::test]
+    async fn entity_curation_posts_to_the_entity_action() -> AntflyResult<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/db/v1/tables/codex_concepts/entities/concept%2Fagents:merge",
+            ))
+            .and(body_json(json!({"into": "concept/agent"})))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"complete": false})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/db/v1/tables/codex_concepts/entities/concept%2Fagents/redirects",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"redirects": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let backend = RemoteBackend::new(&server.uri(), None)?;
+        let merged = backend
+            .curate_entity(
+                "codex_concepts".into(),
+                "concept/agents".into(),
+                json!({"action": "merge", "into": "concept/agent"}),
+            )
+            .await?;
+        assert_eq!(merged, Some(json!({"complete": false})));
+        let redirects = backend
+            .curate_entity(
+                "codex_concepts".into(),
+                "concept/agents".into(),
+                json!({"action": "redirects"}),
+            )
+            .await?;
+        assert_eq!(redirects, Some(json!({"redirects": []})));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolver_reads_retry_busy_and_map_missing_to_none() -> AntflyResult<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/db/v1/tables/codex_knowledge/resolvers/concepts"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/db/v1/tables/codex_knowledge/resolvers/concepts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"redirects": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/db/v1/tables/codex_knowledge/resolvers/concepts:render",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"minted_key": "concept/agents", "key": "concept/agent"})),
+            )
+            .mount(&server)
+            .await;
+        let backend = RemoteBackend::new(&server.uri(), None)?;
+        assert_eq!(
+            backend
+                .resolver_curation("codex_knowledge".into(), "concepts".into())
+                .await?,
+            Some(json!({"redirects": []}))
+        );
+        let mention = json!({"text": "Agents", "label": "concept"});
+        assert_eq!(
+            backend
+                .render_resolver_key("codex_knowledge".into(), "concepts".into(), mention.clone())
+                .await?,
+            Some("concept/agent".to_string())
+        );
+        assert_eq!(
+            backend
+                .render_resolver("codex_memory_notes".into(), "concepts".into(), mention)
+                .await?,
+            None
+        );
+        Ok(())
     }
 }

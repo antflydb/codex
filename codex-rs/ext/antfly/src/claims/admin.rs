@@ -31,6 +31,7 @@ use super::ThreadClaims;
 use super::Worker;
 use super::concepts;
 pub use super::concepts::Consolidation;
+pub use super::concepts::GenericScreen;
 pub use super::concepts::Relations;
 use super::now_ms;
 
@@ -189,7 +190,7 @@ pub async fn run(
 pub async fn consolidate(
     thread_manager: &Arc<ThreadManager>,
     config: &Config,
-) -> anyhow::Result<(Consolidation, Relations)> {
+) -> anyhow::Result<(GenericScreen, Consolidation, Relations)> {
     let antfly = match &config.experimental_thread_store {
         codex_core::config::ThreadStoreConfig::Antfly(antfly) => codex_antfly::shared(antfly),
         _ => anyhow::bail!("the thread store is not Antfly"),
@@ -217,9 +218,16 @@ pub async fn consolidate(
     if let Err(err) = knowledge.describe_concepts(usize::MAX).await {
         tracing::warn!("antfly: describing concepts failed: {err}");
     }
+    let screened = concepts::screen_generic(
+        &knowledge,
+        &antfly,
+        &super::extract_model(config),
+        |concepts| worker.screen(&job, concepts),
+    )
+    .await?;
     let merged = concepts::consolidate(&knowledge, |pairs| worker.judge(&job, pairs)).await?;
     let related = concepts::relate(&knowledge, |pairs| worker.relate(&job, pairs)).await?;
-    Ok((merged, related))
+    Ok((screened, merged, related))
 }
 
 /// Writes descriptions for up to `max` concepts whose evidence changed,

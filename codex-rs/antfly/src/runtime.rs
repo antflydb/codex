@@ -281,6 +281,20 @@ impl Antfly {
         self.decider()?.decide(request).await
     }
 
+    /// See [`crate::Backend::curate_entity`].
+    pub async fn curate_entity(
+        &self,
+        entity_table: &str,
+        key: &str,
+        request: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.sql().await?;
+        self.backend()
+            .await?
+            .curate_entity(entity_table.to_string(), key.to_string(), request)
+            .await
+    }
+
     /// Generates text with a local generator model.
     pub async fn generate(&self, request: &Value) -> AntflyResult<Value> {
         self.decider()?.generate(request).await
@@ -376,6 +390,26 @@ impl Documents<'_> {
         self.backend()
             .await?
             .resolve_query(self.table.to_string(), resolver.to_string(), request)
+            .await
+    }
+
+    /// See [`crate::Backend::resolver_curation`].
+    pub async fn resolver_curation(&self, resolver: &str) -> AntflyResult<Option<Value>> {
+        self.backend()
+            .await?
+            .resolver_curation(self.table.to_string(), resolver.to_string())
+            .await
+    }
+
+    /// See [`crate::Backend::render_resolver`].
+    pub async fn render_resolver(
+        &self,
+        resolver: &str,
+        mention: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.backend()
+            .await?
+            .render_resolver(self.table.to_string(), resolver.to_string(), mention)
             .await
     }
 

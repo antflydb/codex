@@ -644,6 +644,29 @@ impl Worker {
         concepts::parse_judgments(&answer, count)
     }
 
+    /// The extraction model's verdict on whether each concept (rendered with
+    /// [`concepts::judged_name`]) is a generic word.
+    pub(crate) async fn screen(
+        &self,
+        job: &Job,
+        concepts: Vec<String>,
+    ) -> anyhow::Result<Vec<bool>> {
+        let count = concepts.len();
+        let answer = self
+            .sample(
+                job,
+                concepts::GENERIC_INSTRUCTIONS,
+                &concepts::generic_input(&concepts),
+                concepts::generic_schema(),
+            )
+            .await
+            .map_err(|stop| match stop {
+                Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
+                Stop::Failed(err) => err,
+            })?;
+        concepts::parse_generic(&answer, count)
+    }
+
     /// The extraction model's relation (`a_is_b`, …, `none`) for each pair
     /// of concepts, rendered with [`concepts::judged_name`].
     pub(crate) async fn relate(
@@ -734,6 +757,13 @@ impl Worker {
         match knowledge.describe_concepts(DESCRIBE_PER_PASS).await {
             Ok(report) => tracing::info!("antfly: concept descriptions: {report:?}"),
             Err(err) => tracing::warn!("antfly: describing concepts failed: {err}"),
+        }
+        // Screen out generic words before they can be merged or linked.
+        let model = extract_model(&job.claims.config);
+        let screen = |concepts: Vec<String>| self.screen(job, concepts);
+        match concepts::screen_generic(&knowledge, &job.claims.antfly, &model, screen).await {
+            Ok(report) => tracing::info!("antfly: generic concept screening: {report:?}"),
+            Err(err) => tracing::warn!("antfly: generic concept screening failed: {err}"),
         }
         let judge = |pairs: Vec<(String, String)>| self.judge(job, pairs);
         match concepts::consolidate(&knowledge, judge).await {

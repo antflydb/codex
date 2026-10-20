@@ -118,6 +118,41 @@ pub trait Backend: Send + Sync {
         Box::pin(async { Ok(false) })
     }
 
+    /// Curates entity `key` of `entity_table` in every resolver that writes
+    /// into it: `{"action": "merge" | "unmerge" | "suppress" | "unsuppress" |
+    /// "redirects", "into"?, "replace"?, "pin_distinct"?}`. Returns the
+    /// per-resolver results; `None` when the backend cannot curate.
+    fn curate_entity(
+        &self,
+        _entity_table: String,
+        _key: String,
+        _request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// `resolver`'s durable curation on `table`: redirects, distinct pins
+    /// and suppressions. `None` when the backend cannot report it.
+    fn resolver_curation(
+        &self,
+        _table: String,
+        _resolver: String,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// The full rendering of `mention` by `resolver`: `minted_key` (the key
+    /// before redirects), `key` (after them) and `suppressed`. `None` when
+    /// the backend cannot render.
+    fn render_resolver(
+        &self,
+        _table: String,
+        _resolver: String,
+        _mention: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// The canonical key `resolver` gives `mention` (`{"text", "label"}`),
     /// following aliases and merges. `None` when the backend cannot render.
     fn render_resolver_key(

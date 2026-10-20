@@ -164,7 +164,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `968f037c9a` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `51cfaa8f6e` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +172,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `968f037c9a` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `51cfaa8f6e` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -513,7 +513,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `968f037c9a`, which includes
+against Antfly 1258e8cfcb; the pin is now `51cfaa8f6e`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -522,7 +522,9 @@ replacement), #1127 (NUL diagnostics, statement context in errors), #1135
 under steady writes), #1145 (graph replacement with an inline resolver) and
 #1158 (inline-resolver enrichment settles, explicit `models_dir` in
 background maintenance, no handle-reopen churn) and #1163 (enrichment and
-resolution no longer stall under writes with an inline resolver).
+resolution no longer stall under writes with an inline resolver), #1186
+(generated deciders, reversible curation and the entity APIs) and #1223
+(schema safety, resolver credential redaction).
 
 ### Goal
 
@@ -842,8 +844,10 @@ before it was built:
   Code" 0.80, about as high as true synonyms.
 
 So the resolver stays deterministic, and Codex merges afterwards through
-Antfly's durable `merge_resolver_keys`. The merge redirects the key in the
-claims and memory-notes resolvers and replays affected extractions. A
+Antfly's entity API (`curate_entity` with `merge`), falling back to
+`merge_resolver_keys` per resolver on backends without it. One call
+redirects the key in every resolver that writes concepts (claims and memory
+notes) and replays affected extractions. A
 consolidation pass (`ext/antfly/src/claims/concepts.rs`) runs after a thread
 settles, at most every 10 minutes per database. For each promoted concept it
 has not examined (`codex_concept_reviews`, migration 24):
@@ -902,6 +906,41 @@ Since #1158 the embedded tests extract for real. GLiNER needs about 2.4 GB of
 inference live memory, so under memory pressure (other builds running, say)
 loads can be refused with a retryable `MODEL_RESOURCE_BUSY` and these tests
 can fail. Isolated reruns pass.
+
+### Curation
+
+Merges, unmerges and suppressions use Antfly's entity API (#1186), which
+fans out to every resolver writing into `codex_concepts`:
+
+| Command | Entity action | Effect |
+|---|---|---|
+| `codex knowledge merges` | resolver state | Lists redirects from every concept resolver |
+| `codex knowledge unmerge <concept>` | `unmerge`, `pin_distinct: true` | Restores the concept and pins the pair distinct |
+| `codex knowledge unmerge --allow-remerge <concept>` | `unmerge` | Restores it; a later pass may merge it again |
+| `codex knowledge ignore <concept>` | `suppress` | Mentions stop minting the concept; its edges are removed |
+| `codex knowledge unignore <concept>` | `unsuppress` | Reverses `ignore` |
+
+A concept argument is a `concept/…` key, or a name rendered through the
+resolver (`:render`, whose `minted_key` is the key before redirects, so an
+unmerge can name the merged-away concept), or a case-insensitive name match.
+
+Consolidation reads the curation state (`Knowledge::concept_curation`) and
+never proposes a pair that is pinned distinct, whether lexical twins, name
+neighbors or description neighbors.
+
+**Generic concepts.** Extraction turns generic words in memory notes into
+concepts ("note", "content", "add"). Each consolidation pass first screens up
+to 40 unscreened concepts in one request to the extraction model, with their
+descriptions. Concepts it calls generic are suppressed. Each verdict is
+logged in `codex_decision_log` (kind `generic_concept`) and the concept is
+never screened again; `unignore` reverses a wrong call.
+
+The remote backend maps the same operations to HTTP:
+`POST /tables/{t}/entities/{key}:{merge|unmerge|suppress|unsuppress}`,
+`GET /tables/{t}/entities/{key}/redirects`, `GET /tables/{t}/resolvers/{r}`,
+`POST /tables/{t}/resolvers/{r}:render|:resolve` and
+`POST /tables/{t}/resolvers/{r}/redirects`. It retries 429 and 503 with
+backoff; a 404 means the backend cannot curate.
 
 ### Memory notes
 
@@ -1277,12 +1316,6 @@ through `knowledge.search`.
   - **If not,** Antfly needs generator-backed adjudication.
   - **Either way,** adjudication would need concept descriptions as an asset
     on the concept documents, not a separate table.
-- **Undoing merges.** `codex knowledge merges` lists every merge, but a
-  merge can't be undone. On the E2E database one is doubtful:
-  "killall -HUP mDNSResponder" was folded into "killall".
-- **Generic concepts.** Extraction turns generic words in memory notes into
-  concepts ("note", "content", "add"). The relation judge is told to answer
-  `none` for them, but they still get descriptions and can still be merged.
 - **Single writer (embedded).** Run Codex through the app-server daemon
   (the TUI probes its socket, or use `--remote`) so one process owns the
   `.aflite` file. Other processes fail fast rather than opening a second
@@ -1309,3 +1342,11 @@ through `knowledge.search`.
   matching Antfly port; the `DualStore` harness and the fresh-`CODEX_HOME`
   gate catch drift.
 - Branch: `antfly/integration`, tracking `upstream/main`.
+- Upstream builds `v8` 152 against Codex-built rusty_v8 artifacts from the
+  `rusty-v8-v<version>` release of openai/codex. Locally, download
+  `librusty_v8_ptrcomp_sandbox_release_<target>.a.gz` and
+  `src_binding_ptrcomp_sandbox_release_<target>.rs`, check them against
+  `third_party/v8/rusty_v8_<version>_release_manifests.sha256` (as
+  `.github/actions/setup-rusty-v8` does), and set `RUSTY_V8_ARCHIVE` and
+  `RUSTY_V8_SRC_BINDING_PATH`. `codex-voice-host` needs GStreamer; exclude
+  it from workspace builds without it.
