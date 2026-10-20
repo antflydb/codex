@@ -17,3 +17,6 @@ pub use fragment::ContextualUserFragment;
 pub use fragment::RenderedFragment;
 
 pub use recap_prompt::RecapPrompt;
+
+/// Shared classification for compaction summaries produced by core and filtered by Guardian.
+pub const COMPACTION_SUMMARY_KIND: &str = "compaction.summary";

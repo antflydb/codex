@@ -23,6 +23,7 @@ pub struct GuardianReviewSessionLimits {
 pub async fn run_with_retry<Evidence, F, Attempt>(
     limits: GuardianReviewSessionLimits,
     external_cancel: Option<&CancellationToken>,
+    telemetry: Option<&codex_otel::SessionTelemetry>,
     mut run_attempt: F,
 ) -> (
     GuardianReviewOutcome,
@@ -45,9 +46,12 @@ where
     } = limits;
     assert!(max_attempts > 0, "guardian review must run at least once");
     let mut attempt_count = 1;
+    let mut context_changed = false;
     loop {
         let (outcome, mut analytics_result, evidence) = run_attempt(deadline).await;
         analytics_result.attempt_count = attempt_count;
+        context_changed |= analytics_result.context_changed;
+        analytics_result.context_changed = context_changed;
         if attempt_count >= max_attempts || !should_retry_guardian_review(&outcome) {
             return (outcome, analytics_result, evidence);
         }
@@ -57,7 +61,8 @@ where
             }
             _ => None,
         };
-        if let Some(error) = wait_before_guardian_retry(
+        let wait_started = Instant::now();
+        let wait_error = wait_before_guardian_retry(
             attempt_count,
             max_attempts,
             &outcome,
@@ -65,8 +70,32 @@ where
             deadline,
             external_cancel,
         )
-        .await
-        {
+        .await;
+        if let Some(telemetry) = telemetry {
+            let reason = match &outcome {
+                GuardianReviewOutcome::Error(error) => {
+                    crate::metrics::failure_reason_tag(Some(error.failure_reason()))
+                }
+                GuardianReviewOutcome::CachedApproval | GuardianReviewOutcome::Completed(_) => {
+                    "none"
+                }
+            };
+            let wait_outcome = match &wait_error {
+                None => "retry",
+                Some(GuardianReviewError::Cancelled) => "cancelled",
+                Some(_) => "deadline",
+            };
+            let tags = [("failure_reason", reason), ("outcome", wait_outcome)];
+            telemetry.record_duration(
+                "codex.guardian.review.retry_wait_ms",
+                wait_started.elapsed(),
+                &tags,
+            );
+            if wait_error.is_none() {
+                telemetry.counter("codex.guardian.review.retry", /*inc*/ 1, &tags);
+            }
+        }
+        if let Some(error) = wait_error {
             return (GuardianReviewOutcome::Error(error), analytics_result, None);
         }
         attempt_count += 1;

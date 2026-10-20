@@ -37,7 +37,14 @@ pub(crate) async fn run_mcp_tool(
 ) -> HandlerRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
+    let timeout_started = tokio::time::Instant::now();
+    let duration = Duration::from_secs(handler.timeout_sec);
     let result = async {
+        if let Some(trust) = &handler.plugin_trust {
+            tokio::time::timeout(duration, trust.verify())
+                .await
+                .context("hook trust verification timed out")??;
+        }
         let hook_event: Value =
             serde_json::from_str(hook_event_json).context("failed to parse hook event input")?;
         let input = expand_mcp_argument_template(argument_template, &hook_event)?;
@@ -70,7 +77,11 @@ pub(crate) async fn run_mcp_tool(
                 environment_id,
                 metadata: call_metadata,
                 input,
-                timeout: Duration::from_secs(handler.timeout_sec),
+                timeout: if handler.plugin_trust.is_some() {
+                    duration.saturating_sub(timeout_started.elapsed())
+                } else {
+                    Duration::from_secs(handler.timeout_sec)
+                },
             })
             .await
     }

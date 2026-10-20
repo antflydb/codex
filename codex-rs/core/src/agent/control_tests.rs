@@ -101,6 +101,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WorldStateItem;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -1174,9 +1175,12 @@ async fn cancelled_v2_send_finishes_reload_registration() {
             .unwrap(),
         child_id,
     );
-    assert_eq!(
-        control.runtime.registry.evicted_environments(child_id),
-        None
+    assert!(
+        control
+            .runtime
+            .registry
+            .evicted_environments(child_id)
+            .is_none()
     );
     // Evict and reload again with the single child slot. This also catches a leaked
     // pin or pending residency reservation left behind by the cancelled sender.
@@ -2823,7 +2827,8 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         model: None,
         instructions: Some("Updated model instructions.".to_string()),
     }
-    .render();
+    .render()
+    .expect_text();
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -2833,6 +2838,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
     let mut child_config = harness.config.clone();
+    child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = child_config.features.enable(Feature::MultiAgentV2);
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
@@ -2878,7 +2884,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let tool_declarations = ResponseItem::AdditionalTools {
         id: None,
         role: "developer".to_string(),
-        tools: vec![serde_json::json!({"type": "function", "name": "parent_tool"})],
+        tools: Arc::from([serde_json::json!({"type": "function", "name": "parent_tool"})]),
     };
     let tool_state = serde_json::json!({"top_level_tools": {"function:parent_tool": "hash"}})
         .as_object()
@@ -3153,6 +3159,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     );
 
     let mut no_hint_child_config = harness.config.clone();
+    no_hint_child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = no_hint_child_config.features.enable(Feature::MultiAgentV2);
     no_hint_child_config.developer_instructions = Some(String::new());
     no_hint_child_config
@@ -3249,6 +3256,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(marke
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
     let mut child_config = harness.config.clone();
+    child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = child_config.features.enable(Feature::MultiAgentV2);
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
@@ -3284,7 +3292,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(marke
     let tool_declarations = ResponseItem::AdditionalTools {
         id: None,
         role: "developer".to_string(),
-        tools: vec![serde_json::json!({"type": "function", "name": "compacted_tool"})],
+        tools: Arc::from([serde_json::json!({"type": "function", "name": "compacted_tool"})]),
     };
     let tools_update = ContextualUserFragment::into(IncrementalToolsHint(
         codex_prompts::ResolvedIncrementalToolMessages::default().tool_update_hint,
@@ -3863,7 +3871,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         rollout_items.push(rollout_response_item(ResponseItem::AdditionalTools {
             id: None,
             role: "developer".to_string(),
-            tools: vec![serde_json::json!({"type": "function", "name": "parent_tool"})],
+            tools: Arc::from([serde_json::json!({"type": "function", "name": "parent_tool"})]),
         }));
         rollout_items.push(RolloutItem::TurnContext(
             turn_context.to_turn_context_item(),

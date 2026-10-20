@@ -66,9 +66,13 @@ mod patch_approval_tests;
 mod permission_selection_tests;
 #[path = "tests/projectless_tests.rs"]
 mod projectless_tests;
+#[path = "tests/quick_dials_tests.rs"]
+mod quick_dials_tests;
 #[path = "tests/unavailable_commands_tests.rs"]
 mod unavailable_commands;
 
+#[path = "tests/backend_sessions_tests.rs"]
+mod backend_sessions;
 #[path = "tests/history_hydration_tests.rs"]
 mod history_hydration_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
@@ -97,6 +101,8 @@ mod startup_frame_tests;
 mod startup_warnings_tests;
 #[path = "tests/stream_animation_tests.rs"]
 mod stream_animation_tests;
+#[path = "tests/streaming_interleave_e2e.rs"]
+mod streaming_interleave_e2e;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/transcript_composer.rs"]
@@ -276,6 +282,64 @@ async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<(
 }
 
 #[tokio::test]
+async fn program_status_acknowledges_deliberate_mouse_events() -> Result<()> {
+    use crate::terminal_program_status::ProgramStatus;
+    use crossterm::event::MouseButton;
+    use crossterm::event::MouseEvent;
+    use crossterm::event::MouseEventKind;
+
+    let mut app = make_test_app().await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let thread_id = ThreadId::new();
+    for (turn_status, expected) in [
+        (TurnStatus::Completed, ProgramStatus::Done),
+        (TurnStatus::Failed, ProgramStatus::Error),
+    ] {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            app.chat_widget.handle_server_notification(
+                turn_started_notification(thread_id, "result"),
+                /*replay_kind*/ None,
+            );
+            app.chat_widget.handle_server_notification(
+                turn_completed_notification(thread_id, "result", turn_status.clone()),
+                /*replay_kind*/ None,
+            );
+            let before = app.chat_widget.desired_program_status();
+            let mut mouse = MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Mouse(mouse))
+                .await?;
+            let after_hover = app.chat_widget.desired_program_status();
+            mouse.kind = kind;
+            app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Mouse(mouse))
+                .await?;
+            assert_eq!(
+                [
+                    before,
+                    after_hover,
+                    app.chat_widget.desired_program_status()
+                ],
+                [expected, expected, ProgramStatus::Idle],
+                "after {turn_status:?}, {kind:?}",
+            );
+        }
+    }
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn duplicate_named_resume_renders_error_without_replacing_current_session() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let label = format!("duplicate-{}", ThreadId::new());
@@ -421,7 +485,8 @@ async fn next_thread_settings_updated(
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+            event.event
             && let ServerNotification::ThreadSettingsUpdated(notification) = *notification
             && notification.thread_id == thread_id.to_string()
         {
@@ -442,6 +507,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
     app.handle_mcp_inventory_result(
         Ok(vec![McpServerStatus {
             server_capabilities: None,
+            tool_list_meta: None,
             tools_error: None,
             name: "docs".to_string(),
             runtime_status: None,
@@ -898,6 +964,11 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
             text_elements: Vec::new(),
         }])
     );
+
+    for expected in ["follow-up after replay", "earlier prompt"] {
+        app.chat_widget.handle_key_event(KeyCode::Up.into());
+        assert_eq!(app.chat_widget.composer_text_with_pending(), expected);
+    }
 
     Ok(())
 }
@@ -2756,7 +2827,10 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         }
 
         // Cold-resume the persisted V2 root so its children are registered before selection.
-        app.config.thread_unload_delay = Duration::ZERO;
+        std::fs::write(
+            app.config.codex_home.join("config.toml"),
+            "thread_unload_delay_secs = 0\n",
+        )?;
         let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
             &app.config,
         ))
@@ -2810,7 +2884,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             app_server.thread_unsubscribe(child_thread_id).await?;
             let closed = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
                 while let Some(event) = app_server.next_event().await {
-                    if matches!(&event,
+                    if matches!(&event.event,
                         codex_app_server_client::AppServerEvent::ServerNotification(notification)
                             if matches!(notification.as_ref(), ServerNotification::ThreadClosed(closed)
                                 if closed.thread_id == child_thread_id.to_string()))
@@ -2825,7 +2899,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             app.select_agent_thread(&mut tui, &mut app_server, child_thread_id)
                 .await?;
             // A queued close from the old runtime must not undo the new attachment.
-            app.handle_app_server_event(&app_server, closed).await;
+            app.handle_backend_event(&app_server, closed).await;
             app.drain_active_thread_events(&mut tui).await?;
             assert_eq!(app.active_thread_id, Some(child_thread_id));
             assert!(!matches!(
@@ -3122,7 +3196,8 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+            event.event
             && let ServerNotification::ThreadStarted(notification) = notification.as_ref()
             && notification.thread.id == side_thread_id.to_string()
         {
@@ -3536,6 +3611,7 @@ async fn remote_resume_rejects_explicit_permission_override() -> Result<()> {
     )?;
     app.config.codex_home = home.path().to_path_buf().abs();
     let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let backend_id = server.backend_id();
     app.cli_kv_overrides
         .push(("default_permissions".into(), ":workspace".into()));
     assert!(
@@ -3556,6 +3632,7 @@ async fn remote_resume_rejects_explicit_permission_override() -> Result<()> {
         &mut tui,
         &mut server,
         SessionTarget {
+            backend_id,
             thread_id: ThreadId::new(),
             path: None,
             cwd: None,
@@ -8059,6 +8136,7 @@ async fn remote_resume_current_cwd_rejection_snapshot() -> Result<()> {
         },
     };
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let backend_id = app_server.backend_id();
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
     let control = app
@@ -8066,6 +8144,7 @@ async fn remote_resume_current_cwd_rejection_snapshot() -> Result<()> {
             &mut tui,
             &mut app_server,
             crate::resume_picker::SessionTarget {
+                backend_id,
                 path: None,
                 thread_id: ThreadId::new(),
                 cwd: None,
@@ -8103,6 +8182,7 @@ async fn remote_exec_resume_current_cwd_is_rejected() -> Result<()> {
         .await,
     );
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let backend_id = app_server.backend_id();
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
     let control = app
@@ -8110,6 +8190,7 @@ async fn remote_exec_resume_current_cwd_is_rejected() -> Result<()> {
             &mut tui,
             &mut app_server,
             crate::resume_picker::SessionTarget {
+                backend_id,
                 path: None,
                 thread_id: ThreadId::new(),
                 cwd: None,
@@ -8142,6 +8223,7 @@ async fn in_app_resume_session_cwd_without_metadata_is_non_fatal() -> Result<()>
     app.state_db = None;
     let active_thread_id = app.chat_widget.thread_id();
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let backend_id = app_server.backend_id();
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
     let control = app
@@ -8149,6 +8231,7 @@ async fn in_app_resume_session_cwd_without_metadata_is_non_fatal() -> Result<()>
             &mut tui,
             &mut app_server,
             crate::resume_picker::SessionTarget {
+                backend_id,
                 path: None,
                 thread_id: ThreadId::new(),
                 cwd: None,
@@ -8205,6 +8288,7 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
     };
     app.harness_overrides.cwd = Some(remote_cwd.clone());
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let backend_id = app_server.backend_id();
     Box::pin(app_server.resume_thread(
         &crate::local_settings::LocalSettings::from(&app.config),
         app.config.clone(),
@@ -8228,6 +8312,7 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
         &mut tui,
         &mut app_server,
         crate::resume_picker::SessionTarget {
+            backend_id,
             path: Some(rollout_path),
             thread_id: ThreadId::from_string(&thread_id)?,
             cwd: None,
@@ -8361,6 +8446,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             Some(server) => server,
             slot @ None => slot.insert(
                 crate::start_app_server_for_picker(
+                    crate::backend_id::BackendId::new(),
                     &config,
                     &crate::AppServerTarget::Embedded,
                     Vec::new(),
@@ -8371,6 +8457,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
                 .await?,
             ),
         };
+        let backend_id = app_server.backend_id();
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         app.config = config;
         app.launch_cwd = launch_cwd.clone();
@@ -8386,6 +8473,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
                 &mut tui,
                 app_server,
                 crate::resume_picker::SessionTarget {
+                    backend_id,
                     path: Some(rollout_path),
                     thread_id,
                     cwd: None,
@@ -8457,6 +8545,7 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
         .await
         .map_err(std::io::Error::other)?;
 
+    let backend_id = crate::backend_id::BackendId::new();
     let mut targets = Vec::new();
     for (filename_timestamp, metadata_timestamp, session_cwd) in [
         (
@@ -8498,6 +8587,7 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
             ),
         )?;
         targets.push(crate::resume_picker::SessionTarget {
+            backend_id,
             path: Some(rollout_path),
             thread_id: ThreadId::from_string(&thread_id)?,
             cwd: None,
@@ -8508,6 +8598,7 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
         crate::init_state_db_for_app_server_target(&config, &crate::AppServerTarget::Embedded)
             .await?;
     let mut app_server = Box::pin(crate::start_app_server_for_picker(
+        backend_id,
         &config,
         &crate::AppServerTarget::Embedded,
         Vec::new(),
@@ -9662,17 +9753,32 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
             (ReasoningEffortConfig::High, true),
             (ReasoningEffortConfig::Ultra, true),
         ] {
+            app.chat_widget.set_model(&model_name);
             if session_only {
+                app.chat_widget.set_model("different-base-model");
+                let default_mode = app.chat_widget.current_collaboration_mode().clone();
+                app.chat_widget
+                    .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+                app.chat_widget
+                    .set_collaboration_mask(CollaborationModeMask {
+                        name: "Plan".to_string(),
+                        mode: Some(ModeKind::Plan),
+                        model: Some(model_name.clone()),
+                        reasoning_effort: Some(Some(effort.clone())),
+                        developer_instructions: None,
+                    });
                 app.handle_event(
                     &mut tui,
                     &mut app_server,
                     AppEvent::SelectSessionModel {
                         model: model_name.clone(),
                         effort: Some(effort.clone()),
+                        service_tier: None,
                     },
                 )
                 .await
                 .expect("session-only reasoning selection should succeed");
+                assert_eq!(app.chat_widget.current_collaboration_mode(), &default_mode);
             } else if effort == ReasoningEffortConfig::Ultra {
                 app.chat_widget
                     .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
@@ -10170,3 +10276,6 @@ mod active_reconnect;
 #[cfg(unix)]
 #[path = "tests/navigation_reconnect_tests.rs"]
 mod navigation_reconnect;
+
+#[path = "tests/backend_event_tests.rs"]
+mod backend_event_tests;

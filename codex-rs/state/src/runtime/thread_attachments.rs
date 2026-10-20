@@ -14,6 +14,7 @@ use crate::ThreadAttachmentArchiveFilter;
 use crate::ThreadAttachmentOwner;
 use crate::ThreadAttachmentOwnerPage;
 use crate::ThreadAttachmentPage;
+use crate::sqlite::SqlitePoolWriteExt;
 use anyhow::Context;
 use chrono::Utc;
 use codex_protocol::ThreadId;
@@ -41,7 +42,7 @@ impl StateRuntime {
             )
             .await;
         }
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let destination = destination_thread_id.to_string();
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&destination)
@@ -103,7 +104,7 @@ impl StateRuntime {
             .await;
         }
 
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let thread_id_string = thread_id.to_string();
         let thread_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&thread_id_string)
@@ -180,7 +181,7 @@ impl StateRuntime {
             )
             .await;
         }
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let thread_id_string = thread_id.to_string();
         let thread_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&thread_id_string)

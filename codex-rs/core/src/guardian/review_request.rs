@@ -34,12 +34,19 @@ pub(in crate::guardian) struct ReviewAuthorization {
     history_reset: CancellationToken,
 }
 
+/// Keeps observed context changes separate from the invalidation outcome.
+/// A concurrent stop or history reset can take precedence over changed context.
+pub(in crate::guardian) struct ReviewInvalidation {
+    pub(in crate::guardian) outcome: codex_guardian_reviewer::GuardianReviewSessionOutcome,
+    pub(in crate::guardian) context_changed: bool,
+}
+
 impl ReviewAuthorization {
     pub(in crate::guardian) async fn invalidation(
         &self,
         session: &Session,
         cancellation: Option<&CancellationToken>,
-    ) -> Option<codex_guardian_reviewer::GuardianReviewSessionOutcome> {
+    ) -> Option<ReviewInvalidation> {
         use codex_guardian_reviewer::GuardianReviewSessionOutcome;
 
         let root_snapshot = session
@@ -63,7 +70,7 @@ impl ReviewAuthorization {
         let review_context_changed = root_review_changed
             || self.review_context_revision != history.guardian_review_context_revision();
         // An actual stop or history reset wins over a concurrent evidence change.
-        if self.history_reset.is_cancelled()
+        let outcome = if self.history_reset.is_cancelled()
             || cancellation.is_some_and(CancellationToken::is_cancelled)
             || root_history_changed
         {
@@ -78,7 +85,11 @@ impl ReviewAuthorization {
             Some(GuardianReviewSessionOutcome::StaleAuthorization)
         } else {
             None
-        }
+        };
+        outcome.map(|outcome| ReviewInvalidation {
+            outcome,
+            context_changed: authorization_changed || review_context_changed,
+        })
     }
 }
 

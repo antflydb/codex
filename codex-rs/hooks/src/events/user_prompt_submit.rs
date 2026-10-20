@@ -464,6 +464,7 @@ mod tests {
     fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::UserPromptSubmit,
             matcher: None,
             timeout_sec: 5,

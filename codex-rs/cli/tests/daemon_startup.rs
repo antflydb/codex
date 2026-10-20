@@ -22,6 +22,18 @@ async fn agents_can_offer_restart_for_managed_daemon() -> Result<()> {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn agents_defers_launch_directory_trust_until_starting_a_task() -> Result<()> {
+    daemon_startup("agents-untrusted").await
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn agents_checks_trust_when_starting_after_dismissing_overview() -> Result<()> {
+    daemon_startup("agents-untrusted-new").await
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn discovered_managed_daemon_can_restart_with_auto_start_disabled() -> Result<()> {
     daemon_startup("discovered").await
 }
@@ -173,13 +185,18 @@ async fn daemon_startup(command: &str) -> Result<()> {
          tui.disable_paste_burst = true\n\
          {}\n\
          notice.model_migrations.\"gpt-5.6-terra\" = \"gpt-6-sol\"\n\
-         [projects.{}]\ntrust_level = \"trusted\"\n",
+         [projects.{}]\ntrust_level = \"{}\"\n",
             if command == "discovered" {
-                "tui.status_line=[\"model\",\"thread-id\",\"thread-name\"]"
+                "tui.status_line=[\"model\",\"thread-id\",\"thread-name\"]\nfeatures.daemon_auto_start=false"
             } else {
                 ""
             },
             serde_json::to_string(&workspace_path)?,
+            if command.starts_with("agents-untrusted") {
+                "untrusted"
+            } else {
+                "trusted"
+            },
         ),
     )?;
     let mismatch = command.starts_with("mismatch-");
@@ -216,7 +233,13 @@ async fn daemon_startup(command: &str) -> Result<()> {
     let mut steps: VecDeque<(&str, &[u8])> = VecDeque::new();
     if matches!(
         command,
-        "start" | "agents" | "discovered" | "bedrock-running" | "restrictive-job"
+        "start"
+            | "agents"
+            | "agents-untrusted"
+            | "agents-untrusted-new"
+            | "discovered"
+            | "bedrock-running"
+            | "restrictive-job"
     ) || mismatch
     {
         // A selected package with a stopped daemon avoids installing a release.
@@ -273,6 +296,15 @@ async fn daemon_startup(command: &str) -> Result<()> {
             steps.push_back(("GPT-5.6-Terra", b"/daemon\r"));
             steps.push_back(("Restartbackgroundserver", b"\x1b[F\r"));
             "Restartbackgroundserver?"
+        } else if command.starts_with("agents-untrusted") {
+            args.push("agents".into());
+            if command == "agents-untrusted-new" {
+                steps.push_back(("Notasksyet", b"\x1b"));
+                steps.push_back(("GPT-5.6-Terra", b"/new\r"));
+            } else {
+                steps.push_back(("Notasksyet", b"n"));
+            }
+            "entercontinue·escback"
         } else if command == "discovered" {
             args.extend(["--disable".into(), "daemon_auto_start".into()]);
             // Empty drafts need not survive a daemon restart. Renaming materializes the
@@ -382,6 +414,7 @@ async fn daemon_startup(command: &str) -> Result<()> {
         let writer = session.writer_sender();
         let mut stdout = spawned.stdout_rx;
         let mut output = String::new();
+        let mut initial_agents_screen = String::new();
         let mut screen = vt100::Parser::new(
             /*rows*/ 40, /*cols*/ 120, /*scrollback_len*/ 0,
         );
@@ -422,6 +455,12 @@ async fn daemon_startup(command: &str) -> Result<()> {
                 if let Some((ready, input)) = steps.front()
                     && text.contains(ready)
                 {
+                    if command == "agents-untrusted" && *ready == "Notasksyet" {
+                        if !text.contains("enteropennnew") {
+                            continue;
+                        }
+                        initial_agents_screen = screen.screen().contents();
+                    }
                     if command == "discovered" {
                         if *ready == "Restartbackgroundserver?" {
                             existing_daemon = Some(fs::read(&pid_file)?);
@@ -433,6 +472,12 @@ async fn daemon_startup(command: &str) -> Result<()> {
                             }) {
                                 continue;
                             }
+                        }
+                        // A replacement PID can appear before the TUI observes the disconnect.
+                        // Wait for reconnect to clear/rebuild the transcript, so the old
+                        // composer's command popup cannot make the status probe look ready.
+                        if *input == b"/status" && !output.contains("\x1b[3J") {
+                            continue;
                         }
                         // The old header can linger while the daemon stops. Check both
                         // the draft and its Enter against the replacement process and UI.
@@ -456,6 +501,22 @@ async fn daemon_startup(command: &str) -> Result<()> {
                     steps.pop_front();
                     output.clear();
                 } else if steps.is_empty() && text.contains(expected) {
+                    if command == "agents-untrusted" {
+                        let transition = format!(
+                            "{initial_agents_screen}\n\n--- Start a task ---\n\n{}",
+                            screen.screen().contents()
+                        )
+                        .replace(&*workspace_path.to_string_lossy(), "[WORKSPACE]")
+                        .replace(&*home.path().to_string_lossy(), "[CODEX_HOME]")
+                        .replace("     tab/⇧tab filter", "tab/shift+tab filter");
+                        let transition = transition.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+                        let snapshot = codex_utils_cargo_bin::find_resource!(
+                            "tests/snapshots/daemon_startup__agents_overview_before_folder_consent.snap"
+                        )?;
+                        insta::with_settings!({snapshot_path => snapshot.parent().context("snapshot has no parent")?}, {
+                            insta::assert_snapshot!("agents_overview_before_folder_consent", transition);
+                        });
+                    }
                     if mismatch {
                         let previous_pid = existing_daemon.as_ref().context("missing original daemon PID")?;
                         ensure!((fs::read(&pid_file)? != *previous_pid) == restart);

@@ -253,7 +253,10 @@ impl Classification {
                 truncations.extend(rendered.truncations);
                 codex_guardian_context::PreviousReview {
                     id: review.delivery_id.clone(),
-                    fragment: GuardianReviewEvidenceFragment::new(rendered.body).render(),
+                    fragment: GuardianReviewEvidenceFragment::new(rendered.body)
+                        .render()
+                        .into_text()
+                        .unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -398,21 +401,24 @@ impl Classification {
                         );
                     }
                     let (ready, score) = tokio::sync::oneshot::channel();
-                    tokio::spawn(reservation.run(ConversationRequest {
+                    let request = ConversationRequest {
                         evidence,
                         sampling,
-                        reset_token_limit:
-                            guardian_config.async_classifier_conversation_token_limit,
+                        reset_token_limit: guardian_config
+                            .async_classifier_conversation_token_limit,
                         ready,
                         authorization: score_authorization.clone(),
                         thread: Arc::clone(&thread),
                         metrics: metrics.clone(),
                         pending_score: pending_score.clone(),
-                    }));
+                    };
+                    if let Some(prepared) = reservation.prepare(request).await {
+                        tokio::spawn(prepared.run());
+                    }
                     tokio::select! {
                         biased;
                         () = pending_score.expired() => Err(LunaSamplerError::Superseded),
-                        result = score => result.unwrap_or(Err(LunaSamplerError::Superseded)),
+                        result = score => result.unwrap_or(Err(LunaSamplerError::Superseded)).map(super::sampler::SampledScore::accept),
                     }
                 }
             };

@@ -215,6 +215,8 @@ mod app_server_events;
 pub(crate) mod app_server_requests;
 mod app_server_thread_ownership;
 mod backend_banner_fallback;
+mod backend_events;
+mod backend_sessions;
 mod background_requests;
 mod composer_hints;
 mod config_panel;
@@ -237,6 +239,7 @@ mod managed_worktree_creation;
 mod misalignment_policy;
 mod model_defaults;
 mod new_session;
+mod quick_dials;
 mod turn_tips;
 pub(crate) use new_session::has_launch_setting;
 mod clipboard;
@@ -277,6 +280,7 @@ mod thread_settings;
 mod thread_title;
 mod transcript_export;
 mod tui_mode_picker;
+mod user_turn_submission;
 mod user_verification;
 mod user_verification_errors;
 mod user_verification_requests;
@@ -876,6 +880,12 @@ impl App {
             self.discard_startup_modal_input(tui)?;
             return Ok(AppRunControl::Continue);
         }
+        if matches!(&event, TuiEvent::Key(key) if key.kind != KeyEventKind::Release)
+            || matches!(&event, TuiEvent::Paste(text) if !text.is_empty())
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+        {
+            self.chat_widget.acknowledge_program_status();
+        }
         let idle_draw = matches!(event, TuiEvent::Draw);
         if self.handle_rendered_selection_event(tui, &event)? {
             return Ok(AppRunControl::Continue);
@@ -1123,7 +1133,7 @@ impl App {
                     let restrict_disconnected_input = self.reconnect.offline
                         && !self.chat_widget.keymap_contexts().is_warnings()
                         && self.reconnect.presentation
-                            == reconnect::ReconnectPresentation::Conversation
+                            != reconnect::ReconnectPresentation::Overview
                         && !self
                             .chat_widget
                             .active_view_accepts_input_when_disconnected();
@@ -1219,7 +1229,6 @@ impl App {
     }
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
-        self.sync_thread_title_progress();
         self.chat_widget
             .set_sparkle_terminal_focus(tui.is_terminal_focused());
         if tui.is_owned_screen() {
