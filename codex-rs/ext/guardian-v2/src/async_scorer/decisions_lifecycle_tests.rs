@@ -7,6 +7,7 @@ use pretty_assertions::assert_eq;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    let trusted_skill_path = "/skills/example/SKILL.md";
     for (case, enabled, status, choice, baseline, expected_risk) in [
         ("disabled", false, 200, "high", "low", 0.0),
         ("not_initialized", true, 200, "high", "low", 0.0),
@@ -84,6 +85,11 @@ async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -
         } else {
             assert!(store.get::<DecisionsSampler>().is_none());
         }
+        if case == "cannot_escalate" {
+            store
+                .get_or_init(codex_core::context::GuardianReviewEvidence::default)
+                .record_trusted_skill("turn-1", trusted_skill_path.into());
+        }
         metrics.0.lock().unwrap().clear();
         fixture.score_tool(ToolName::plain("read_file")).await;
         let score = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
@@ -118,19 +124,25 @@ async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -
                 let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
                 let baseline_body = baseline_mock.single_request().body_json();
                 let baseline_input = baseline_body["input"].as_array().unwrap();
-                let policy = baseline_input
+                let policy_index = baseline_input
                     .iter()
-                    .find(|item| item["role"] == "developer" && item["type"] == "message")
+                    .position(|item| item["role"] == "developer" && item["type"] == "message")
                     .unwrap();
+                let policy = &baseline_input[policy_index];
                 assert_eq!(
                     body["questions"][0]["instructions"],
                     policy["content"][0]["text"]
                 );
-                let evidence = baseline_input
+                let evidence = baseline_input[policy_index + 1..]
                     .iter()
-                    .filter(|item| item["role"] == "user")
                     .map(|item| json!({"role": item["role"], "content":item["content"]}))
                     .collect::<Vec<_>>();
+                assert!(evidence.iter().any(|item| {
+                    item["role"] == "developer"
+                        && item["content"][0]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(trusted_skill_path))
+                }));
                 assert_eq!(body["input"], json!(evidence));
             }
             let (outcome, reason) = match case {

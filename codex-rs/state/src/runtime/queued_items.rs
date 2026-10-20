@@ -2,6 +2,8 @@ use super::*;
 use crate::MAX_QUEUE_ITEMS;
 use crate::QueuedUserSubmissionRecord;
 use crate::runtime::antfly_backend::queue as antfly_queue;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use sqlx::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -134,7 +136,7 @@ impl SqliteQueueStore {
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(i64::try_from(MAX_QUEUE_ITEMS)?)
-        .fetch_one(pool.as_ref())
+        .fetch_one_write(pool.as_ref())
         .await?;
         QueuedUserSubmissionRecord::try_from_row(&row)
     }
@@ -195,7 +197,7 @@ impl SqliteQueueStore {
         .bind(datetime_to_epoch_millis(Utc::now()))
         .bind(thread_id.to_string())
         .bind(item_id)
-        .fetch_optional(pool.as_ref())
+        .fetch_optional_write(pool.as_ref())
         .await?;
         row.as_ref()
             .map(QueuedUserSubmissionRecord::try_from_row)
@@ -213,7 +215,7 @@ impl SqliteQueueStore {
             sqlx::query("DELETE FROM queued_items WHERE thread_id = ? AND id = ?")
                 .bind(thread_id.to_string())
                 .bind(item_id)
-                .execute(pool.as_ref())
+                .execute_with_busy_retry(pool.as_ref())
                 .await?
                 .rows_affected()
                 > 0,
@@ -227,7 +229,7 @@ impl SqliteQueueStore {
                 return Box::pin(antfly_queue::reorder(antfly, thread_id, ordered_ids)).await;
             }
         };
-        let mut transaction = pool.begin().await?;
+        let mut transaction = pool.begin_immediate().await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, queue_order FROM queued_items
              WHERE thread_id = ? ORDER BY queue_order",
@@ -274,7 +276,7 @@ impl SqliteQueueStore {
         };
         Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(pool.as_ref())
+            .execute_with_busy_retry(pool.as_ref())
             .await?
             .rows_affected()
             > 0)

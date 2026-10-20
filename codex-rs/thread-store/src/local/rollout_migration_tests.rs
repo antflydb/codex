@@ -9,7 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_extension_items::ExtensionItem;
+use codex_extension_items::image_generation::GeneratedImageRef;
 use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
@@ -49,6 +51,7 @@ use codex_rollout::RetainedContextEvent;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -532,13 +535,16 @@ async fn migration_preserves_image_generation_failure_metadata() {
         id: "image-call".to_string(),
         status: "failed".to_string(),
         revised_prompt: Some("paint a blue whale".to_string()),
-        result: String::new(),
+        image: GeneratedImageRef::Inline {
+            result: String::new(),
+        },
         transparent_background: None,
         failure: Some(ImageGenerationFailure::UsageLimitExceeded {
             limit_id: "image_gen".to_string(),
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        input_images: Vec::new(),
         imagegen_request_id: None,
         generation_id: None,
     };
@@ -547,10 +553,74 @@ async fn migration_preserves_image_generation_failure_metadata() {
             call_id: expected_item.id.clone(),
             status: expected_item.status.clone(),
             revised_prompt: expected_item.revised_prompt.clone(),
-            result: expected_item.result.clone(),
+            image: expected_item.image.clone(),
             transparent_background: expected_item.transparent_background,
             failure: expected_item.failure.clone(),
             saved_path: expected_item.saved_path.clone(),
+            input_images: Vec::new(),
+        }));
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![
+            started("image-turn"),
+            image_completion,
+            completed("image-turn"),
+        ],
+    );
+    let store = indexed_store(home.path()).await;
+
+    store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate legacy image completion");
+
+    let migrated_item = read_rollout(&path)
+        .into_iter()
+        .find_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Some(event.item),
+            _ => None,
+        })
+        .expect("migrated image completion");
+    let TurnItem::Extension(ExtensionItem::ImageGeneration(migrated_item)) = migrated_item else {
+        panic!("expected migrated extension image-generation item");
+    };
+    assert_eq!(migrated_item, expected_item);
+}
+
+#[tokio::test]
+async fn migration_preserves_image_generation_input_observations() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let expected_item = ImageGenerationItem {
+        id: "image-call".to_string(),
+        status: "completed".to_string(),
+        revised_prompt: Some("paint a blue whale".to_string()),
+        image: GeneratedImageRef::Inline {
+            result: "cG5n".to_string(),
+        },
+        transparent_background: None,
+        failure: None,
+        saved_path: None,
+        input_images: vec![ImageGenerationInputImage {
+            path: AbsolutePathBuf::from_absolute_path(home.path().join("reference.png"))
+                .expect("absolute input path"),
+            sha256: "ab".repeat(32),
+        }],
+        imagegen_request_id: None,
+        generation_id: None,
+    };
+    let image_completion =
+        RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+            call_id: expected_item.id.clone(),
+            status: expected_item.status.clone(),
+            revised_prompt: expected_item.revised_prompt.clone(),
+            image: expected_item.image.clone(),
+            transparent_background: expected_item.transparent_background,
+            failure: expected_item.failure.clone(),
+            saved_path: expected_item.saved_path.clone(),
+            input_images: expected_item.input_images.clone(),
         }));
     let path = write_rollout(
         home.path(),

@@ -98,12 +98,20 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
         sender,
         codex_analytics::AnalyticsEventsClient::disabled(),
     ));
+    let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
+        manager.clone(),
+        Some(config.cwd.to_path_buf()),
+        Arc::clone(&config),
+        threads.get_models_manager(),
+        Arc::clone(&auth_manager),
+    ));
     let processor = AccountRequestProcessor::new(
         Arc::clone(&auth_manager),
         threads,
         outgoing,
         config,
         manager,
+        model_catalog,
     );
     let initial_loads = loads.load(Ordering::SeqCst);
     for _ in 0..3 {

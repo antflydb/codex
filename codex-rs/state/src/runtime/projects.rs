@@ -16,6 +16,7 @@ use crate::ProjectRoot;
 use crate::ProjectSortKey;
 use crate::ProjectsPage;
 use crate::SortDirection;
+use crate::sqlite::SqlitePoolWriteExt;
 
 const PROJECT_SELECT: &str = "SELECT projects.*,
     (SELECT MAX(recency_at_ms) FROM threads
@@ -31,7 +32,7 @@ impl StateRuntime {
         if let Some(antfly) = &self.antfly {
             return antfly_projects::set_thread_project(antfly, thread_id, project_id).await;
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
         if let Some(project_id) = project_id {
             let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE id = ?")
                 .bind(project_id)
@@ -169,7 +170,7 @@ impl StateRuntime {
             .await?;
             return Ok(CreatedProject { project, created });
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let existing_project_id = sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM project_idempotency_keys WHERE key = ?",
         )
@@ -263,7 +264,7 @@ impl StateRuntime {
         if let Some(antfly) = &self.antfly {
             return antfly_projects::update_project(antfly, id, name, roots, metadata).await;
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let row = QueryBuilder::<Sqlite>::new(PROJECT_SELECT)
             .push(" WHERE id = ")
             .push_bind(id)
@@ -323,7 +324,7 @@ impl StateRuntime {
         if let Some(antfly) = &self.antfly {
             return antfly_projects::move_project(antfly, project_id, before_project_id).await;
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let mut project_ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM projects ORDER BY position ASC, id ASC",
         )
@@ -375,7 +376,7 @@ impl StateRuntime {
         if let Some(antfly) = &self.antfly {
             return antfly_projects::delete_project(antfly, id).await;
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE id = ?")
             .bind(id)
             .fetch_one(&mut *tx)

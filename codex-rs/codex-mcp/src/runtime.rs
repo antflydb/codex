@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -112,6 +113,7 @@ pub struct McpRuntime {
     resource_cache_generation: AtomicU64,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
+    ema_auth: OnceLock<crate::ema_auth::EmaAuthContext>,
 }
 
 struct EventStreamCancellation {
@@ -251,6 +253,7 @@ impl McpRuntime {
             resource_cache_generation: AtomicU64::new(0),
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
+            ema_auth: OnceLock::new(),
         }
     }
 
@@ -335,6 +338,23 @@ impl McpRuntime {
     }
 
     async fn publish(&self, input: McpRuntimeInput, previous: Option<&McpConnectionSet>) {
+        let ema_auth = (input.config.xaa_enabled
+            && input.mcp_servers.values().any(|server| {
+                server.config().enabled
+                    && matches!(server.config().auth, codex_config::McpServerAuth::EmaAuth)
+            }))
+        .then(|| {
+            self.ema_auth
+                .get_or_init(|| {
+                    crate::ema_auth::EmaAuth::new(
+                        Arc::clone(&input.config),
+                        input.auth.as_ref(),
+                        input.auth_manager.as_ref(),
+                    )
+                    .map_err(Into::into)
+                })
+                .clone()
+        });
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let auth = input.auth.clone();
@@ -351,6 +371,7 @@ impl McpRuntime {
         let ready_environments = input.runtime_context.ready_environments.clone();
         let connections = Arc::new(
             McpConnectionSet::new(
+                ema_auth,
                 previous,
                 publication_gate,
                 input,
@@ -657,9 +678,9 @@ impl McpRuntime {
             .await
     }
 
-    /// Calls a tool for the host, using a cached namespace only if its catalogs stay unchanged.
-    /// Missing or changed catalogs leave the namespace unknown. Attribution never starts
-    /// servers or refreshes their catalogs.
+    /// Calls a tool for the host, retaining attribution while its catalogs stay unchanged.
+    /// Waiting calls capture a binding after the selected server starts; non-waiting calls
+    /// use the cached binding. Missing or changed catalogs leave the namespace unknown.
     #[allow(clippy::too_many_arguments)]
     pub async fn latest_call_tool(
         &self,
@@ -672,12 +693,36 @@ impl McpRuntime {
         wait_for_server: bool,
     ) -> anyhow::Result<McpToolCallResult> {
         let current = self.current.load_full();
-        let cached = current
-            .cached_binding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(|cached| Some((cached.catalog_revisions.clone(), cached.binding.upgrade()?)));
+        current
+            .connections
+            .validate_tool_call(server, tool, environment_id)?;
+        let attribution = if wait_for_server
+            && current.connections.wait_for_server_startup(server).await
+            && let Some(revisions) = current
+                .connections
+                .stable_catalog_revisions(
+                    /*required_servers*/ &[],
+                    /*required_plugins*/ &HashSet::new(),
+                )
+                .await
+        {
+            Self::binding_from_published_runtime(
+                Arc::clone(&current),
+                /*required_servers*/ &[],
+                /*required_plugins*/ &HashSet::new(),
+            )
+            .await
+            .map(|binding| (revisions, binding))
+        } else {
+            current
+                .cached_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|cached| {
+                    Some((cached.catalog_revisions.clone(), cached.binding.upgrade()?))
+                })
+        };
         let result = current
             .connections
             .call_tool(
@@ -694,7 +739,7 @@ impl McpRuntime {
         // Check after dispatch so a refresh before or during the call invalidates attribution.
         // Revisions include client identity and increase on catalog changes. Reading them
         // does not start servers or refresh catalogs; all catalogs matter for name collisions.
-        let namespace = if let Some((revisions, binding)) = cached
+        let namespace = if let Some((revisions, binding)) = attribution
             && current
                 .connections
                 .stable_catalog_revisions(

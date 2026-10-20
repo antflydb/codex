@@ -601,20 +601,43 @@ pub(crate) fn active_binding_specs(
     let bindings = bindings_for_action(runtime_keymap, context, action).ok_or_else(|| {
         format!("Unknown keymap action `{context}.{action}`. Reopen /keymap and choose an action.")
     })?;
-    if let Some(action_id) = action_id
-        && let Some(crate::key_hint::ShortcutHint::Chord { prefix, completion }) =
-            runtime_keymap.chords.primary_hint(action_id, bindings)
-    {
-        return Ok(vec![format!(
-            "{} {}",
-            binding_to_config_key_spec(prefix)?,
-            binding_to_config_key_spec(completion)?
-        )]);
-    }
-    bindings
+    let mut specs = bindings
         .iter()
+        .filter(|binding| !crate::keymap::is_dispatch_token(**binding))
         .map(|binding| binding_to_config_key_spec(*binding))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(action_id) = action_id {
+        let chords: Vec<_> = runtime_keymap
+            .chords
+            .bindings
+            .iter()
+            .filter(|binding| binding.action == action_id)
+            .collect();
+        let available: std::collections::HashSet<_> = chords
+            .iter()
+            .map(|binding| (binding.chord.prefix, binding.chord.completion))
+            .collect();
+        for binding in &chords {
+            // An implicit default can yield to a different action on some leader aliases.
+            // Only persist the symbolic form when all aliases remain available.
+            let partial_leader = binding.spec.starts_with("leader ")
+                && runtime_keymap
+                    .chords
+                    .leader
+                    .iter()
+                    .any(|prefix| !available.contains(&(*prefix, binding.chord.completion)));
+            specs.push(if partial_leader {
+                format!(
+                    "{} {}",
+                    binding_to_config_key_spec(binding.chord.prefix)?,
+                    binding_to_config_key_spec(binding.chord.completion)?
+                )
+            } else {
+                binding.spec.clone()
+            });
+        }
+    }
+    Ok(dedup_bindings(specs))
 }
 
 fn dedup_bindings(bindings: Vec<String>) -> Vec<String> {

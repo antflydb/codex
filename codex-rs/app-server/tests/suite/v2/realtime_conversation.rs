@@ -1316,6 +1316,7 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
                 additional_context: None,
                 client_user_message_id: None,
                 responsesapi_client_metadata: None,
+                responsesapi_client_metadata_patch: None,
             })
             .await?;
         let rejected = timeout(
@@ -1348,6 +1349,7 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
             additional_context: None,
             client_user_message_id: Some("accepted-steer".to_string()),
             responsesapi_client_metadata: None,
+            responsesapi_client_metadata_patch: None,
         })
         .await?;
     let accepted: TurnSteerResponse =

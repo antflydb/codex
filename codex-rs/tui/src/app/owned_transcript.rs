@@ -80,6 +80,10 @@ impl App {
         let chat_widget = &self.chat_widget;
         let transcript_width = chat_widget.history_wrap_width(width);
         let view = &mut self.transcript_view;
+        view.image_protocol = chat_widget.pet_image_support().protocol().filter(|_| {
+            !self.app_server_target.uses_remote_workspace()
+                && crate::projectless::has_only_local_environments(&self.environment_manager)
+        });
         view.mouse_scroll_speed = self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0);
         view.primary_selection = self.right_click_paste_environment.primary;
         view.copy_on_select = self
@@ -357,6 +361,9 @@ impl App {
             if let Some(position) = rendered_cursor {
                 frame.set_cursor_style(foreground.cursor_style(foreground_area));
                 frame.set_cursor_position(position);
+            }
+            if chat_widget.no_modal_or_popup_active() {
+                frame.transcript_images = view.image_placements();
             }
         })?;
         if let Some((surface, tip)) = &turn_tip

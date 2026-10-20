@@ -1,4 +1,5 @@
 use super::*;
+use crate::sqlite::SqliteWriteQueryExt;
 
 impl StateRuntime {
     pub async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState> {
@@ -48,7 +49,7 @@ WHERE id = 1
         .bind(crate::BackfillStatus::Complete.as_str())
         .bind(crate::BackfillStatus::Running.as_str())
         .bind(lease_cutoff)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -71,7 +72,7 @@ WHERE id = 1
         )
         .bind(crate::BackfillStatus::Running.as_str())
         .bind(Utc::now().timestamp())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(())
     }
@@ -95,7 +96,7 @@ WHERE id = 1
         .bind(crate::BackfillStatus::Running.as_str())
         .bind(watermark)
         .bind(Utc::now().timestamp())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(())
     }
@@ -126,7 +127,7 @@ WHERE id = 1
         .bind(last_watermark)
         .bind(now)
         .bind(now)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(())
     }

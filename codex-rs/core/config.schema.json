@@ -782,6 +782,9 @@
             "api_key_model_discovery": {
               "type": "boolean"
             },
+            "app_server_websocket_compression": {
+              "type": "boolean"
+            },
             "apply_patch_freeform": {
               "type": "boolean"
             },
@@ -1068,6 +1071,9 @@
             "mcp_oauth_refresh_coordination": {
               "type": "boolean"
             },
+            "mcp_tool_list_changed": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -1090,6 +1096,9 @@
               "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
             },
             "multi_agent_v2_dynamic_tools": {
+              "type": "boolean"
+            },
+            "multi_env_copy_file": {
               "type": "boolean"
             },
             "network_proxy": {
@@ -1242,6 +1251,9 @@
             "subagent_default_context_limits": {
               "type": "boolean"
             },
+            "subagent_thread_environments": {
+              "type": "boolean"
+            },
             "system_proxy_fallback": {
               "type": "boolean"
             },
@@ -1315,6 +1327,9 @@
               "type": "boolean"
             },
             "view_image": {
+              "type": "boolean"
+            },
+            "wake_on_agent_messages": {
               "type": "boolean"
             },
             "web_search": {
@@ -2291,6 +2306,10 @@
         "enabled": {
           "type": "boolean"
         },
+        "trusted_content_hash": {
+          "description": "Approved plugin contents; kept separate for declaration-only clients.",
+          "type": "string"
+        },
         "trusted_hash": {
           "type": "string"
         }
@@ -2320,6 +2339,13 @@
           },
           "type": "array"
         },
+        "PostModelRequest": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
         "PostToolUse": {
           "default": [],
           "items": {
@@ -2328,6 +2354,13 @@
           "type": "array"
         },
         "PreCompact": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
+        "PreModelRequest": {
           "default": [],
           "items": {
             "$ref": "#/definitions/MatcherGroup"
@@ -2644,7 +2677,7 @@
           "type": "boolean"
         },
         "dual_write": {
-          "description": "Generate both versions while the selected version supplies context.",
+          "description": "Generate both versions while v1 is selected; v2 runs alone after cutover.",
           "type": "boolean"
         },
         "extract_model": {
@@ -3029,7 +3062,7 @@
           "type": "boolean"
         },
         "preserve_fork_prefix": {
-          "description": "Preserve the parent's model-visible history on full forks and append child instructions. Defaults to false. Legacy compaction without a reusable context baseline still rebuilds.",
+          "description": "Preserve the parent's model-visible history on full forks and append child instructions. Defaults to true. Legacy compaction without a reusable context baseline still rebuilds.",
           "type": "boolean"
         },
         "root_agent_usage_hint_text": {
@@ -3713,6 +3746,10 @@
     "PluginConfig": {
       "additionalProperties": false,
       "properties": {
+        "auto_provision": {
+          "description": "Provisioning metadata. Omission does not request provisioning. Only applies with `remote_plugin_id` and Plugin Service availability to the requesting user at provisioning time. Effective enablement, trusted provisioning policy, and authentication and authorization restrictions still apply. This value is not trusted authorization and does not trigger provisioning.",
+          "type": "boolean"
+        },
         "enabled": {
           "description": "Explicit activation override. Omission inherits the installed-plugin default.",
           "type": "boolean"
@@ -3723,6 +3760,14 @@
           },
           "description": "Per-MCP-server policy overlays for MCP servers contributed by this plugin.",
           "type": "object"
+        },
+        "release_id": {
+          "description": "Release identifier used to pin the remote plugin to a specific release. Omission leaves release selection unchanged. Core stores this metadata without selecting or fetching a release.",
+          "type": "string"
+        },
+        "remote_plugin_id": {
+          "description": "Stable, unique identifier of a ChatGPT-hosted remote plugin. Availability to the requesting user is determined by Plugin Service at provisioning time.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -3794,6 +3839,24 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "Preset": {
+      "additionalProperties": false,
+      "description": "One reusable prompt or slash command submitted through the TUI composer.",
+      "properties": {
+        "input": {
+          "description": "Plain-text input, limited to 8,000 UTF-8 bytes.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Optional short name for the picker and shortcut hints.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input"
+      ],
       "type": "object"
     },
     "ProfileTui": {
@@ -4884,6 +4947,7 @@
               "increase_reasoning_effort": null,
               "interrupt_turn": null,
               "next_permission_mode": null,
+              "open_presets": null,
               "previous_permission_mode": null,
               "prompt_stack_back": null,
               "skip_question": null,
@@ -5094,6 +5158,14 @@
           ],
           "default": "composer",
           "description": "Where the terminal pet should anchor vertically.\n\nDefaults to `composer`, which follows the current TUI composer viewport."
+        },
+        "presets": {
+          "additionalProperties": {
+            "$ref": "#/definitions/Preset"
+          },
+          "default": {},
+          "description": "Saved inputs keyed by a single digit (`0` through `9`).",
+          "type": "object"
         },
         "question_esc_back": {
           "default": true,
@@ -5418,6 +5490,14 @@
             }
           ],
           "description": "Switch to the next available permission mode."
+        },
+        "open_presets": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open saved prompts and slash commands."
         },
         "previous_permission_mode": {
           "allOf": [
@@ -5870,6 +5950,7 @@
             "increase_reasoning_effort": null,
             "interrupt_turn": null,
             "next_permission_mode": null,
+            "open_presets": null,
             "previous_permission_mode": null,
             "prompt_stack_back": null,
             "skip_question": null,
@@ -7216,6 +7297,9 @@
         "api_key_model_discovery": {
           "type": "boolean"
         },
+        "app_server_websocket_compression": {
+          "type": "boolean"
+        },
         "apply_patch_freeform": {
           "type": "boolean"
         },
@@ -7502,6 +7586,9 @@
         "mcp_oauth_refresh_coordination": {
           "type": "boolean"
         },
+        "mcp_tool_list_changed": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -7524,6 +7611,9 @@
           "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
         },
         "multi_agent_v2_dynamic_tools": {
+          "type": "boolean"
+        },
+        "multi_env_copy_file": {
           "type": "boolean"
         },
         "network_proxy": {
@@ -7676,6 +7766,9 @@
         "subagent_default_context_limits": {
           "type": "boolean"
         },
+        "subagent_thread_environments": {
+          "type": "boolean"
+        },
         "system_proxy_fallback": {
           "type": "boolean"
         },
@@ -7749,6 +7842,9 @@
           "type": "boolean"
         },
         "view_image": {
+          "type": "boolean"
+        },
+        "wake_on_agent_messages": {
           "type": "boolean"
         },
         "web_search": {
@@ -8206,7 +8302,7 @@
       "type": "boolean"
     },
     "thread_unload_delay_secs": {
-      "description": "Seconds a thread must have no subscribers and no activity before app-server unloads it. Defaults to 1800 (30 minutes); zero unloads immediately. Changes require a server restart.",
+      "description": "Seconds a thread must have no subscribers and no activity before app-server unloads it. Defaults to 1800 (30 minutes); zero unloads immediately. Resolved when each thread is loaded; request config overrides apply per thread.",
       "format": "uint64",
       "minimum": 0.0,
       "type": "integer"
