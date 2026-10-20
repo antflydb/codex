@@ -246,7 +246,10 @@ impl KnowledgeCli {
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
                 if knowledge.suppress_concept(&key).await? {
-                    println!("ignoring {}; its graph edges are removed on replay", args.concept);
+                    println!(
+                        "ignoring {}; its graph edges are removed on replay",
+                        args.concept
+                    );
                 } else {
                     println!("this Antfly backend can't suppress concepts");
                 }
@@ -368,7 +371,10 @@ impl KnowledgeCli {
                                 "judged {} concept pairs for relations: {} linked",
                                 relations.judged, relations.linked
                             );
-                            if screened.screened == 0 && report.examined == 0 && relations.judged == 0 {
+                            if screened.screened == 0
+                                && report.examined == 0
+                                && relations.judged == 0
+                            {
                                 break;
                             }
                         }
