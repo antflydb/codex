@@ -60,7 +60,9 @@ alternative spellings, or a name with or without a qualifier that does not chang
 refers to (\"Antfly\" and \"Antfly database\"). Answer false for different versions \
 (\"Qwen3\" and \"Qwen2\"), a part, feature or kind of something (\"PageRank\" and \
 \"Personalized PageRank\"), sibling products (\"Codex\" and \"Codex Cloud\"), and things that \
-are merely related. When unsure, answer false.";
+are merely related. Set `sure: false` when the pair could plausibly be the same thing but the \
+names and descriptions do not settle it; such a pair goes to a person to review instead of being \
+merged, so use it rather than guessing true. Different pairs can be marked sure.";
 
 pub(crate) fn judge_schema() -> Value {
     json!({
@@ -73,8 +75,9 @@ pub(crate) fn judge_schema() -> Value {
                     "properties": {
                         "pair": {"type": "integer"},
                         "same": {"type": "boolean"},
+                        "sure": {"type": "boolean"},
                     },
-                    "required": ["pair", "same"],
+                    "required": ["pair", "same", "sure"],
                     "additionalProperties": false,
                 },
             },
@@ -185,22 +188,54 @@ struct Judgments {
 struct Judgment {
     pair: usize,
     same: bool,
+    /// Older answers without it count as sure.
+    #[serde(default = "sure_default")]
+    sure: bool,
+}
+
+fn sure_default() -> bool {
+    true
+}
+
+/// The judge's verdict on one pair of concept names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeVerdict {
+    Different,
+    /// The same thing: merged.
+    Same,
+    /// Plausibly the same but not settled: proposed for review.
+    Unsure,
+}
+
+impl MergeVerdict {
+    /// 1 for same, 0.5 for unsure, 0 for different.
+    pub(crate) fn score(self) -> f64 {
+        match self {
+            MergeVerdict::Different => 0.0,
+            MergeVerdict::Unsure => 0.5,
+            MergeVerdict::Same => 1.0,
+        }
+    }
 }
 
 /// The model's verdict per pair; pairs it skipped count as different.
-pub(crate) fn parse_judgments(answer: &str, count: usize) -> anyhow::Result<Vec<bool>> {
+pub(crate) fn parse_judgments(answer: &str, count: usize) -> anyhow::Result<Vec<MergeVerdict>> {
     let judgments: Judgments = serde_json::from_str(answer.trim())?;
-    let mut same = vec![false; count];
+    let mut verdicts = vec![MergeVerdict::Different; count];
     for judgment in judgments.pairs {
         if let Some(slot) = judgment
             .pair
             .checked_sub(1)
-            .and_then(|index| same.get_mut(index))
+            .and_then(|index| verdicts.get_mut(index))
         {
-            *slot = judgment.same;
+            *slot = match (judgment.same, judgment.sure) {
+                (false, _) => MergeVerdict::Different,
+                (true, true) => MergeVerdict::Same,
+                (true, false) => MergeVerdict::Unsure,
+            };
         }
     }
-    Ok(same)
+    Ok(verdicts)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -213,17 +248,19 @@ pub struct Consolidation {
     pub judged: usize,
     /// Pairs the model judged the same and that were merged.
     pub judged_merges: usize,
+    /// Pairs the model was unsure about, proposed for review.
+    pub proposed_merges: usize,
 }
 
 /// One consolidation pass. `judge` answers whether each pair of names means
-/// the same thing.
+/// the same thing; pairs it is unsure about become merge proposals.
 pub(crate) async fn consolidate<J, F>(
     knowledge: &Knowledge<'_>,
     judge: J,
 ) -> anyhow::Result<Consolidation>
 where
     J: FnOnce(Vec<(String, String)>) -> F,
-    F: Future<Output = anyhow::Result<Vec<bool>>>,
+    F: Future<Output = anyhow::Result<Vec<MergeVerdict>>>,
 {
     let reviewed = knowledge.reviewed_concepts().await?;
     let mut pending: Vec<Concept> = knowledge
@@ -325,18 +362,36 @@ where
             descriptions.get(&concept.key).map(String::as_str),
         )
     };
-    let rendered = pairs
+    let rendered: Vec<(String, String)> = pairs
         .iter()
         .map(|(concept, neighbor)| (render(concept), render(neighbor)))
         .collect();
-    let verdicts = judge(rendered).await?;
+    let verdicts = judge(rendered.clone()).await?;
     report.judged = pairs.len();
-    for ((concept, neighbor), same) in pairs.into_iter().zip(verdicts) {
-        if same && knowledge.merge_concept(&concept.key, &neighbor.key).await? {
-            knowledge
-                .record_concept_review(&concept, Some(&neighbor.key))
-                .await?;
-            report.judged_merges += 1;
+    for (((concept, neighbor), (a, b)), verdict) in pairs.into_iter().zip(rendered).zip(verdicts) {
+        match verdict {
+            MergeVerdict::Same => {
+                if knowledge.merge_concept(&concept.key, &neighbor.key).await? {
+                    knowledge
+                        .record_concept_review(&concept, Some(&neighbor.key))
+                        .await?;
+                    report.judged_merges += 1;
+                }
+            }
+            MergeVerdict::Unsure => {
+                if knowledge
+                    .propose_merge(
+                        &concept.key,
+                        &neighbor.key,
+                        "the merge judge was unsure these name the same thing",
+                        json!({"a": a, "b": b}),
+                    )
+                    .await?
+                {
+                    report.proposed_merges += 1;
+                }
+            }
+            MergeVerdict::Different => {}
         }
     }
     Ok(report)
@@ -709,12 +764,11 @@ mod tests {
             async move {
                 Ok(pairs
                     .iter()
-                    .map(|(a, b)| {
-                        matches!(
-                            (a.as_str(), b.as_str()),
-                            ("\"Antfly database\"", "\"Antfly\"")
-                                | ("\"Antfly\"", "\"Antfly database\"")
-                        )
+                    .map(|(a, b)| match (a.as_str(), b.as_str()) {
+                        ("\"Antfly database\"", "\"Antfly\"")
+                        | ("\"Antfly\"", "\"Antfly database\"") => MergeVerdict::Same,
+                        // Every other candidate pair is left for review.
+                        _ => MergeVerdict::Unsure,
                     })
                     .collect())
             }
@@ -723,6 +777,20 @@ mod tests {
         let asked = asked.into_inner().unwrap_or_default();
         assert_eq!(report.lexical_merges, 1, "{report:?}");
         assert_eq!(report.judged_merges, 1, "{report:?} {asked:?}");
+        // Pairs the judge was unsure about are proposed, not merged.
+        assert_eq!(
+            report.proposed_merges,
+            report.judged - report.judged_merges,
+            "{report:?}"
+        );
+        let proposed = knowledge.open_proposals().await?;
+        assert_eq!(proposed.len(), report.proposed_merges, "{proposed:?}");
+        assert!(
+            proposed
+                .iter()
+                .all(|proposal| proposal.action == "merge" && proposal.into.is_some()),
+            "{proposed:?}"
+        );
         // Different numbers are never asked about.
         assert!(
             !asked
@@ -807,7 +875,7 @@ mod tests {
         assert_eq!(again, GenericScreen::default());
         assert_eq!(
             knowledge
-                .decide_proposal(&proposals[0].id, false, codex_antfly::knowledge::USER_ACTOR)
+                .decide_proposal(&proposals[0], false, codex_antfly::knowledge::USER_ACTOR)
                 .await?,
             Some(Vec::new())
         );
@@ -880,10 +948,18 @@ mod tests {
             judge_input_rendered(&rendered),
             "1. \"Antfly\" | \"Antfly database\"\n2. \"Codex\" | \"Codex Cloud\"\n3. \"PageRank\" | \"Personalized PageRank\""
         );
-        let answer = json!({"pairs": [{"pair": 1, "same": true}, {"pair": 2, "same": false}, {"pair": 9, "same": true}]});
+        let answer = json!({"pairs": [
+            {"pair": 1, "same": true, "sure": true},
+            {"pair": 2, "same": true, "sure": false},
+            {"pair": 9, "same": true, "sure": true},
+        ]});
         assert_eq!(
             parse_judgments(&answer.to_string(), 3)?,
-            vec![true, false, false]
+            vec![
+                MergeVerdict::Same,
+                MergeVerdict::Unsure,
+                MergeVerdict::Different
+            ]
         );
         Ok(())
     }

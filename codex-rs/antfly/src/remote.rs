@@ -158,6 +158,38 @@ impl RemoteBackend {
     /// Creates a graph index when missing. Stale versions are left for the
     /// operator: dropping server indexes is not this client's call.
     async fn ensure_graph(&self, table: &str, graph: &GraphIndex) -> AntflyResult<()> {
+        // Enrichments the graph reads; PUT is idempotent.
+        for enrichment in &graph.enrichments {
+            let Some(name) = enrichment["name"].as_str() else {
+                continue;
+            };
+            let mut body = enrichment.clone();
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("name");
+                // The server takes the producer as an object.
+                if let Some(producer) = fields.remove("producer_json") {
+                    let producer = match producer {
+                        Value::String(text) => serde_json::from_str(&text)
+                            .map_err(|err| AntflyError::Malformed(err.to_string()))?,
+                        other => other,
+                    };
+                    fields.insert("producer".to_string(), producer);
+                }
+            }
+            let response = self
+                .send(
+                    self.request(
+                        reqwest::Method::PUT,
+                        self.table_url(
+                            table,
+                            &format!("/artifacts/{}/enrichment", encode_path_segment(name)),
+                        ),
+                    )
+                    .json(&body),
+                )
+                .await?;
+            Self::checked(response).await?;
+        }
         let url = self.table_url(
             table,
             &format!("/indexes/{}", encode_path_segment(&graph.name)),
@@ -181,6 +213,21 @@ impl RemoteBackend {
 }
 
 const RETRY_ATTEMPTS: u32 = 8;
+/// How long a curation write waits for the server to apply it. Without a
+/// wait the server answers 202 before applying, and an immediate read (the
+/// CLI's next command, consolidation's next pair) would not see it. A write
+/// still pending after the wait is durable and applies later.
+const CURATION_WAIT_MS: u64 = 10_000;
+
+/// Adds the curation wait to `body` unless it sets one.
+fn with_wait(mut body: Value) -> Value {
+    if let Some(fields) = body.as_object_mut() {
+        fields
+            .entry("wait")
+            .or_insert_with(|| json!({"timeout_ms": CURATION_WAIT_MS}));
+    }
+    body
+}
 const RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -366,7 +413,7 @@ impl Backend for RemoteBackend {
         to: String,
     ) -> BackendFuture<'_, bool> {
         Box::pin(async move {
-            let request = json!({"from": from, "to": to});
+            let request = with_wait(json!({"from": from, "to": to}));
             let merged = self
                 .json_call(
                     reqwest::Method::POST,
@@ -401,7 +448,7 @@ impl Backend for RemoteBackend {
                 "merge" | "unmerge" | "suppress" | "unsuppress" => (
                     reqwest::Method::POST,
                     self.table_url(&entity_table, &format!("{entity}:{action}")),
-                    Some(body),
+                    Some(with_wait(body)),
                 ),
                 other => {
                     return Err(AntflyError::Config(format!(
@@ -479,7 +526,7 @@ impl Backend for RemoteBackend {
                     &entity_table,
                     &format!("/curation/proposals/{}:{verb}", encode_path_segment(&id)),
                 ),
-                Some(&body),
+                Some(&with_wait(body)),
             )
             .await
         })
@@ -552,7 +599,9 @@ mod tests {
             .and(path(
                 "/db/v1/tables/codex_concepts/entities/concept%2Fagents:merge",
             ))
-            .and(body_json(json!({"into": "concept/agent"})))
+            .and(body_json(
+                json!({"into": "concept/agent", "wait": {"timeout_ms": CURATION_WAIT_MS}}),
+            ))
             .respond_with(ResponseTemplate::new(202).set_body_json(json!({"complete": false})))
             .expect(1)
             .mount(&server)
@@ -608,7 +657,9 @@ mod tests {
             .and(path(
                 "/db/v1/tables/codex_concepts/curation/proposals/p1:reject",
             ))
-            .and(body_json(json!({"actor": "user"})))
+            .and(body_json(
+                json!({"actor": "user", "wait": {"timeout_ms": CURATION_WAIT_MS}}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"complete": true})))
             .expect(1)
             .mount(&server)

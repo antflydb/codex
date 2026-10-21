@@ -203,6 +203,90 @@ pub(crate) fn concept_graph_index(extract_model: &str) -> GraphIndex {
         name,
         config,
         replaces_prefix: CONCEPT_GRAPH_PREFIX,
+        enrichments: Vec::new(),
+    }
+}
+
+/// Prefix of the history concept graph's index and enrichments.
+pub const HISTORY_CONCEPTS_PREFIX: &str = "codex_history_concepts";
+/// Bumped when the history concept graph's configuration changes.
+const HISTORY_CONCEPTS_VERSION: u32 = 1;
+/// Graph node of a thread, the source of its `about` edges to concepts.
+pub const THREAD_NODE_PREFIX: &str = "thread/";
+
+/// Name of the history concept graph index for `extract_model`.
+pub fn history_concepts_graph_name(extract_model: &str) -> String {
+    let hash = fnv1a(&format!(
+        "{extract_model}:{CONCEPT_SCHEMA_VERSION}:{HISTORY_CONCEPTS_VERSION}"
+    ));
+    format!("{HISTORY_CONCEPTS_PREFIX}_{hash:016x}")
+}
+
+/// Concepts of conversation history, per turn: user and agent messages are
+/// grouped by thread (an Antfly grouped source, ordered by ordinal and
+/// segmented by turn), GLiNER extracts concepts from each turn, and the
+/// concept resolver turns them into `about` edges from `thread/<id>` to the
+/// same `concept/…` keys claims and notes use. Tool output is left out.
+pub(crate) fn history_concepts_index(extract_model: &str) -> GraphIndex {
+    let name = history_concepts_graph_name(extract_model);
+    let turns = format!("{name}_turns");
+    let extraction = format!("{name}_extraction");
+    let extractor = json!({"type": "extractor", "config": {
+        "provider": "antfly",
+        "model": extract_model,
+        "schema": {"entities": CONCEPT_ENTITIES, "relations": []},
+        "options": {
+            "include_confidence": true,
+            "include_spans": true,
+            "long_document": {"mode": "window"},
+        },
+    }});
+    let enrichments = vec![
+        json!({
+            "name": turns,
+            "kind": "group",
+            "source": {
+                "group_by": "thread_id",
+                "order_by": "ordinal",
+                "segment_by": "turn_id",
+                "field": crate::SEARCH_TEXT_FIELD,
+                "filter": {"term": {"speaker": ["user", "agent"]}},
+            },
+        }),
+        json!({
+            "name": extraction,
+            "kind": "asset",
+            "source_artifact_name": turns,
+            "content_type": "application/json",
+            "producer_json": extractor.to_string(),
+        }),
+    ];
+    let config = json!({
+        "source": {
+            "artifact": extraction,
+            "path": "$.relations[*]",
+            "format": "extraction_relation",
+            "mention_edge_type": ABOUT_EDGE,
+            "nodes": {"source": format!("{THREAD_NODE_PREFIX}{{{{_doc.value._group_key}}}}")},
+            "edge": {"type": "{{ _item.type }}", "edge_id": "{{_doc.key}}:{{_item.type}}"},
+            "context": {"doc_fields": ["_group_key", "_segment_key"]},
+        },
+        "edge_types": [{"name": ABOUT_EDGE}],
+        "resolvers": [{
+            "name": CONCEPT_RESOLVER,
+            "table": schema::CONCEPTS,
+            "source_artifact": extraction,
+            "resolution_artifact": format!("{name}_resolution"),
+            "key_template": "concept/{{ uslug _entity.text }}",
+            "min_confidence": 0.5,
+            "config_generation": 1,
+        }],
+    });
+    GraphIndex {
+        name,
+        config,
+        replaces_prefix: HISTORY_CONCEPTS_PREFIX,
+        enrichments,
     }
 }
 
@@ -220,6 +304,7 @@ pub(crate) fn concept_links_index() -> GraphIndex {
             .map(|kind| json!({"name": kind, "field": kind}))
             .collect::<Vec<_>>()}),
         replaces_prefix: CONCEPT_LINKS_PREFIX,
+        enrichments: Vec::new(),
     }
 }
 
@@ -232,6 +317,7 @@ pub(crate) fn claim_links_index() -> GraphIndex {
             {"name": REJECTED_IN_FAVOR_OF_EDGE, "field": "rejected_in_favor_of"},
         ]}),
         replaces_prefix: CLAIM_LINKS_PREFIX,
+        enrichments: Vec::new(),
     }
 }
 
@@ -494,6 +580,16 @@ pub struct Related {
     pub linked: Vec<String>,
     pub claims: Vec<RelatedClaim>,
     pub notes: Vec<RelatedNote>,
+    /// Threads whose conversation is about a seed.
+    pub threads: Vec<RelatedThread>,
+}
+
+/// A thread whose turns are about some of the searched concepts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RelatedThread {
+    pub thread_id: String,
+    /// The seeds its turns are about.
+    pub concepts: Vec<String>,
 }
 
 fn now_ms() -> i64 {
@@ -552,6 +648,21 @@ struct Reached {
     key: String,
     from: String,
     doc: Option<Value>,
+}
+
+/// A traversal start at concept nodes, which live in [`schema::CONCEPTS`]
+/// rather than the table being queried. The server matches nodes by
+/// table-qualified identity and finds nothing from bare keys; Lite rejects
+/// the qualified form and matches bare keys.
+fn concept_nodes(remote: bool, concepts: &[String]) -> Value {
+    if remote {
+        json!({"identities": concepts
+            .iter()
+            .map(|key| json!({"table": schema::CONCEPTS, "key": key}))
+            .collect::<Vec<_>>()})
+    } else {
+        json!({"keys": concepts})
+    }
 }
 
 fn reached_nodes(response: &Value, query: &str) -> Vec<Reached> {
@@ -976,6 +1087,14 @@ impl Knowledge<'_> {
             .is_some())
     }
 
+    /// Whether the database is a remote server rather than embedded Lite.
+    fn is_remote(&self) -> bool {
+        matches!(
+            self.antfly.config().backend,
+            crate::BackendConfig::Remote { .. }
+        )
+    }
+
     /// How consolidation screens concepts for generic words.
     pub fn concept_screening(&self) -> crate::TriageMode {
         self.config.concept_screening
@@ -1008,6 +1127,33 @@ impl Knowledge<'_> {
             .is_some())
     }
 
+    /// Queues a proposal to merge concept `key` into `into`, for review.
+    /// Proposing the same pair again keeps its earlier decision. `false`
+    /// when the backend has no proposal queue.
+    pub async fn propose_merge(
+        &self,
+        key: &str,
+        into: &str,
+        reason: &str,
+        evidence: Value,
+    ) -> AntflyResult<bool> {
+        Ok(self
+            .antfly
+            .propose_curation(
+                schema::CONCEPTS,
+                json!({
+                    "action": "merge",
+                    "key": key,
+                    "into": into,
+                    "evidence": evidence,
+                    "actor": CONSOLIDATION_ACTOR,
+                    "reason": reason,
+                }),
+            )
+            .await?
+            .is_some())
+    }
+
     /// Proposals to suppress concepts, in `state` (`open`, `accepted`,
     /// `rejected` or `superseded`; all when `None`). `None` when the backend
     /// has no proposal queue.
@@ -1015,10 +1161,23 @@ impl Knowledge<'_> {
         &self,
         state: Option<&str>,
     ) -> AntflyResult<Option<Vec<ConceptProposal>>> {
+        self.proposals(state, Some("suppress")).await
+    }
+
+    /// Proposals in `state` for `action` (all when `None`). `None` when the
+    /// backend has no proposal queue.
+    pub async fn proposals(
+        &self,
+        state: Option<&str>,
+        action: Option<&str>,
+    ) -> AntflyResult<Option<Vec<ConceptProposal>>> {
         let mut proposals = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut request = json!({"action": "suppress", "limit": PROPOSAL_PAGE});
+            let mut request = json!({"limit": PROPOSAL_PAGE});
+            if let Some(action) = action {
+                request["action"] = json!(action);
+            }
             if let Some(state) = state {
                 request["state"] = json!(state);
             }
@@ -1059,22 +1218,39 @@ impl Knowledge<'_> {
 
     /// Accepts or rejects proposal `id` as `actor`. Accepting applies it;
     /// for a suppression, the concepts suppressed with it are returned.
+    /// Rejecting a merge pins the pair distinct, so it is never merged.
     /// `None` when the backend has no proposal queue.
     pub async fn decide_proposal(
         &self,
-        id: &str,
+        proposal: &ConceptProposal,
         accept: bool,
         actor: &str,
     ) -> AntflyResult<Option<Vec<String>>> {
+        let mut request = json!({"accept": accept, "actor": actor});
+        if !accept && proposal.action == "merge" {
+            request["pin_distinct"] = json!(true);
+        }
         Ok(self
             .antfly
-            .decide_curation_proposal(
-                schema::CONCEPTS,
-                id,
-                json!({"accept": accept, "actor": actor}),
-            )
+            .decide_curation_proposal(schema::CONCEPTS, &proposal.id, request)
             .await?
             .map(|result| absorbed_keys(&result)))
+    }
+
+    /// Open proposals from Codex (generic screening and consolidation).
+    pub async fn open_proposals(&self) -> AntflyResult<Vec<ConceptProposal>> {
+        Ok(self
+            .proposals(Some("open"), None)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|proposal| {
+                matches!(
+                    proposal.actor.as_deref(),
+                    Some(GENERIC_SCREEN_ACTOR | CONSOLIDATION_ACTOR)
+                )
+            })
+            .collect())
     }
 
     /// The open suppression proposal for concept `key`, if any.
@@ -1092,7 +1268,11 @@ impl Knowledge<'_> {
     pub async fn concept_curation(&self) -> AntflyResult<Option<ConceptCuration>> {
         let mut curation = ConceptCuration::default();
         let mut reported = false;
-        for table in [schema::KNOWLEDGE, schema::MEMORY_NOTES] {
+        for table in [
+            schema::KNOWLEDGE,
+            schema::MEMORY_NOTES,
+            schema::HISTORY_ITEMS,
+        ] {
             let Some(state) = self
                 .antfly
                 .documents(table)
@@ -1386,19 +1566,57 @@ impl Knowledge<'_> {
         concepts: &[String],
         limit: usize,
     ) -> Vec<(String, Value, Vec<String>)> {
+        let index = self.graph_for(table).await;
+        let mut found: BTreeMap<String, (Option<Value>, BTreeSet<String>)> = BTreeMap::new();
+        for (concept, node) in self
+            .reached_from_concepts(table, &index, concepts, limit, true)
+            .await
+        {
+            let entry = found.entry(node.key).or_default();
+            if entry.0.is_none() {
+                entry.0 = node.doc;
+            }
+            entry.1.insert(concept);
+        }
+        found
+            .into_iter()
+            .filter_map(|(key, (doc, shared))| Some((key, doc?, shared.into_iter().collect())))
+            .collect()
+    }
+
+    /// Nodes one `about` edge into each of `concepts` in graph `index` of
+    /// `table`, paired with the concept that reached them. One traversal per
+    /// concept: the server only traverses incoming edges with deduplicated
+    /// nodes, so a single traversal would lose which concepts a node shares.
+    /// Failures yield none.
+    async fn reached_from_concepts(
+        &self,
+        table: &'static str,
+        index: &str,
+        concepts: &[String],
+        limit: usize,
+        include_documents: bool,
+    ) -> Vec<(String, Reached)> {
         if concepts.is_empty() {
             return Vec::new();
         }
-        let index = self.graph_for(table).await;
-        let request = json!({
-            "graph_queries": {"docs": {"index": index, "traverse": {
-                "start": {"keys": concepts},
-                "direction": "in", "edge_types": [ABOUT_EDGE], "max_depth": 1,
-                "include_documents": true, "include_paths": true,
-                "deduplicate_nodes": false, "limit": limit,
-            }}},
-            "limit": 1,
-        });
+        let remote = self.is_remote();
+        let queries: serde_json::Map<String, Value> = concepts
+            .iter()
+            .enumerate()
+            .map(|(position, concept)| {
+                (
+                    format!("c{position}"),
+                    json!({"index": index, "traverse": {
+                        "start": concept_nodes(remote, std::slice::from_ref(concept)),
+                        "direction": "in", "edge_types": [ABOUT_EDGE], "max_depth": 1,
+                        "include_documents": include_documents, "include_paths": true,
+                        "limit": limit,
+                    }}),
+                )
+            })
+            .collect();
+        let request = json!({"graph_queries": queries, "limit": 1});
         let response = match self.antfly.documents(table).query(request).await {
             Ok(response) => response,
             Err(err) => {
@@ -1406,18 +1624,50 @@ impl Knowledge<'_> {
                 return Vec::new();
             }
         };
-        let mut found: BTreeMap<String, (Option<Value>, BTreeSet<String>)> = BTreeMap::new();
-        for node in reached_nodes(&response, "docs") {
-            let entry = found.entry(node.key).or_default();
-            if entry.0.is_none() {
-                entry.0 = node.doc;
-            }
-            entry.1.insert(node.from);
-        }
-        found
-            .into_iter()
-            .filter_map(|(key, (doc, shared))| Some((key, doc?, shared.into_iter().collect())))
+        concepts
+            .iter()
+            .enumerate()
+            .flat_map(|(position, concept)| {
+                reached_nodes(&response, &format!("c{position}"))
+                    .into_iter()
+                    .map(|node| (concept.clone(), node))
+            })
             .collect()
+    }
+
+    /// Threads whose turns are about any of `concepts` (history concept
+    /// graph), most shared concepts first. Failures yield none.
+    pub async fn threads_about(&self, concepts: &[String], limit: usize) -> Vec<RelatedThread> {
+        let wanted = history_concepts_graph_name(&self.config.extract_model);
+        let documents = self.antfly.documents(schema::HISTORY_ITEMS);
+        let index = documents.serving_graph(&wanted).await.unwrap_or(wanted);
+        let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (concept, node) in self
+            .reached_from_concepts(schema::HISTORY_ITEMS, &index, concepts, limit * 8, false)
+            .await
+        {
+            if let Some(thread_id) = node.key.strip_prefix(THREAD_NODE_PREFIX) {
+                found
+                    .entry(thread_id.to_string())
+                    .or_default()
+                    .insert(concept);
+            }
+        }
+        let mut threads: Vec<RelatedThread> = found
+            .into_iter()
+            .map(|(thread_id, concepts)| RelatedThread {
+                thread_id,
+                concepts: concepts.into_iter().collect(),
+            })
+            .collect();
+        threads.sort_by(|a, b| {
+            b.concepts
+                .len()
+                .cmp(&a.concepts.len())
+                .then(a.thread_id.cmp(&b.thread_id))
+        });
+        threads.truncate(limit);
+        threads
     }
 
     /// Fills each claim's rationale and rejected alternatives from the
@@ -2097,11 +2347,13 @@ impl Knowledge<'_> {
             .collect();
         notes.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.path.cmp(&b.path)));
         notes.truncate(limit);
+        let threads = self.threads_about(&seeds, limit).await;
         Ok(Related {
             seeds,
             linked,
             claims,
             notes,
+            threads,
         })
     }
 }
@@ -2160,6 +2412,8 @@ pub struct ConceptProposal {
     pub id: String,
     pub action: String,
     pub key: String,
+    /// The merge target, for a merge.
+    pub into: Option<String>,
     /// `open`, `accepted`, `rejected` or `superseded`.
     pub state: String,
     pub actor: Option<String>,
@@ -2173,6 +2427,7 @@ impl ConceptProposal {
             id: text("id")?,
             action: text("action")?,
             key: text("key")?,
+            into: text("into"),
             state: text("state")?,
             actor: value["origin"]["actor"].as_str().map(str::to_string),
             reason: value["origin"]["reason"].as_str().map(str::to_string),
@@ -2182,6 +2437,8 @@ impl ConceptProposal {
 
 /// Actor recorded on generic screening's proposals and suppressions.
 pub const GENERIC_SCREEN_ACTOR: &str = "codex/generic-screen";
+/// Actor recorded on consolidation's merge proposals.
+pub const CONSOLIDATION_ACTOR: &str = "codex/consolidation";
 /// Actor recorded on curation from `codex knowledge`.
 pub const USER_ACTOR: &str = "codex/user";
 /// Proposals listed per request.

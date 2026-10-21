@@ -868,7 +868,11 @@ has not examined (`codex_concept_reviews`, migration 24):
 3. **Judgment:** up to 40 candidate pairs per pass go to the memory
    extraction model in one request (`sample_structured`). It answers `same`
    only for synonyms, abbreviations, spellings and non-identifying
-   qualifiers, not versions, parts, kinds or sibling products.
+   qualifiers, not versions, parts, kinds or sibling products. It also says
+   whether it is `sure`. A sure `same` is merged. An unsure `same` becomes a
+   `merge` proposal in Antfly's queue (actor `codex/consolidation`, with
+   both rendered names as evidence), for `codex knowledge accept` or
+   `reject`. Rejecting it pins the pair distinct.
 
 On the labelled pairs (`antfly/tests/fixtures/knowledge_eval/concept_pairs.jsonl`),
 4 pairs merge lexically and 14 reach judgment (9 synonyms, 5 hard negatives).
@@ -924,7 +928,9 @@ fans out to every resolver writing into `codex_concepts`:
 | `codex knowledge ignore <concept>` | proposal `:accept`, else `suppress` with `absorbed: suppress` | Mentions stop minting the concept and what was merged into it; their edges are removed |
 | `codex knowledge keep <concept>` (or `unignore`) | proposal `:reject`, else `unsuppress` | Rejects the proposal, or reverses `ignore` for this concept only |
 | `codex knowledge ignored` | resolver state with provenance | Lists ignored concepts and why: by hand, screened as generic (accepted or enforced), or ignored with the concept it was merged into |
-| `codex knowledge proposals` | open proposals | Lists concepts generic screening proposes to ignore |
+| `codex knowledge proposals` | open proposals | Lists concepts generic screening proposes to ignore, and pairs consolidation was unsure were the same |
+| `codex knowledge accept <concept>` | proposal `:accept` | Applies the open proposal for the concept (ignore or merge) |
+| `codex knowledge reject <concept>` | proposal `:reject` | Rejects it; a rejected merge pins the pair distinct |
 
 A concept argument is a `concept/…` key, or a name rendered through the
 resolver (`:render`, whose `minted_key` is the key before redirects, so an
@@ -979,6 +985,57 @@ The remote backend maps the same operations to HTTP:
 `POST /tables/{t}/curation/proposals/{id}:accept|:reject`. It retries 429
 and 503 with backoff; a 404 means the backend cannot curate. A decision
 reporting `complete: false` is retried until its fanout completes.
+Curation writes and proposal decisions carry `wait: {timeout_ms: 10000}`.
+Without it the server answers 202 before applying the change, and the
+CLI's or consolidation's next read misses it.
+
+Verified against `antfly standalone` (main d2a3003929) in
+`remote_concept_curation`: entity merges and unmerges with a distinct pin,
+cascade suppression with provenance, and the proposal queue. On the server,
+any runtime merge or suppression currently stops entity promotion for
+`codex_concepts` (antflydb/antfly#1244); Lite is unaffected.
+
+### History concepts
+
+Concepts are also extracted from conversation history, per turn, through
+Antfly's grouped (fan-in) sources (antflydb/antfly#1147). The graph
+`codex_history_concepts_<hash>` on `codex_history_items` reads two
+table-level enrichments that Codex registers with it:
+
+1. **`<graph>_turns`, a grouped source:** user and agent messages (items with
+   `speaker` `user` or `agent`; tool output has neither) grouped by
+   `thread_id`, ordered by `ordinal` and segmented by `turn_id`, one unit
+   per turn.
+2. **`<graph>_extraction`:** GLiNER over each unit, entities only.
+
+The graph maps each unit's mentions through a third `concepts` resolver
+into `codex_concepts`, with `nodes.source = thread/{{_doc.value._group_key}}`.
+Every thread gets `about` edges to the same `concept/…` keys claims and notes
+use. Merges and suppressions apply to it automatically, because entity
+curation fans out to every resolver writing into `codex_concepts`.
+`knowledge.search` returns `threads` alongside claims and notes: threads
+whose turns are about the query's concepts, most shared concepts first
+(`Knowledge::threads_about`).
+
+Status:
+- **Server:** works end to end (`remote_history_concepts`). Two turns of a
+  thread yield `about` edges to `antfly`, `embedder`, `embeddinggemma`,
+  `dns` and `macos`; the tool output's "Kubernetes" is excluded.
+  `knowledge.related` returns the thread and a memory note on the same
+  concept.
+- **Lite:** the same configuration works only when a write waits at
+  `sync_level: enrichments`. At `write`, grouped sources never advance
+  (antflydb/antfly#1241). The enrichments and index are registered anyway,
+  so history concepts appear once that is fixed.
+
+**Traversal into concepts.** Concept nodes live in `codex_concepts`, not in
+the table being queried. The server matches table-qualified identities
+(`{"identities": [{"table": "codex_concepts", "key": …}]}`) and finds
+nothing from bare keys, while Lite rejects the qualified form. The server
+also refuses incoming traversal without node deduplication. Codex picks the
+form per backend and runs one deduplicated traversal per seed concept to
+keep which concepts each document shares (antflydb/antfly#1245). Before
+this, remote retrieval silently found no claims or notes through concepts.
 
 ### Memory notes
 
@@ -1186,7 +1243,9 @@ fixtures:
 
 The typed decide models are near chance on both tasks. Laya even gets worse
 with descriptions. So the extraction model judges, now with descriptions;
-this is what `codex knowledge benchmark --llm-judge` measures.
+this is what `codex knowledge benchmark --llm-judge` measures. The benchmark
+scores an unsure `same` as 0.5: it is proposed for review rather than
+merged.
 
 **Merging:**
 - The judge sees each name followed by its description.
@@ -1334,15 +1393,10 @@ through `knowledge.search`.
   until `codex knowledge status` shows recall of about 0.95 or better on
   turns that produced claims, at a threshold that skips a useful share of
   turns.
-- **Concept extraction on history.** Per-item extraction costs one GLiNER
-  call per rollout item, most of them tool output, and attaches edges to
-  items rather than turns or sessions. Materializing per-turn documents in
-  Codex would duplicate the text and reimplement artifact lifecycle.
-  Antfly now has grouped (fan-in) artifact sources (antflydb/antfly#1147,
-  in #1186): history items grouped by `thread_id`, ordered by `ordinal`,
-  segmented by `turn_id`, extracted per turn, with `about` edges from a
-  thread node. Codex has not adopted them yet; claims carry thread and turn
-  provenance meanwhile.
+- **History concepts on Lite.** Built (see [History concepts](#history-concepts)),
+  and working against a server. On Lite, grouped sources never advance in the
+  background (antflydb/antfly#1241), so history concepts appear only once
+  that is fixed.
 - **Moving the merge judge into Antfly.** Antfly has what it needs
   (antflydb/antfly#1186): REVIEW-band adjudication with a decider (#1176),
   and generator-backed deciders (`decision_method: generated`, #1187), which

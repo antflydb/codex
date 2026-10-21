@@ -622,7 +622,7 @@ impl Worker {
         &self,
         job: &Job,
         pairs: Vec<(String, String)>,
-    ) -> anyhow::Result<Vec<bool>> {
+    ) -> anyhow::Result<Vec<concepts::MergeVerdict>> {
         let count = pairs.len();
         let instructions = format!(
             "{}{}",

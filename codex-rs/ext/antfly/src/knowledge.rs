@@ -127,7 +127,7 @@ fn search_spec() -> ToolSpec {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": MAX_RESULTS,
-                "description": "Maximum claims and notes to return each (default 8).",
+                "description": "Maximum claims, notes and threads to return each (default 8).",
             },
             "include_history": {
                 "type": "boolean",
@@ -273,6 +273,18 @@ fn render(
             "shared_concepts": note.concepts.iter().map(concept).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });
+    if !related.threads.is_empty() {
+        out["threads"] = json!(
+            related
+                .threads
+                .iter()
+                .map(|thread| json!({
+                    "thread_id": thread.thread_id,
+                    "shared_concepts": thread.concepts.iter().map(concept).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
     let described: serde_json::Map<String, Value> = related
         .seeds
         .iter()
@@ -293,6 +305,7 @@ mod tests {
     use codex_antfly::knowledge::Related;
     use codex_antfly::knowledge::RelatedClaim;
     use codex_antfly::knowledge::RelatedNote;
+    use codex_antfly::knowledge::RelatedThread;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -347,6 +360,10 @@ mod tests {
                 concepts: vec!["concept/embeddinggemma_2".to_string()],
                 score: 1.0,
             }],
+            threads: vec![RelatedThread {
+                thread_id: "t".to_string(),
+                concepts: vec!["concept/embeddinggemma_2".to_string()],
+            }],
         };
         assert_eq!(
             render(&related, &std::collections::HashMap::new()),
@@ -371,6 +388,7 @@ mod tests {
                     "path": "MEMORY.md",
                     "shared_concepts": ["embeddinggemma_2"],
                 }],
+                "threads": [{"thread_id": "t", "shared_concepts": ["embeddinggemma_2"]}],
             })
         );
     }

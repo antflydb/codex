@@ -225,6 +225,9 @@ impl Antfly {
                 }
                 schema::TableGraph::ClaimLinks => crate::knowledge::claim_links_index(),
                 schema::TableGraph::ConceptLinks => crate::knowledge::concept_links_index(),
+                schema::TableGraph::HistoryConcepts => {
+                    crate::knowledge::history_concepts_index(&knowledge.extract_model)
+                }
             })
             .collect()
     }

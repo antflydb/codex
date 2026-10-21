@@ -213,6 +213,50 @@ fn migrate_resolver_namespaces(db: &Database, config: &Value) -> AntflyResult<()
     Ok(())
 }
 
+/// Adds each of `enrichments` (Antfly `EnrichmentConfig`s with `name`) that
+/// the database does not have.
+fn ensure_enrichments(db: &Database, enrichments: &[Value]) -> AntflyResult<()> {
+    if enrichments.is_empty() {
+        return Ok(());
+    }
+    let existing = names(
+        &db.enrichments_json()
+            .map_err(embedded("list enrichments"))?,
+    );
+    for enrichment in enrichments {
+        let Some(name) = enrichment["name"].as_str() else {
+            continue;
+        };
+        if !existing.iter().any(|existing| existing == name) {
+            let bytes = serde_json::to_vec(enrichment)?;
+            retry_busy(|| db.add_enrichment_json(&bytes)).map_err(embedded("add enrichment"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes enrichments named with `prefix` that are not in `current`.
+fn drop_stale_enrichments(db: &Database, prefix: &str, current: &[Value]) -> AntflyResult<()> {
+    if prefix.is_empty() || current.is_empty() {
+        return Ok(());
+    }
+    let listed: Value = serde_json::from_slice(
+        &db.enrichments_json()
+            .map_err(embedded("list enrichments"))?,
+    )?;
+    for enrichment in listed.as_array().into_iter().flatten() {
+        let (Some(name), Some(kind)) = (enrichment["name"].as_str(), enrichment["kind"].as_str())
+        else {
+            continue;
+        };
+        if name.starts_with(prefix) && !current.iter().any(|wanted| wanted["name"] == name) {
+            retry_busy(|| db.delete_enrichment(kind, name))
+                .map_err(embedded("delete stale enrichment"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Adds `name` (replacing `stale` when given) and reports which index serves.
 fn reconcile_graph(
     db: &Database,
@@ -469,8 +513,10 @@ impl EmbeddedBackend {
         let name = graph.name.clone();
         let prefix = graph.replaces_prefix;
         let config = graph.config;
+        let enrichments = graph.enrichments;
         let state = self
             .call_in(table.to_string(), move |db| {
+                ensure_enrichments(db, &enrichments)?;
                 let indexes = names(&db.indexes_json().map_err(embedded("list indexes"))?);
                 let mut stale: Vec<&String> = if prefix.is_empty() {
                     Vec::new()
@@ -482,11 +528,13 @@ impl EmbeddedBackend {
                 };
                 stale.sort();
                 if indexes.contains(&name) {
-                    // Swapped (or added) already; older leftovers retire.
+                    // Swapped (or added) already; older leftovers retire,
+                    // then the enrichments only they read.
                     for old in stale {
                         retry_busy(|| db.delete_index(old))
                             .map_err(embedded("delete stale graph index"))?;
                     }
+                    drop_stale_enrichments(db, prefix, &enrichments)?;
                     return Ok(GraphState::Ready);
                 }
                 // Replace the newest older version; any others are dropped

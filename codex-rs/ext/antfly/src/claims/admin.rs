@@ -32,6 +32,7 @@ use super::Worker;
 use super::concepts;
 pub use super::concepts::Consolidation;
 pub use super::concepts::GenericScreen;
+pub use super::concepts::MergeVerdict;
 pub use super::concepts::Relations;
 use super::now_ms;
 
@@ -582,9 +583,10 @@ pub async fn benchmark_llm(
             let each = started.elapsed() / u32::try_from(pairs.len().max(1)).unwrap_or(1);
             for (index, case) in chunk.iter().enumerate() {
                 let label = case["same"].as_bool().unwrap_or(false);
+                // Unsure answers score 0.5: proposed for review, not merged.
                 let score = verdicts
                     .as_ref()
-                    .map(|same| Some(if same[index] { 1.0 } else { 0.0 }))
+                    .map(|verdicts| Some(verdicts[index].score()))
                     .map_err(Clone::clone);
                 result.record_scored(label, score, each);
             }

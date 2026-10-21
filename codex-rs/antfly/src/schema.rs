@@ -60,6 +60,9 @@ pub enum TableGraph {
     ClaimLinks,
     /// `is_a`, `part_of` and `alternative_to` edges between concepts.
     ConceptLinks,
+    /// GLiNER concepts of each conversation turn: `about` edges from
+    /// `thread/<id>` to `concept/<slug>` nodes.
+    HistoryConcepts,
 }
 
 /// A document table with the declared fields SQL can filter and join on.
@@ -84,7 +87,7 @@ pub const DOCUMENT_TABLES: &[DocumentTable] = &[
             ("speaker", "string"),
             ("created_at_ms", "integer"),
         ],
-        graphs: &[],
+        graphs: &[TableGraph::HistoryConcepts],
         dense_field: None,
     },
     DocumentTable {

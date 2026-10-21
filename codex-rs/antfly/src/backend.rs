@@ -231,6 +231,10 @@ pub struct GraphIndex {
     /// Indexes with this prefix and another name are stale versions of this
     /// one and are dropped. Empty keeps every other index.
     pub replaces_prefix: &'static str,
+    /// Table-level enrichments the index reads (Antfly `EnrichmentConfig`,
+    /// with `name`), added before it. Enrichments with `replaces_prefix`
+    /// and another name are dropped with stale indexes.
+    pub enrichments: Vec<Value>,
 }
 
 /// A document table and the indexes Codex needs on it. Full-text search over

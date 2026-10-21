@@ -483,6 +483,7 @@ fn graph_upgrades_replace_the_old_version_without_a_gap() -> Result<(), Box<dyn 
             name: name.to_string(),
             config: json!({"edge_types": [{"name": "links", "field": "links"}]}),
             replaces_prefix: "links_graph_",
+            enrichments: Vec::new(),
         }],
     };
     let traverse = |index: &str| {
@@ -894,6 +895,7 @@ fn graph_upgrade_moves_resolver_and_keeps_merges() -> Result<(), Box<dyn std::er
         let graph = |name: &str, template: &str| GraphIndex {
             name: name.to_string(),
             replaces_prefix: "kg_",
+            enrichments: Vec::new(),
             config: json!({
                 "source": {"artifact": format!("{name}_extraction"), "path": "$.relations[*]",
                            "format": "extraction_relation", "mention_edge_type": "about",

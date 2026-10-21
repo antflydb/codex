@@ -67,8 +67,14 @@ pub enum KnowledgeSubcommand {
     Unignore(ConceptArg),
     /// List ignored concepts, and why they are ignored.
     Ignored,
-    /// List concepts generic screening proposes to ignore (shadow mode).
+    /// List open proposals: concepts generic screening proposes to ignore,
+    /// and pairs consolidation was unsure were the same.
     Proposals,
+    /// Accept the open proposal for a concept (ignore it, or merge it).
+    Accept(ConceptArg),
+    /// Reject the open proposal for a concept; a rejected merge pins the
+    /// pair distinct.
+    Reject(ConceptArg),
 }
 
 #[derive(Debug, clap::Args)]
@@ -177,7 +183,7 @@ impl KnowledgeCli {
                 let names = knowledge
                     .concepts_by_key()
                     .await
-                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                    .context("reading concepts")?;
                 let resolve = |given: &str| -> Option<String> {
                     if names.contains_key(given) {
                         return Some(given.to_string());
@@ -207,7 +213,7 @@ impl KnowledgeCli {
                 let names = knowledge
                     .concepts_by_key()
                     .await
-                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                    .context("reading concepts")?;
                 let name = |key: &str| {
                     names
                         .get(key)
@@ -254,18 +260,28 @@ impl KnowledgeCli {
                 let knowledge = antfly
                     .knowledge()
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
-                let proposals = knowledge.generic_proposals().await?;
+                let proposals = knowledge.open_proposals().await?;
                 if proposals.is_empty() {
                     println!("no open proposals");
                     return Ok(());
                 }
-                let keys: Vec<String> = proposals.into_iter().map(|p| p.key).collect();
-                print_concepts(&knowledge, &keys, |_, _| "looks generic".to_string()).await?;
+                let keys: Vec<String> = proposals.iter().map(|p| p.key.clone()).collect();
+                let into: std::collections::HashMap<String, String> = proposals
+                    .iter()
+                    .filter_map(|p| Some((p.key.clone(), p.into.clone()?)))
+                    .collect();
+                print_concepts(&knowledge, &keys, |key, name| match into.get(key) {
+                    Some(target) => format!("maybe the same as {}", name(target)),
+                    None => "looks generic".to_string(),
+                })
+                .await?;
                 println!(
-                    "\naccept with `codex knowledge ignore <concept>`, reject with `codex knowledge keep <concept>`"
+                    "\naccept with `codex knowledge accept <concept>`, reject with `codex knowledge reject <concept>`"
                 );
                 Ok(())
             }
+            KnowledgeSubcommand::Accept(args) => decide(&antfly, &args.concept, true).await,
+            KnowledgeSubcommand::Reject(args) => decide(&antfly, &args.concept, false).await,
             KnowledgeSubcommand::Unmerge(args) => {
                 let knowledge = antfly
                     .knowledge()
@@ -294,7 +310,7 @@ impl KnowledgeCli {
                 let user = codex_antfly::knowledge::USER_ACTOR;
                 // Accepting an open proposal keeps the screening's provenance.
                 let absorbed = match knowledge.open_suppress_proposal(&key).await? {
-                    Some(proposal) => knowledge.decide_proposal(&proposal.id, true, user).await?,
+                    Some(proposal) => knowledge.decide_proposal(&proposal, true, user).await?,
                     None => knowledge.suppress_concept(&key, user, None).await?,
                 };
                 let Some(absorbed) = absorbed else {
@@ -320,7 +336,7 @@ impl KnowledgeCli {
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
                 let user = codex_antfly::knowledge::USER_ACTOR;
                 if let Some(proposal) = knowledge.open_suppress_proposal(&key).await? {
-                    knowledge.decide_proposal(&proposal.id, false, user).await?;
+                    knowledge.decide_proposal(&proposal, false, user).await?;
                     println!("keeping {}; it won't be proposed again", args.concept);
                     return Ok(());
                 }
@@ -344,7 +360,7 @@ impl KnowledgeCli {
                 let names = knowledge
                     .concepts_by_key()
                     .await
-                    .context("reading concepts (is the app-server daemon holding the database?)")?;
+                    .context("reading concepts")?;
                 let name = |key: &str| {
                     names
                         .get(key)
@@ -434,12 +450,16 @@ impl KnowledgeCli {
                                 println!("review them with `codex knowledge proposals`");
                             }
                             println!(
-                                "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged",
+                                "examined {} concepts: {} merged by spelling, {} of {} judged pairs merged, {} proposed",
                                 report.examined,
                                 report.lexical_merges,
                                 report.judged_merges,
-                                report.judged
+                                report.judged,
+                                report.proposed_merges
                             );
+                            if report.proposed_merges > 0 {
+                                println!("review proposed merges with `codex knowledge proposals`");
+                            }
                             println!(
                                 "judged {} concept pairs for relations: {} linked",
                                 relations.judged, relations.linked
@@ -465,6 +485,30 @@ impl KnowledgeCli {
     }
 }
 
+/// Accepts or rejects the open proposal for `concept`.
+async fn decide(antfly: &codex_antfly::Antfly, concept: &str, accept: bool) -> Result<()> {
+    let knowledge = antfly
+        .knowledge()
+        .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+    let key = concept_key_arg(&knowledge, concept).await?;
+    let open = knowledge.open_proposals().await?;
+    let Some(proposal) = open.iter().find(|proposal| proposal.key == key) else {
+        println!("no open proposal for {concept}");
+        return Ok(());
+    };
+    let user = codex_antfly::knowledge::USER_ACTOR;
+    knowledge.decide_proposal(proposal, accept, user).await?;
+    let what = match (proposal.action.as_str(), accept) {
+        ("merge", true) => "merged",
+        ("merge", false) => "kept apart; the pair won't be merged",
+        ("suppress", true) => "ignored",
+        (_, true) => "applied",
+        (_, false) => "kept; it won't be proposed again",
+    };
+    println!("{concept}: {what}");
+    Ok(())
+}
+
 /// Prints `keys` as `name (why): description`, `why` given the key and a
 /// key-to-name lookup.
 async fn print_concepts(
@@ -475,7 +519,7 @@ async fn print_concepts(
     let names = knowledge
         .concepts_by_key()
         .await
-        .context("reading concepts (is the app-server daemon holding the database?)")?;
+        .context("reading concepts")?;
     let name = |key: &str| {
         names
             .get(key)
