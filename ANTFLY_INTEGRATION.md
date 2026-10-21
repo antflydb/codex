@@ -701,8 +701,10 @@ It drives the same worker as the live pipeline (`ext/antfly/src/claims/admin.rs`
 - **Attribution:** model requests are attributed to an ephemeral host thread
   (`codex_core::start_standalone_thread`, factored out of `codex debug
   prompt-input`), as live requests are attributed to a loaded thread.
-- **Single writer:** the command opens the embedded database itself, so the
-  app-server daemon must not be holding it.
+- **Concurrent processes:** the command opens the embedded database itself.
+  It can run while the app-server daemon has it open: Lite serializes
+  writes per operation through its writer lease (waiting up to
+  `BUSY_TIMEOUT`, 5 s).
 
 Verified on the scratch database: `--max-requests 1` extracted one thread and
 stopped, a rerun finished the other, and `status` then showed nothing pending.
@@ -1336,26 +1338,24 @@ through `knowledge.search`.
   call per rollout item, most of them tool output, and attaches edges to
   items rather than turns or sessions. Materializing per-turn documents in
   Codex would duplicate the text and reimplement artifact lifecycle.
-  antflydb/antfly#1147 proposes grouped (fan-in) artifact sources instead:
-  history items grouped by `thread_id`, ordered by `ordinal`, segmented by
-  `turn_id`, extracted per turn, with `about` edges from a thread node.
-  Until then, claims carry thread and turn provenance.
-- **Moving the merge judge into Antfly.** antflydb/antfly#1186 adds REVIEW-band
-  adjudication with a typed decider, plus reversible curation and entity
-  APIs. The local typed models are near chance on the concept fixtures, so
-  Codex keeps its own judge for now.
-  - **Next step:** run the fixtures through the OpenAI Decisions API (the
-    decider's `openai` provider). Add it as a `codex knowledge benchmark`
-    model; this needs an OpenAI API key.
-  - **If it matches the 94% generative judge,** Codex moves merge judging
-    into resolution.
-  - **If not,** Antfly needs generator-backed adjudication.
-  - **Either way,** adjudication would need concept descriptions as an asset
-    on the concept documents, not a separate table.
-- **Single writer (embedded).** Run Codex through the app-server daemon
-  (the TUI probes its socket, or use `--remote`) so one process owns the
-  `.aflite` file. Other processes fail fast rather than opening a second
-  writer. The remote backend removes this constraint.
+  Antfly now has grouped (fan-in) artifact sources (antflydb/antfly#1147,
+  in #1186): history items grouped by `thread_id`, ordered by `ordinal`,
+  segmented by `turn_id`, extracted per turn, with `about` edges from a
+  thread node. Codex has not adopted them yet; claims carry thread and turn
+  provenance meanwhile.
+- **Moving the merge judge into Antfly.** Antfly has what it needs
+  (antflydb/antfly#1186): REVIEW-band adjudication with a decider (#1176),
+  and generator-backed deciders (`decision_method: generated`, #1187), which
+  can use hosted generators. What blocks it is quality, not features. The
+  local typed models are near chance on the concept fixtures, and a local
+  generated decider (Gemma E4B) reaches only AUC 0.86, so Codex keeps its
+  own judge (94%) for now.
+  - **Next step:** benchmark a hosted generator as a generated decider
+    (OpenAI provider) on the fixtures, as a `codex knowledge benchmark`
+    model. This needs an OpenAI API key.
+  - **If it matches,** move merge judging into resolution, with concept
+    descriptions as an asset on the concept documents rather than a
+    separate table.
 - **In-process inference.** A GPU driver fault terminates the host process and
   device calls cannot be preempted. Run the approval model on CPU initially.
 - **Linking.** The binary needs `libantfly` at runtime (`ANTFLY_LIB_DIR`,
