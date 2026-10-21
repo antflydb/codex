@@ -131,6 +131,40 @@ pub trait Backend: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Queues a proposed entity correction on `entity_table` for review:
+    /// `{"action", "key", "into"?, "options"?, "confidence"?, "evidence"?,
+    /// "actor"?, "reason"?}`. Idempotent on action, key and target; a decided
+    /// proposal keeps its decision. `None` when the backend has no queue.
+    fn propose_curation(
+        &self,
+        _entity_table: String,
+        _request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A page of `entity_table`'s proposals: `{"state"?, "action"?,
+    /// "cursor"?, "limit"?}` → `{"proposals", "next_cursor"?}`.
+    fn list_curation_proposals(
+        &self,
+        _entity_table: String,
+        _request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Accepts (applying it as the entity action would) or rejects proposal
+    /// `id`: `{"accept", "options"?, "pin_distinct"?, "actor"?, "reason"?}`.
+    /// A result with `complete: false` is retried with the same request.
+    fn decide_curation_proposal(
+        &self,
+        _entity_table: String,
+        _id: String,
+        _request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// `resolver`'s durable curation on `table`: redirects, distinct pins
     /// and suppressions. `None` when the backend cannot report it.
     fn resolver_curation(

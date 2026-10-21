@@ -234,23 +234,18 @@ impl KnowledgeCli {
                     return Ok(());
                 };
                 let keys: Vec<String> = curation.suppressed.iter().cloned().collect();
-                let screened = codex_antfly::labels::latest_results(
-                    &antfly,
-                    codex_antfly::labels::GENERIC_CONCEPT,
-                )
-                .await?;
-                let with = codex_antfly::labels::latest_inputs(
-                    &antfly,
-                    codex_antfly::labels::CONCEPT_SUPPRESSED_WITH,
-                )
-                .await?;
                 print_concepts(&knowledge, &keys, |key, name| {
-                    if let Some(target) = with.get(key) {
-                        format!("ignored with {}", name(target))
-                    } else if screened.get(key) == Some(&true) {
-                        "screened as generic".to_string()
-                    } else {
-                        "ignored".to_string()
+                    let Some(origin) = curation.suppression_origins.get(key) else {
+                        return "ignored".to_string();
+                    };
+                    let screened = origin.actor.as_deref()
+                        == Some(codex_antfly::knowledge::GENERIC_SCREEN_ACTOR);
+                    match (origin.origin.as_str(), &origin.cascade_from) {
+                        ("cascade", Some(from)) => format!("ignored with {}", name(from)),
+                        ("review", _) => "screened as generic, accepted".to_string(),
+                        _ if screened => "screened as generic".to_string(),
+                        ("config", _) => "ignored by configuration".to_string(),
+                        _ => "ignored".to_string(),
                     }
                 })
                 .await
@@ -259,11 +254,12 @@ impl KnowledgeCli {
                 let knowledge = antfly
                     .knowledge()
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
-                let keys = knowledge.generic_proposals().await?;
-                if keys.is_empty() {
+                let proposals = knowledge.generic_proposals().await?;
+                if proposals.is_empty() {
                     println!("no open proposals");
                     return Ok(());
                 }
+                let keys: Vec<String> = proposals.into_iter().map(|p| p.key).collect();
                 print_concepts(&knowledge, &keys, |_, _| "looks generic".to_string()).await?;
                 println!(
                     "\naccept with `codex knowledge ignore <concept>`, reject with `codex knowledge keep <concept>`"
@@ -295,20 +291,25 @@ impl KnowledgeCli {
                     .knowledge()
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
-                if let Some(absorbed) = knowledge.suppress_concept(&key).await? {
-                    knowledge.review_generic(&key, /*accepted*/ true).await?;
-                    println!(
-                        "ignoring {}; its graph edges are removed on replay",
-                        args.concept
-                    );
-                    if !absorbed.is_empty() {
-                        println!(
-                            "also unmerged and ignoring what was merged into it: {}",
-                            absorbed.join(", ")
-                        );
-                    }
-                } else {
+                let user = codex_antfly::knowledge::USER_ACTOR;
+                // Accepting an open proposal keeps the screening's provenance.
+                let absorbed = match knowledge.open_suppress_proposal(&key).await? {
+                    Some(proposal) => knowledge.decide_proposal(&proposal.id, true, user).await?,
+                    None => knowledge.suppress_concept(&key, user, None).await?,
+                };
+                let Some(absorbed) = absorbed else {
                     println!("this Antfly backend can't suppress concepts");
+                    return Ok(());
+                };
+                println!(
+                    "ignoring {}; its graph edges are removed on replay",
+                    args.concept
+                );
+                if !absorbed.is_empty() {
+                    println!(
+                        "also ignoring what was merged into it: {}",
+                        absorbed.join(", ")
+                    );
                 }
                 Ok(())
             }
@@ -317,8 +318,19 @@ impl KnowledgeCli {
                     .knowledge()
                     .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
                 let key = concept_key_arg(&knowledge, &args.concept).await?;
-                if knowledge.unsuppress_concept(&key).await? {
-                    knowledge.review_generic(&key, /*accepted*/ false).await?;
+                let user = codex_antfly::knowledge::USER_ACTOR;
+                if let Some(proposal) = knowledge.open_suppress_proposal(&key).await? {
+                    knowledge.decide_proposal(&proposal.id, false, user).await?;
+                    println!("keeping {}; it won't be proposed again", args.concept);
+                    return Ok(());
+                }
+                let suppressed = knowledge
+                    .concept_curation()
+                    .await?
+                    .is_some_and(|curation| curation.suppressed.contains(&key));
+                if !suppressed {
+                    println!("{} is not ignored", args.concept);
+                } else if knowledge.unsuppress_concept(&key, user).await? {
                     println!("keeping {}", args.concept);
                 } else {
                     println!("this Antfly backend can't suppress concepts");

@@ -65,12 +65,6 @@ pub async fn record_decision(antfly: &Antfly, record: DecisionRecord<'_>) -> Ant
 /// A concept's generic screening: `result` true when the model called it
 /// a generic word.
 pub const GENERIC_CONCEPT: &str = "generic_concept";
-/// The user's review of a generic screening: `result` true when accepted
-/// (the concept is ignored), false when rejected (it is kept).
-pub const GENERIC_CONCEPT_REVIEW: &str = "generic_concept_review";
-/// A concept suppressed because it was merged into a concept that was
-/// ignored; `input` is that concept's key.
-pub const CONCEPT_SUPPRESSED_WITH: &str = "concept_suppressed_with";
 
 /// The latest verdict per subject for `kind`.
 pub async fn latest_results(
@@ -84,18 +78,6 @@ pub async fn latest_results(
         .collect())
 }
 
-/// The latest input per subject for `kind`.
-pub async fn latest_inputs(
-    antfly: &Antfly,
-    kind: &str,
-) -> AntflyResult<std::collections::BTreeMap<String, String>> {
-    Ok(latest_rows(antfly, kind)
-        .await?
-        .into_iter()
-        .filter_map(|(subject, row)| Some((subject, row.string("input").ok()?)))
-        .collect())
-}
-
 async fn latest_rows(
     antfly: &Antfly,
     kind: &str,
@@ -105,7 +87,7 @@ async fn latest_rows(
     // Ascending, so later rows replace earlier ones.
     for row in sql
         .fetch_all(
-            "SELECT subject, input, result FROM codex_decision_log \
+            "SELECT subject, result FROM codex_decision_log \
              WHERE kind = $1 AND subject IS NOT NULL ORDER BY created_at_ms, id",
             sql_params![kind],
         )

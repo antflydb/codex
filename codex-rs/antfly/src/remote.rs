@@ -413,6 +413,78 @@ impl Backend for RemoteBackend {
         })
     }
 
+    fn propose_curation(
+        &self,
+        entity_table: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            self.json_call(
+                reqwest::Method::POST,
+                self.table_url(&entity_table, "/curation/proposals"),
+                Some(&request),
+            )
+            .await
+        })
+    }
+
+    fn list_curation_proposals(
+        &self,
+        entity_table: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let query: Vec<String> = ["state", "action", "cursor", "limit"]
+                .iter()
+                .filter_map(|name| {
+                    let value = request.get(*name)?;
+                    let value = value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string());
+                    Some(format!("{name}={}", encode_path_segment(&value)))
+                })
+                .collect();
+            let suffix = if query.is_empty() {
+                "/curation/proposals".to_string()
+            } else {
+                format!("/curation/proposals?{}", query.join("&"))
+            };
+            self.json_call(
+                reqwest::Method::GET,
+                self.table_url(&entity_table, &suffix),
+                None,
+            )
+            .await
+        })
+    }
+
+    fn decide_curation_proposal(
+        &self,
+        entity_table: String,
+        id: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let mut body = request;
+            let accept = body
+                .as_object_mut()
+                .and_then(|fields| fields.remove("accept"))
+                .and_then(|accept| accept.as_bool())
+                .ok_or_else(|| AntflyError::Config("proposal decision needs `accept`".into()))?;
+            let verb = if accept { "accept" } else { "reject" };
+            self.json_call(
+                reqwest::Method::POST,
+                self.table_url(
+                    &entity_table,
+                    &format!("/curation/proposals/{}:{verb}", encode_path_segment(&id)),
+                ),
+                Some(&body),
+            )
+            .await
+        })
+    }
+
     fn resolver_curation(
         &self,
         table: String,
@@ -510,6 +582,64 @@ mod tests {
             )
             .await?;
         assert_eq!(redirects, Some(json!({"redirects": []})));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proposals_use_the_curation_routes() -> AntflyResult<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/db/v1/tables/codex_concepts/curation/proposals"))
+            .and(body_json(
+                json!({"action": "suppress", "key": "concept/note"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "p1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/db/v1/tables/codex_concepts/curation/proposals"))
+            .and(wiremock::matchers::query_param("state", "open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"proposals": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/db/v1/tables/codex_concepts/curation/proposals/p1:reject",
+            ))
+            .and(body_json(json!({"actor": "user"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"complete": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let backend = RemoteBackend::new(&server.uri(), None)?;
+        let table = || "codex_concepts".to_string();
+        assert_eq!(
+            backend
+                .propose_curation(
+                    table(),
+                    json!({"action": "suppress", "key": "concept/note"})
+                )
+                .await?,
+            Some(json!({"id": "p1"}))
+        );
+        assert_eq!(
+            backend
+                .list_curation_proposals(table(), json!({"state": "open"}))
+                .await?,
+            Some(json!({"proposals": []}))
+        );
+        assert_eq!(
+            backend
+                .decide_curation_proposal(
+                    table(),
+                    "p1".into(),
+                    json!({"accept": false, "actor": "user"})
+                )
+                .await?,
+            Some(json!({"complete": true}))
+        );
         Ok(())
     }
 

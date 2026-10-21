@@ -66,6 +66,9 @@ pub struct Antfly {
     lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Attempts at completing a proposal decision's fanout.
+const DECISION_ATTEMPTS: usize = 5;
+
 impl std::fmt::Debug for Antfly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Antfly")
@@ -293,6 +296,56 @@ impl Antfly {
             .await?
             .curate_entity(entity_table.to_string(), key.to_string(), request)
             .await
+    }
+
+    /// See [`crate::Backend::propose_curation`].
+    pub async fn propose_curation(
+        &self,
+        entity_table: &str,
+        request: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.sql().await?;
+        self.backend()
+            .await?
+            .propose_curation(entity_table.to_string(), request)
+            .await
+    }
+
+    /// See [`crate::Backend::list_curation_proposals`].
+    pub async fn list_curation_proposals(
+        &self,
+        entity_table: &str,
+        request: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.sql().await?;
+        self.backend()
+            .await?
+            .list_curation_proposals(entity_table.to_string(), request)
+            .await
+    }
+
+    /// See [`crate::Backend::decide_curation_proposal`]. Retries until the
+    /// decision's fanout is complete.
+    pub async fn decide_curation_proposal(
+        &self,
+        entity_table: &str,
+        id: &str,
+        request: Value,
+    ) -> AntflyResult<Option<Value>> {
+        self.sql().await?;
+        let backend = self.backend().await?;
+        for _ in 0..DECISION_ATTEMPTS {
+            let result = backend
+                .decide_curation_proposal(entity_table.to_string(), id.to_string(), request.clone())
+                .await?;
+            match &result {
+                Some(value) if value.get("complete") == Some(&Value::Bool(false)) => continue,
+                _ => return Ok(result),
+            }
+        }
+        Err(crate::AntflyError::Remote(format!(
+            "curation proposal {id} stayed incomplete after {DECISION_ATTEMPTS} attempts"
+        )))
     }
 
     /// Generates text with a local generator model.

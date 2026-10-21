@@ -164,7 +164,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `51cfaa8f6e` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `9a619236a4` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +172,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `51cfaa8f6e` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `9a619236a4` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -514,7 +514,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `51cfaa8f6e`, which includes
+against Antfly 1258e8cfcb; the pin is now `9a619236a4`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -525,7 +525,8 @@ under steady writes), #1145 (graph replacement with an inline resolver) and
 background maintenance, no handle-reopen churn) and #1163 (enrichment and
 resolution no longer stall under writes with an inline resolver), #1186
 (generated deciders, reversible curation and the entity APIs) and #1223
-(schema safety, resolver credential redaction).
+(schema safety, resolver credential redaction) and #1233 (cascade
+suppression, curation provenance and the entity proposal queue).
 
 ### Goal
 
@@ -918,10 +919,10 @@ fans out to every resolver writing into `codex_concepts`:
 | `codex knowledge merges` | resolver state | Lists redirects from every concept resolver |
 | `codex knowledge unmerge <concept>` | `unmerge`, `pin_distinct: true` | Restores the concept and pins the pair distinct |
 | `codex knowledge unmerge --allow-remerge <concept>` | `unmerge` | Restores it; a later pass may merge it again |
-| `codex knowledge ignore <concept>` | `suppress` | Mentions stop minting the concept; its edges are removed. Accepts a proposal |
-| `codex knowledge keep <concept>` (or `unignore`) | `unsuppress` | Reverses `ignore`, or rejects a proposal |
-| `codex knowledge ignored` | resolver state | Lists ignored concepts and why: by hand, screened as generic, or ignored with a concept it was merged into |
-| `codex knowledge proposals` | none | Lists concepts generic screening proposes to ignore |
+| `codex knowledge ignore <concept>` | proposal `:accept`, else `suppress` with `absorbed: suppress` | Mentions stop minting the concept and what was merged into it; their edges are removed |
+| `codex knowledge keep <concept>` (or `unignore`) | proposal `:reject`, else `unsuppress` | Rejects the proposal, or reverses `ignore` for this concept only |
+| `codex knowledge ignored` | resolver state with provenance | Lists ignored concepts and why: by hand, screened as generic (accepted or enforced), or ignored with the concept it was merged into |
+| `codex knowledge proposals` | open proposals | Lists concepts generic screening proposes to ignore |
 
 A concept argument is a `concept/…` key, or a name rendered through the
 resolver (`:render`, whose `minted_key` is the key before redirects, so an
@@ -931,12 +932,17 @@ Consolidation reads the curation state (`Knowledge::concept_curation`) and
 never proposes a pair that is pinned distinct, whether lexical twins, name
 neighbors or description neighbors.
 
-**Ignoring a merge target.** Antfly refuses to suppress a key that other
-keys redirect to (`SuppressedResolverRedirectTarget`). `ignore` therefore
-first unmerges every concept merged into it, suppresses those too, and logs
-each as `concept_suppressed_with`. These are separate calls, so the sequence
-is not atomic; antflydb/antfly#1230 asks for an `absorbed` option on
-`:suppress` that does it atomically.
+**Ignoring a merge target.** Suppression uses `absorbed: "suppress"`, so
+the concepts merged into the target are suppressed with it in one commit.
+Antfly records each as a `cascade` from the target. `unsuppress` restores
+only the named concept: the absorbed ones stay suppressed and are no longer
+merged.
+
+**Provenance.** Codex writes an `actor` on curation: `codex/user` from
+`codex knowledge`, and `codex/generic-screen` from screening, which also
+writes a `reason`. Antfly adds the origin (`manual`, `review`, `cascade`,
+`config`), time, revision, proposal id and `cascade_from`. `ignored` uses
+these to explain each suppression.
 
 **Generic concepts.** Extraction turns generic words in memory notes into
 concepts ("note", "content", "add"). Each consolidation pass first screens up
@@ -944,11 +950,14 @@ to 40 unscreened concepts in one request to the extraction model, with their
 descriptions. Each verdict is logged in `codex_decision_log` (kind
 `generic_concept`), and a concept is screened once. `concept_screening`
 chooses what happens next:
-- `shadow` (default): generic verdicts are proposals, listed by
-  `codex knowledge proposals`. `ignore` accepts one and `keep` rejects it;
-  both are logged (`generic_concept_review`), and a reviewed concept is not
-  proposed again.
-- `enforce`: generic concepts are suppressed right away.
+- `shadow` (default): each generic concept becomes a proposal in Antfly's
+  entity proposal queue (`action: suppress`, `options.absorbed: suppress`,
+  actor `codex/generic-screen`, with the judged name and description as
+  evidence). `codex knowledge proposals` lists the open ones; `ignore`
+  accepts one and `keep` rejects it. Antfly keeps the decision, so a
+  rejected concept is not proposed again.
+- `enforce`: generic concepts are suppressed right away, attributed to
+  `codex/generic-screen`.
 - `off`: no screening.
 
 Shadow is the default because enforcing was too aggressive. On the E2E
@@ -959,17 +968,15 @@ verbs, single everyday words) as generic and treats domain terms and
 multi-word phrases as specific. It proposed 6 of the same 40: "add",
 "assistant", "content", "creation", "delete" and "edit".
 
-antflydb/antfly#1230 also proposes curation provenance (why each redirect,
-pin or suppression exists) and an entity-level proposal queue. Once those
-land, these proposals move into Antfly and the decision-log bookkeeping goes
-away.
-
 The remote backend maps the same operations to HTTP:
 `POST /tables/{t}/entities/{key}:{merge|unmerge|suppress|unsuppress}`,
 `GET /tables/{t}/entities/{key}/redirects`, `GET /tables/{t}/resolvers/{r}`,
 `POST /tables/{t}/resolvers/{r}:render|:resolve` and
-`POST /tables/{t}/resolvers/{r}/redirects`. It retries 429 and 503 with
-backoff; a 404 means the backend cannot curate.
+`POST /tables/{t}/resolvers/{r}/redirects`, and for proposals
+`POST|GET /tables/{t}/curation/proposals` and
+`POST /tables/{t}/curation/proposals/{id}:accept|:reject`. It retries 429
+and 503 with backoff; a 404 means the backend cannot curate. A decision
+reporting `complete: false` is retried until its fanout completes.
 
 ### Memory notes
 

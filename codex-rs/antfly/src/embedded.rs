@@ -862,6 +862,58 @@ impl Backend for EmbeddedBackend {
         })
     }
 
+    fn propose_curation(
+        &self,
+        entity_table: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call(move |db| {
+                    retry_busy(|| db.propose_curation_json(&entity_table, &bytes))
+                        .map_err(embedded("propose curation"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
+    fn list_curation_proposals(
+        &self,
+        entity_table: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call(move |db| {
+                    retry_busy(|| db.list_curation_proposals_json(&entity_table, &bytes))
+                        .map_err(embedded("list curation proposals"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
+    fn decide_curation_proposal(
+        &self,
+        entity_table: String,
+        id: String,
+        request: Value,
+    ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call(move |db| {
+                    retry_busy(|| db.decide_curation_proposal_json(&entity_table, &id, &bytes))
+                        .map_err(embedded("decide curation proposal"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
     fn render_resolver(
         &self,
         table: String,

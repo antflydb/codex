@@ -1237,19 +1237,32 @@ fn concept_curation_merges_unmerges_and_suppresses() -> Result<(), Box<dyn std::
             Some(agents)
         );
 
-        // Antfly refuses to suppress a merge target, so what was merged
-        // into it is unmerged and suppressed too.
+        // Suppressing a merge target suppresses what was merged into it in
+        // the same commit, recorded as a cascade.
         let notes = "concept/notes";
         assert!(knowledge.merge_concept(notes, note).await?);
+        let user = codex_antfly::knowledge::USER_ACTOR;
         assert_eq!(
-            knowledge.suppress_concept(note).await?,
+            knowledge
+                .suppress_concept(note, user, Some("generic"))
+                .await?,
             Some(vec![notes.to_string()])
         );
         let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
         assert!(curation.suppressed.contains(note), "{curation:?}");
         assert!(curation.suppressed.contains(notes), "{curation:?}");
         assert!(!curation.redirects.contains_key(notes), "{curation:?}");
-        assert!(knowledge.unsuppress_concept(note).await?);
+        let origin = &curation.suppression_origins[note];
+        assert_eq!(
+            (origin.actor.as_deref(), origin.reason.as_deref()),
+            (Some(user), Some("generic"))
+        );
+        let cascade = &curation.suppression_origins[notes];
+        assert_eq!(
+            (cascade.origin.as_str(), cascade.cascade_from.as_deref()),
+            ("cascade", Some(note))
+        );
+        assert!(knowledge.unsuppress_concept(note, user).await?);
         let curation = knowledge.concept_curation().await?.ok_or("no curation")?;
         assert!(!curation.suppressed.contains(note), "{curation:?}");
         antfly.close().await?;

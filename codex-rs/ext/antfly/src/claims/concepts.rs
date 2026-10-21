@@ -430,10 +430,10 @@ pub struct GenericScreen {
 /// One screening pass: concepts never screened before go to `judge`, which
 /// says per concept whether it is a generic word rather than a specific
 /// thing. Each verdict is a `generic_concept` label, and each concept is
-/// screened once. In shadow mode (the default) generic ones are proposals,
-/// listed by `codex knowledge proposals`; in enforce mode they are
-/// suppressed, so their mentions stop minting them and their edges are
-/// removed. `codex knowledge unignore` reverses one.
+/// screened once. In shadow mode (the default) generic ones become Antfly
+/// curation proposals, listed by `codex knowledge proposals`; in enforce
+/// mode they are suppressed, so their mentions stop minting them and their
+/// edges are removed. `codex knowledge keep` reverses one.
 pub(crate) async fn screen_generic<J, F>(
     knowledge: &Knowledge<'_>,
     antfly: &codex_antfly::Antfly,
@@ -488,10 +488,27 @@ where
     for ((concept, rendered), generic) in pending.iter().zip(&rendered).zip(verdicts) {
         if generic {
             report.generic += 1;
-            if mode == codex_antfly::TriageMode::Enforce
-                && knowledge.suppress_concept(&concept.key).await?.is_some()
-            {
-                report.suppressed += 1;
+            let reason = format!("generic word, screened by {model}");
+            if mode == codex_antfly::TriageMode::Enforce {
+                if knowledge
+                    .suppress_concept(
+                        &concept.key,
+                        codex_antfly::knowledge::GENERIC_SCREEN_ACTOR,
+                        Some(&reason),
+                    )
+                    .await?
+                    .is_some()
+                {
+                    report.suppressed += 1;
+                }
+            } else {
+                knowledge
+                    .propose_generic(
+                        &concept.key,
+                        &reason,
+                        json!({"model": model, "judged": rendered}),
+                    )
+                    .await?;
             }
         }
         codex_antfly::labels::record_decision(
@@ -781,13 +798,20 @@ mod tests {
         );
         let curation = knowledge.concept_curation().await?.unwrap_or_default();
         assert!(curation.suppressed.is_empty(), "{curation:?}");
-        assert_eq!(knowledge.generic_proposals().await?, vec!["concept/note"]);
-        // Each concept is screened once, and a reviewed one is no longer
-        // proposed.
+        let proposals = knowledge.generic_proposals().await?;
+        let keys: Vec<&str> = proposals.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["concept/note"]);
+        // Each concept is screened once, and a decided proposal is no
+        // longer open.
         let again = screen_generic(&knowledge, &antfly, "test", note_is_generic).await?;
         assert_eq!(again, GenericScreen::default());
-        knowledge.review_generic("concept/note", false).await?;
-        assert_eq!(knowledge.generic_proposals().await?, Vec::<String>::new());
+        assert_eq!(
+            knowledge
+                .decide_proposal(&proposals[0].id, false, codex_antfly::knowledge::USER_ACTOR)
+                .await?,
+            Some(Vec::new())
+        );
+        assert!(knowledge.generic_proposals().await?.is_empty());
         antfly.close().await?;
         Ok(())
     }
@@ -819,7 +843,13 @@ mod tests {
         );
         let curation = knowledge.concept_curation().await?.unwrap_or_default();
         assert!(curation.suppressed.contains("concept/note"), "{curation:?}");
-        assert_eq!(knowledge.generic_proposals().await?, Vec::<String>::new());
+        assert_eq!(
+            curation.suppression_origins["concept/note"]
+                .actor
+                .as_deref(),
+            Some(codex_antfly::knowledge::GENERIC_SCREEN_ACTOR)
+        );
+        assert!(knowledge.generic_proposals().await?.is_empty());
         antfly.close().await?;
         Ok(())
     }

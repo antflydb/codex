@@ -946,43 +946,34 @@ impl Knowledge<'_> {
     }
 
     /// Suppresses concept `key`: its mentions mint no concept and no `about`
-    /// edge, and existing edges are removed on replay. Antfly rejects
-    /// suppressing a merge target, so concepts merged into `key` are
-    /// unmerged and suppressed with it; they are returned. `None` when the
-    /// backend cannot curate.
-    pub async fn suppress_concept(&self, key: &str) -> AntflyResult<Option<Vec<String>>> {
-        let absorbed: Vec<String> = match self.concept_curation().await? {
-            Some(curation) => curation
-                .redirects
-                .iter()
-                .filter(|(_, target)| target.as_str() == key)
-                .map(|(source, _)| source.clone())
-                .collect(),
-            None => return Ok(None),
-        };
-        for source in &absorbed {
-            self.unmerge_concept(source, /*pin_distinct*/ false).await?;
-            self.curate_concept(source, json!({"action": "suppress"}))
-                .await?;
-            crate::labels::record_decision(
-                self.antfly,
-                crate::labels::DecisionRecord {
-                    kind: crate::labels::CONCEPT_SUPPRESSED_WITH,
-                    model: "codex",
-                    subject: Some(source.clone()),
-                    input: key,
-                    response: &json!({"suppressed_with": key}),
-                    result: Some(true),
-                    score: None,
-                    threshold_bp: None,
-                },
-            )
-            .await?;
+    /// edge, and existing edges are removed on replay. Concepts merged into
+    /// `key` are suppressed with it in the same commit (Antfly records them
+    /// as a cascade from `key`); they are returned. `actor` and `reason` are
+    /// kept as the suppression's provenance. `None` when the backend cannot
+    /// curate.
+    pub async fn suppress_concept(
+        &self,
+        key: &str,
+        actor: &str,
+        reason: Option<&str>,
+    ) -> AntflyResult<Option<Vec<String>>> {
+        let mut request = json!({"action": "suppress", "absorbed": "suppress", "actor": actor});
+        if let Some(reason) = reason {
+            request["reason"] = json!(reason);
         }
         Ok(self
-            .curate_concept(key, json!({"action": "suppress"}))
+            .curate_concept(key, request)
             .await?
-            .map(|_| absorbed))
+            .map(|result| absorbed_keys(&result)))
+    }
+
+    /// Reverses [`Knowledge::suppress_concept`] for `key` alone; concepts
+    /// suppressed with it stay suppressed and unmerged.
+    pub async fn unsuppress_concept(&self, key: &str, actor: &str) -> AntflyResult<bool> {
+        Ok(self
+            .curate_concept(key, json!({"action": "unsuppress", "actor": actor}))
+            .await?
+            .is_some())
     }
 
     /// How consolidation screens concepts for generic words.
@@ -990,56 +981,110 @@ impl Knowledge<'_> {
         self.config.concept_screening
     }
 
-    /// Records the user's review of concept `key`'s generic screening:
-    /// `accepted` when it is ignored, not when it is kept. A reviewed concept
-    /// is no longer proposed.
-    pub async fn review_generic(&self, key: &str, accepted: bool) -> AntflyResult<()> {
-        crate::labels::record_decision(
-            self.antfly,
-            crate::labels::DecisionRecord {
-                kind: crate::labels::GENERIC_CONCEPT_REVIEW,
-                model: "user",
-                subject: Some(key.to_string()),
-                input: key,
-                response: &json!({"accepted": accepted}),
-                result: Some(accepted),
-                score: None,
-                threshold_bp: None,
-            },
-        )
-        .await
-    }
-
-    /// Concepts screening called generic that are not ignored, merged away,
-    /// or reviewed yet: the open proposals.
-    pub async fn generic_proposals(&self) -> AntflyResult<Vec<String>> {
-        let Some(curation) = self.concept_curation().await? else {
-            return Ok(Vec::new());
-        };
-        let reviewed =
-            crate::labels::latest_results(self.antfly, crate::labels::GENERIC_CONCEPT_REVIEW)
-                .await?;
-        Ok(
-            crate::labels::latest_results(self.antfly, crate::labels::GENERIC_CONCEPT)
-                .await?
-                .into_iter()
-                .filter(|(key, generic)| {
-                    *generic
-                        && !reviewed.contains_key(key)
-                        && !curation.suppressed.contains(key)
-                        && !curation.redirects.contains_key(key)
-                })
-                .map(|(key, _)| key)
-                .collect(),
-        )
-    }
-
-    /// Reverses [`Knowledge::suppress_concept`].
-    pub async fn unsuppress_concept(&self, key: &str) -> AntflyResult<bool> {
+    /// Queues a proposal to suppress concept `key` as a generic word, for
+    /// review. Accepting it suppresses what was merged into `key` too.
+    /// Proposing a concept again keeps its earlier decision. `false` when
+    /// the backend has no proposal queue.
+    pub async fn propose_generic(
+        &self,
+        key: &str,
+        reason: &str,
+        evidence: Value,
+    ) -> AntflyResult<bool> {
         Ok(self
-            .curate_concept(key, json!({"action": "unsuppress"}))
+            .antfly
+            .propose_curation(
+                schema::CONCEPTS,
+                json!({
+                    "action": "suppress",
+                    "key": key,
+                    "options": {"absorbed": "suppress"},
+                    "evidence": evidence,
+                    "actor": GENERIC_SCREEN_ACTOR,
+                    "reason": reason,
+                }),
+            )
             .await?
             .is_some())
+    }
+
+    /// Proposals to suppress concepts, in `state` (`open`, `accepted`,
+    /// `rejected` or `superseded`; all when `None`). `None` when the backend
+    /// has no proposal queue.
+    pub async fn suppress_proposals(
+        &self,
+        state: Option<&str>,
+    ) -> AntflyResult<Option<Vec<ConceptProposal>>> {
+        let mut proposals = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut request = json!({"action": "suppress", "limit": PROPOSAL_PAGE});
+            if let Some(state) = state {
+                request["state"] = json!(state);
+            }
+            if let Some(cursor) = &cursor {
+                request["cursor"] = json!(cursor);
+            }
+            let Some(page) = self
+                .antfly
+                .list_curation_proposals(schema::CONCEPTS, request)
+                .await?
+            else {
+                return Ok(None);
+            };
+            proposals.extend(
+                page["proposals"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(ConceptProposal::from_json),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+                _ => return Ok(Some(proposals)),
+            }
+        }
+    }
+
+    /// Open proposals from generic screening.
+    pub async fn generic_proposals(&self) -> AntflyResult<Vec<ConceptProposal>> {
+        Ok(self
+            .suppress_proposals(Some("open"))
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|proposal| proposal.actor.as_deref() == Some(GENERIC_SCREEN_ACTOR))
+            .collect())
+    }
+
+    /// Accepts or rejects proposal `id` as `actor`. Accepting applies it;
+    /// for a suppression, the concepts suppressed with it are returned.
+    /// `None` when the backend has no proposal queue.
+    pub async fn decide_proposal(
+        &self,
+        id: &str,
+        accept: bool,
+        actor: &str,
+    ) -> AntflyResult<Option<Vec<String>>> {
+        Ok(self
+            .antfly
+            .decide_curation_proposal(
+                schema::CONCEPTS,
+                id,
+                json!({"accept": accept, "actor": actor}),
+            )
+            .await?
+            .map(|result| absorbed_keys(&result)))
+    }
+
+    /// The open suppression proposal for concept `key`, if any.
+    pub async fn open_suppress_proposal(&self, key: &str) -> AntflyResult<Option<ConceptProposal>> {
+        Ok(self
+            .suppress_proposals(Some("open"))
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|proposal| proposal.key == key))
     }
 
     /// Redirects, distinct pins and suppressions of the concept resolvers,
@@ -2079,6 +2124,81 @@ pub struct ConceptCuration {
     pub distinct: BTreeSet<(String, String)>,
     /// Suppressed concept keys.
     pub suppressed: BTreeSet<String>,
+    /// Why each suppressed key is suppressed, when Antfly recorded it.
+    pub suppression_origins: BTreeMap<String, CurationOrigin>,
+}
+
+/// Antfly's provenance for one curation record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CurationOrigin {
+    /// `manual`, `adjudicator`, `review`, `cascade` or `config`.
+    pub origin: String,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    /// For a cascade, the key whose suppression suppressed this one.
+    pub cascade_from: Option<String>,
+    /// For a review, the accepted proposal.
+    pub proposal_id: Option<String>,
+}
+
+impl CurationOrigin {
+    fn from_json(value: &Value) -> Self {
+        let text = |field: &str| value[field].as_str().map(str::to_string);
+        Self {
+            origin: text("origin").unwrap_or_default(),
+            actor: text("actor"),
+            reason: text("reason"),
+            cascade_from: text("cascade_from"),
+            proposal_id: text("proposal_id"),
+        }
+    }
+}
+
+/// A queued curation proposal for a concept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConceptProposal {
+    pub id: String,
+    pub action: String,
+    pub key: String,
+    /// `open`, `accepted`, `rejected` or `superseded`.
+    pub state: String,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl ConceptProposal {
+    fn from_json(value: &Value) -> Option<Self> {
+        let text = |field: &str| value[field].as_str().map(str::to_string);
+        Some(Self {
+            id: text("id")?,
+            action: text("action")?,
+            key: text("key")?,
+            state: text("state")?,
+            actor: value["origin"]["actor"].as_str().map(str::to_string),
+            reason: value["origin"]["reason"].as_str().map(str::to_string),
+        })
+    }
+}
+
+/// Actor recorded on generic screening's proposals and suppressions.
+pub const GENERIC_SCREEN_ACTOR: &str = "codex/generic-screen";
+/// Actor recorded on curation from `codex knowledge`.
+pub const USER_ACTOR: &str = "codex/user";
+/// Proposals listed per request.
+const PROPOSAL_PAGE: usize = 200;
+
+/// Keys an entity action released or suppressed with its target, across
+/// resolvers.
+fn absorbed_keys(result: &Value) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    for resolver in result["results"].as_array().into_iter().flatten() {
+        for absorbed in resolver["absorbed"].as_array().into_iter().flatten() {
+            if let Some(key) = absorbed["key"].as_str() {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys.into_iter().collect()
 }
 
 impl ConceptCuration {
@@ -2098,13 +2218,17 @@ impl ConceptCuration {
                 self.distinct.insert(ordered_pair(from, to));
             }
         }
-        for key in curation["suppress"]["keys"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        let suppress = &curation["suppress"];
+        for key in suppress["keys"].as_array().into_iter().flatten() {
             if let Some(key) = key.as_str() {
                 self.suppressed.insert(key.to_string());
+            }
+        }
+        for entry in suppress["entries"].as_array().into_iter().flatten() {
+            if let Some(key) = entry["key"].as_str() {
+                self.suppressed.insert(key.to_string());
+                self.suppression_origins
+                    .insert(key.to_string(), CurationOrigin::from_json(&entry["origin"]));
             }
         }
     }
