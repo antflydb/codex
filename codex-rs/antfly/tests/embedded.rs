@@ -1272,3 +1272,78 @@ fn concept_curation_merges_unmerges_and_suppresses() -> Result<(), Box<dyn std::
     })?;
     Ok(())
 }
+
+/// History concepts on Lite: a thread's user and agent messages are grouped
+/// per turn, GLiNER extracts concepts, and the thread node gets `about`
+/// edges to them, from ordinary writes; tool output is left out.
+#[test]
+#[ignore = "Lite grouped sources do not advance in the background until antflydb/antfly#1241"]
+fn history_concepts_link_threads_to_concepts() -> Result<(), Box<dyn std::error::Error>> {
+    if !has_models("fastino") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, false);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let thread = "history-lite";
+        let rows = [
+            (
+                1,
+                "turn-1",
+                Some("user"),
+                "Switch the embedder to EmbeddingGemma in Antfly.",
+            ),
+            (
+                2,
+                "turn-1",
+                Some("agent"),
+                "I changed the Antfly config to use EmbeddingGemma.",
+            ),
+            (
+                3,
+                "turn-1",
+                None,
+                "cargo build output mentioning Kubernetes",
+            ),
+        ];
+        antfly
+            .documents(schema::HISTORY_ITEMS)
+            .write(
+                rows.iter()
+                    .map(|(ordinal, turn, speaker, text)| {
+                        let mut doc =
+                            json!({"thread_id": thread, "ordinal": ordinal, "turn_id": turn});
+                        if let Some(speaker) = speaker {
+                            doc["speaker"] = json!(speaker);
+                            doc["search_text"] = json!(text);
+                        } else {
+                            doc["item"] = json!({"tool_output": text});
+                        }
+                        Write::put(format!("{thread}:{ordinal}"), doc)
+                    })
+                    .collect(),
+            )
+            .await?;
+        let seeds = vec![
+            "concept/embeddinggemma".to_string(),
+            "concept/kubernetes".to_string(),
+        ];
+        let mut threads = Vec::new();
+        for _ in 0..120 {
+            threads = knowledge.threads_about(&seeds, 10).await;
+            if !threads.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let found = threads
+            .iter()
+            .find(|found| found.thread_id == thread)
+            .ok_or_else(|| format!("thread not reached: {threads:?}"))?;
+        assert_eq!(found.concepts, vec!["concept/embeddinggemma".to_string()]);
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}

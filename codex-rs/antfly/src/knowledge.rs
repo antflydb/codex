@@ -650,19 +650,14 @@ struct Reached {
     doc: Option<Value>,
 }
 
-/// A traversal start at concept nodes, which live in [`schema::CONCEPTS`]
-/// rather than the table being queried. The server matches nodes by
-/// table-qualified identity and finds nothing from bare keys; Lite rejects
-/// the qualified form and matches bare keys.
-fn concept_nodes(remote: bool, concepts: &[String]) -> Value {
-    if remote {
-        json!({"identities": concepts
-            .iter()
-            .map(|key| json!({"table": schema::CONCEPTS, "key": key}))
-            .collect::<Vec<_>>()})
-    } else {
-        json!({"keys": concepts})
-    }
+/// A traversal start at concept nodes. They live in [`schema::CONCEPTS`],
+/// not in the table being queried, so they are addressed by table-qualified
+/// identity.
+fn concept_nodes(concepts: &[String]) -> Value {
+    json!({"identities": concepts
+        .iter()
+        .map(|key| json!({"table": schema::CONCEPTS, "key": key}))
+        .collect::<Vec<_>>()})
 }
 
 fn reached_nodes(response: &Value, query: &str) -> Vec<Reached> {
@@ -1085,14 +1080,6 @@ impl Knowledge<'_> {
             .curate_concept(key, json!({"action": "unsuppress", "actor": actor}))
             .await?
             .is_some())
-    }
-
-    /// Whether the database is a remote server rather than embedded Lite.
-    fn is_remote(&self) -> bool {
-        matches!(
-            self.antfly.config().backend,
-            crate::BackendConfig::Remote { .. }
-        )
     }
 
     /// How consolidation screens concepts for generic words.
@@ -1586,7 +1573,7 @@ impl Knowledge<'_> {
 
     /// Nodes one `about` edge into each of `concepts` in graph `index` of
     /// `table`, paired with the concept that reached them. One traversal per
-    /// concept: the server only traverses incoming edges with deduplicated
+    /// concept: the server traverses incoming edges only with deduplicated
     /// nodes, so a single traversal would lose which concepts a node shares.
     /// Failures yield none.
     async fn reached_from_concepts(
@@ -1600,7 +1587,6 @@ impl Knowledge<'_> {
         if concepts.is_empty() {
             return Vec::new();
         }
-        let remote = self.is_remote();
         let queries: serde_json::Map<String, Value> = concepts
             .iter()
             .enumerate()
@@ -1608,7 +1594,7 @@ impl Knowledge<'_> {
                 (
                     format!("c{position}"),
                     json!({"index": index, "traverse": {
-                        "start": concept_nodes(remote, std::slice::from_ref(concept)),
+                        "start": concept_nodes(std::slice::from_ref(concept)),
                         "direction": "in", "edge_types": [ABOUT_EDGE], "max_depth": 1,
                         "include_documents": include_documents, "include_paths": true,
                         "limit": limit,

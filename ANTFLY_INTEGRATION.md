@@ -164,7 +164,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `9a619236a4` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `8654b1d708` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +172,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `9a619236a4` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `8654b1d708` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -514,7 +514,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `9a619236a4`, which includes
+against Antfly 1258e8cfcb; the pin is now `8654b1d708`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -526,7 +526,8 @@ background maintenance, no handle-reopen churn) and #1163 (enrichment and
 resolution no longer stall under writes with an inline resolver), #1186
 (generated deciders, reversible curation and the entity APIs) and #1223
 (schema safety, resolver credential redaction) and #1233 (cascade
-suppression, curation provenance and the entity proposal queue).
+suppression, curation provenance and the entity proposal queue) and #1246
+(promotion after curation, cross-table traversal starts).
 
 ### Goal
 
@@ -989,11 +990,11 @@ Curation writes and proposal decisions carry `wait: {timeout_ms: 10000}`.
 Without it the server answers 202 before applying the change, and the
 CLI's or consolidation's next read misses it.
 
-Verified against `antfly standalone` (main d2a3003929) in
-`remote_concept_curation`: entity merges and unmerges with a distinct pin,
-cascade suppression with provenance, and the proposal queue. On the server,
-any runtime merge or suppression currently stops entity promotion for
-`codex_concepts` (antflydb/antfly#1244); Lite is unaffected.
+Verified against `antfly standalone` in `remote_concept_curation`: entity
+merges and unmerges with a distinct pin, cascade suppression with
+provenance, and the proposal queue. Before antflydb/antfly#1246, any
+runtime merge or suppression on the server stopped entity promotion for
+`codex_concepts` (#1244).
 
 ### History concepts
 
@@ -1025,17 +1026,19 @@ Status:
   concept.
 - **Lite:** the same configuration works only when a write waits at
   `sync_level: enrichments`. At `write`, grouped sources never advance
-  (antflydb/antfly#1241). The enrichments and index are registered anyway,
+  (antflydb/antfly#1241; the fix is in #1227, not yet on main;
+  `history_concepts_link_threads_to_concepts` is ignored until then). The
+  enrichments and index are registered anyway,
   so history concepts appear once that is fixed.
 
 **Traversal into concepts.** Concept nodes live in `codex_concepts`, not in
-the table being queried. The server matches table-qualified identities
-(`{"identities": [{"table": "codex_concepts", "key": …}]}`) and finds
-nothing from bare keys, while Lite rejects the qualified form. The server
-also refuses incoming traversal without node deduplication. Codex picks the
-form per backend and runs one deduplicated traversal per seed concept to
-keep which concepts each document shares (antflydb/antfly#1245). Before
-this, remote retrieval silently found no claims or notes through concepts.
+the table being queried, so traversals start from table-qualified
+identities (`{"identities": [{"table": "codex_concepts", "key": …}]}`),
+which both backends accept since antflydb/antfly#1246. Bare cross-table keys
+used to find nothing on the server, so remote retrieval through concepts
+silently returned no claims or notes (#1245). The server traverses incoming
+edges only with node deduplication, so Codex runs one traversal per seed
+concept to keep which concepts each document shares.
 
 ### Memory notes
 
