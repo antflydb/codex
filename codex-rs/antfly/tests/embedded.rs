@@ -1277,7 +1277,6 @@ fn concept_curation_merges_unmerges_and_suppresses() -> Result<(), Box<dyn std::
 /// per turn, GLiNER extracts concepts, and the thread node gets `about`
 /// edges to them, from ordinary writes; tool output is left out.
 #[test]
-#[ignore = "Lite grouped sources do not advance in the background until antflydb/antfly#1241"]
 fn history_concepts_link_threads_to_concepts() -> Result<(), Box<dyn std::error::Error>> {
     if !has_models("fastino") {
         return Ok(());

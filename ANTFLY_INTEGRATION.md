@@ -164,7 +164,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `8654b1d708` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `ddba6584b3` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +172,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `8654b1d708` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `ddba6584b3` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -514,7 +514,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `8654b1d708`, which includes
+against Antfly 1258e8cfcb; the pin is now `ddba6584b3`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -527,7 +527,8 @@ resolution no longer stall under writes with an inline resolver), #1186
 (generated deciders, reversible curation and the entity APIs) and #1223
 (schema safety, resolver credential redaction) and #1233 (cascade
 suppression, curation provenance and the entity proposal queue) and #1246
-(promotion after curation, cross-table traversal starts).
+(promotion after curation, cross-table traversal starts) and #1254 (Lite
+grouped sources advance in the background).
 
 ### Goal
 
@@ -1024,12 +1025,9 @@ Status:
   `dns` and `macos`; the tool output's "Kubernetes" is excluded.
   `knowledge.related` returns the thread and a memory note on the same
   concept.
-- **Lite:** the same configuration works only when a write waits at
-  `sync_level: enrichments`. At `write`, grouped sources never advance
-  (antflydb/antfly#1241; the fix is in #1227, not yet on main;
-  `history_concepts_link_threads_to_concepts` is ignored until then). The
-  enrichments and index are registered anyway,
-  so history concepts appear once that is fixed.
+- **Lite:** works from ordinary writes since antflydb/antfly#1254 fixed
+  #1241 (`history_concepts_link_threads_to_concepts`). Before that, grouped
+  sources advanced only when a write waited at `sync_level: enrichments`.
 
 **Traversal into concepts.** Concept nodes live in `codex_concepts`, not in
 the table being queried, so traversals start from table-qualified
@@ -1396,10 +1394,6 @@ through `knowledge.search`.
   until `codex knowledge status` shows recall of about 0.95 or better on
   turns that produced claims, at a threshold that skips a useful share of
   turns.
-- **History concepts on Lite.** Built (see [History concepts](#history-concepts)),
-  and working against a server. On Lite, grouped sources never advance in the
-  background (antflydb/antfly#1241), so history concepts appear only once
-  that is fixed.
 - **Moving the merge judge into Antfly.** Antfly has what it needs
   (antflydb/antfly#1186): REVIEW-band adjudication with a decider (#1176),
   and generator-backed deciders (`decision_method: generated`, #1187), which
