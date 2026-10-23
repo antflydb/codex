@@ -2457,11 +2457,6 @@ impl ThreadRequestProcessor {
         )
         .await?;
         let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-        let rollout_path = rollout_path.ok_or_else(|| {
-            internal_error(format!(
-                "rollout path missing after reloading thread {thread_id}"
-            ))
-        })?;
         // Revert keeps the existing thread state and subscriptions across the internal reload.
         // Start the replacement listener from that state instead of depending on the requesting
         // connection still being open.
@@ -2473,7 +2468,7 @@ impl ThreadRequestProcessor {
                 thread_id,
                 codex_thread.as_ref(),
                 &response_history,
-                rollout_path.as_path(),
+                rollout_path.as_deref(),
                 Some(resume_source_thread),
                 /*include_turns*/ false,
             )
@@ -4294,13 +4289,9 @@ impl ThreadRequestProcessor {
                     return Ok(ControlFlow::Break(()));
                 }
                 let instruction_sources = codex_thread.legacy_instruction_sources().await;
+                // Thread stores without rollout files (Antfly) have no path; the
+                // thread is read back from the store instead.
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-                let Some(rollout_path) = rollout_path else {
-                    let error =
-                        internal_error(format!("rollout path missing for thread {thread_id}"));
-                    self.outgoing.send_error(request_id, error).await;
-                    return Ok(ControlFlow::Break(()));
-                };
                 // Paginated JSONL is canonical, but its SQLite projection can lag after a
                 // previous write failure. Persist after reopening the live writer so legacy
                 // response hydration reads the latest durable turns and items.
@@ -4343,7 +4334,7 @@ impl ThreadRequestProcessor {
                         thread_id,
                         codex_thread.as_ref(),
                         &response_history,
-                        rollout_path.as_path(),
+                        rollout_path.as_deref(),
                         resume_source_thread,
                         include_turns && !paginated_resume,
                     )
@@ -5006,7 +4997,7 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         thread: &CodexThread,
         thread_history: &InitialHistory,
-        rollout_path: &Path,
+        rollout_path: Option<&Path>,
         resume_source_thread: Option<StoredThread>,
         include_turns: bool,
     ) -> std::result::Result<Thread, String> {
@@ -5080,7 +5071,7 @@ impl ThreadRequestProcessor {
                     session_id.clone(),
                     thread.multi_agent_version(),
                     &config_snapshot,
-                    Some(rollout_path.into()),
+                    rollout_path.map(Into::into),
                 );
                 thread.preview = preview_from_rollout_items(items);
                 Ok(thread)
@@ -5094,7 +5085,7 @@ impl ThreadRequestProcessor {
         thread.can_accept_direct_input = Some(can_accept_direct_input);
         thread.id = thread_id.to_string();
         thread.session_id = session_id;
-        thread.path = Some(rollout_path.to_path_buf());
+        thread.path = rollout_path.map(Path::to_path_buf);
         if include_turns {
             let history_items = thread_history.get_rollout_items();
             populate_thread_turns_from_history(

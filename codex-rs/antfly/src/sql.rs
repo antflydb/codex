@@ -281,11 +281,32 @@ fn antfly_arguments(params: Vec<SqlValue>) -> AntflyResult<AntflyArguments> {
     Ok(arguments)
 }
 
+/// A NULL parameter with no declared type (OID 0), so the server infers it
+/// from the column, as for a literal `NULL`. A typed NULL (`Option<String>`)
+/// is a text expression, which PostgreSQL semantics reject for non-text
+/// columns (42804).
+struct UntypedNull;
+
+impl sqlx::Type<sqlx_postgres::Postgres> for UntypedNull {
+    fn type_info() -> sqlx_postgres::PgTypeInfo {
+        sqlx_postgres::PgTypeInfo::with_oid(sqlx_postgres::types::Oid(0))
+    }
+}
+
+impl sqlx::Encode<'_, sqlx_postgres::Postgres> for UntypedNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut sqlx_postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        Ok(sqlx::encode::IsNull::Yes)
+    }
+}
+
 fn pg_arguments(params: Vec<SqlValue>) -> AntflyResult<PgArguments> {
     let mut arguments = PgArguments::default();
     for value in params {
         let added = match value {
-            SqlValue::Null => arguments.add(Option::<String>::None),
+            SqlValue::Null => arguments.add(UntypedNull),
             SqlValue::Bool(value) => arguments.add(value),
             SqlValue::Int(value) => arguments.add(value),
             SqlValue::Float(value) => arguments.add(value),

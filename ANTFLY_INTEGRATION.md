@@ -493,6 +493,7 @@ Keep changes here minimal; delegate to the new crates.
 | `core/src/state_db_bridge.rs:7`, `tui/src/lib.rs:399` | Same, for non-app-server entry points |
 | `app-server/src/message_processor.rs:308` | `Antfly` arm returns `AntflyQueueStore` |
 | `app-server/src/extensions.rs` | Install `codex_antfly_extension` before Guardian V2; Antfly message board and memories backend |
+| `app-server/src/request_processors/thread_processor.rs` (resume, revert) | The rollout path is optional: Antfly threads have none and are read back from the thread store; client `thread/resume` used to fail with "rollout path missing" |
 | `state/src/runtime.rs` (and `runtime/*.rs`) | Swap SQLite internals for the Antfly backend behind the existing method signatures |
 | `Cargo.toml` (workspace) | New members; `antfly-embedded` and `antfly-sdk` dependencies |
 | `thread-store/src/store.rs` | Defaulted `ThreadStore::load_full_history` (raw items in either history mode) |
@@ -1419,6 +1420,44 @@ through `knowledge.search`.
 - **Privacy (remote).** Transcripts contain code and tool output that may
   include secrets. Decide what is mirrored, redact or truncate tool output,
   and keep the API key in an environment variable.
+
+## Durable sessions across processes
+
+Prototype (October 23): could a Codex agent survive its process dying, with
+the thread picked up by a different app-server, using Antfly as the only
+shared state? The driver talks JSON-RPC to two `codex app-server` processes
+with separate `CODEX_HOME`s (standing in for two machines) and one store:
+
+It passes against `antfly standalone` (main afd21fc353), with nothing shared
+between the two processes but the server, and against a shared Lite file:
+
+1. App-server A starts a thread and a turn that runs `sleep 25 && echo done-A > marker-a.txt`.
+2. A is SIGKILLed while the command runs.
+3. App-server B calls `thread/resume`. The killed turn reads back as
+   `interrupted`, holding only the user message.
+4. Asked to finish, B reruns the command; `marker-a.txt` contains `done-A`.
+
+Findings:
+- **Client resume of Antfly threads was broken.** `thread/resume` required
+  a rollout file path. Fixed: see the patch point above.
+- **Hosted Antfly crashed first.** The server aborted within seconds of the
+  first turn: two upserts in one pgwire transaction, which the history
+  projection does every batch (antflydb/antfly#1267, fixed by #1269).
+- **Remote NULL parameters were typed as text.** Codex bound SQL NULL as
+  `Option<String>`, a text expression that PostgreSQL semantics reject for
+  `BIGINT` and `JSONB` columns (42804). Older servers accepted it. NULLs are
+  now sent with no declared type (OID 0), so the server infers each from its
+  column (`antfly/src/sql.rs`, `UntypedNull`).
+- **In-flight tool calls are not recorded.** Items are persisted on completion,
+  so after a crash the store has no trace of a command that started. Here the
+  command died with its process. A command on a remote machine
+  (`exec-server`) could survive and finish, so durable sessions need a
+  "started" record for side-effecting calls.
+- **Recovery ownership is local.** The app-server's daemon recovery list is a
+  local file (`app-server/src/daemon_thread_recovery.rs`), so only the same
+  machine restores its threads. Another host taking over needs a
+  lease row in Antfly. Upstream's `continue_daemon_turn` already continues a
+  recovered turn rather than only marking it interrupted.
 
 ## Rebasing
 
