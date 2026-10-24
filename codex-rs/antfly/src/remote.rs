@@ -13,6 +13,7 @@ use crate::backend::GraphIndex;
 use crate::backend::ScanRequest;
 use crate::backend::TableSpec;
 use crate::backend::Write;
+use crate::backend::with_wait;
 use crate::error::AntflyError;
 use crate::error::AntflyResult;
 
@@ -213,21 +214,6 @@ impl RemoteBackend {
 }
 
 const RETRY_ATTEMPTS: u32 = 8;
-/// How long a curation write waits for the server to apply it. Without a
-/// wait the server answers 202 before applying, and an immediate read (the
-/// CLI's next command, consolidation's next pair) would not see it. A write
-/// still pending after the wait is durable and applies later.
-const CURATION_WAIT_MS: u64 = 10_000;
-
-/// Adds the curation wait to `body` unless it sets one.
-fn with_wait(mut body: Value) -> Value {
-    if let Some(fields) = body.as_object_mut() {
-        fields
-            .entry("wait")
-            .or_insert_with(|| json!({"timeout_ms": CURATION_WAIT_MS}));
-    }
-    body
-}
 const RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -600,7 +586,7 @@ mod tests {
                 "/db/v1/tables/codex_concepts/entities/concept%2Fagents:merge",
             ))
             .and(body_json(
-                json!({"into": "concept/agent", "wait": {"timeout_ms": CURATION_WAIT_MS}}),
+                json!({"into": "concept/agent", "wait": {"timeout_ms": crate::backend::CURATION_WAIT_MS}}),
             ))
             .respond_with(ResponseTemplate::new(202).set_body_json(json!({"complete": false})))
             .expect(1)
@@ -658,7 +644,7 @@ mod tests {
                 "/db/v1/tables/codex_concepts/curation/proposals/p1:reject",
             ))
             .and(body_json(
-                json!({"actor": "user", "wait": {"timeout_ms": CURATION_WAIT_MS}}),
+                json!({"actor": "user", "wait": {"timeout_ms": crate::backend::CURATION_WAIT_MS}}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"complete": true})))
             .expect(1)

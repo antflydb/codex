@@ -45,6 +45,9 @@ pub enum KnowledgeSubcommand {
     Describe(DescribeArgs),
     /// Compare decide models on the labeled questions Codex has logged.
     Benchmark(BenchmarkArgs),
+    /// Judge an Antfly memory evaluation run with the extraction model
+    /// (identity, typed relations, supersession) and submit the verdicts.
+    MemoryEval(MemoryEvalArgs),
     /// Write candidate concept pairs (JSONL) for labeling merges and
     /// relations.
     ExportPairs(ExportPairsArgs),
@@ -127,6 +130,31 @@ pub struct BenchmarkArgs {
     /// model requests on your account).
     #[arg(long)]
     llm_judge: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct MemoryEvalArgs {
+    /// Antfly server, for example `http://127.0.0.1:8080`; without it the
+    /// configured embedded database is used.
+    #[arg(long)]
+    url: Option<String>,
+    /// Memory space holding the evaluation run.
+    #[arg(long)]
+    space: String,
+    /// Evaluation run id (started in `external` mode).
+    #[arg(long)]
+    run: String,
+    /// Environment variable holding the server's bearer token, if any.
+    #[arg(long)]
+    api_key_env: Option<String>,
+    /// A corpus written by Antfly's `scripts/bench/memory_judges.py
+    /// --prepare-only`: create the space, upload its cases as a dataset and
+    /// start the run before judging.
+    #[arg(long)]
+    corpus: Option<std::path::PathBuf>,
+    /// Also write the submitted verdicts here, one JSON object per line.
+    #[arg(long)]
+    save: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -407,6 +435,53 @@ impl KnowledgeCli {
                     results.extend(judged?);
                 }
                 print_benchmark(&results);
+                Ok(())
+            }
+            KnowledgeSubcommand::MemoryEval(args) => {
+                let api_key = args
+                    .api_key_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok());
+                let space = match &args.url {
+                    Some(url) => {
+                        codex_antfly::memory::MemorySpace::remote(url, &args.space, api_key)?
+                    }
+                    None => codex_antfly::memory::MemorySpace::embedded(&antfly, &args.space),
+                };
+                if let Some(path) = &args.corpus {
+                    let corpus: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                    let cases = corpus["cases"].as_array().cloned().unwrap_or_default();
+                    space.ensure(serde_json::json!({})).await?;
+                    space
+                        .start_external_evaluation(&args.run, &args.run, &cases)
+                        .await?;
+                    println!(
+                        "uploaded {} cases and started run {}",
+                        cases.len(),
+                        args.run
+                    );
+                }
+                let (thread_manager, host) = start_host(&config).await?;
+                let report = knowledge_admin::judge_memory_evaluation(
+                    &thread_manager,
+                    &config,
+                    &space,
+                    &args.run,
+                )
+                .await;
+                stop_host(&thread_manager, host).await;
+                let (report, verdicts) = report?;
+                if let Some(path) = &args.save {
+                    let lines: Vec<String> = verdicts.iter().map(ToString::to_string).collect();
+                    std::fs::write(path, lines.join("\n") + "\n")?;
+                }
+                println!(
+                    "{} tasks: {} labelled, {} abstained (unsure), {} invalid, {} skipped",
+                    report.tasks, report.labelled, report.abstained, report.invalid, report.skipped
+                );
+                let status = space.evaluation(&args.run).await?;
+                println!("{}", serde_json::to_string_pretty(&status["run"])?);
                 Ok(())
             }
             KnowledgeSubcommand::Describe(args) => {

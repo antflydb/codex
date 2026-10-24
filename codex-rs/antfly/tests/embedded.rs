@@ -1346,3 +1346,4 @@ fn history_concepts_link_threads_to_concepts() -> Result<(), Box<dyn std::error:
     })?;
     Ok(())
 }
+
