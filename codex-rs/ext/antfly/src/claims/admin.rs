@@ -695,6 +695,11 @@ pub async fn status(antfly: &Antfly) -> anyhow::Result<KnowledgeStatus> {
 /// extraction model (concept identity, typed relations, four-way
 /// supersession) and submits the verdicts. Unsure answers abstain; failed
 /// model requests are submitted as invalid outputs.
+/// The judge metadata this Codex freezes on the external runs it starts.
+pub fn memory_judge(config: &Config) -> serde_json::Value {
+    super::memory_eval::judge_metadata(&codex_memories_write::extraction_model(config))
+}
+
 pub async fn judge_memory_evaluation(
     thread_manager: &Arc<ThreadManager>,
     config: &Config,
@@ -707,6 +712,11 @@ pub async fn judge_memory_evaluation(
     const BATCH: usize = 40;
     let claims = claims(config)?;
     let model = super::extract_model(config);
+    let judge = memory_judge(config);
+    let frozen = space.evaluation(run).await?["run"]["judge"].clone();
+    if !frozen.is_null() && !super::memory_eval::same_judge(&frozen, &judge) {
+        anyhow::bail!("run {run} froze judge {frozen}, but this Codex judges as {judge}");
+    }
     let worker = Worker::standalone(Arc::downgrade(thread_manager), usize::MAX, None);
     let job = Job {
         thread_id: String::new(),
@@ -845,7 +855,12 @@ pub async fn judge_memory_evaluation(
     report.skipped = report.tasks - verdicts.len();
     for batch in verdicts.chunks(32) {
         space
-            .submit_verdicts(run, batch.to_vec(), &format!("codex/judge/{model}"))
+            .submit_verdicts(
+                run,
+                batch.to_vec(),
+                &format!("codex/judge/{model}"),
+                (!frozen.is_null()).then_some(&judge),
+            )
             .await?;
     }
     Ok((report, verdicts))

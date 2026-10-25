@@ -5,6 +5,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::concepts;
 use super::concepts::MergeVerdict;
@@ -93,6 +95,23 @@ pub(crate) fn parse_supersession(
     Ok(verdicts)
 }
 
+/// The judge an external run freezes: Codex, the judging model, and a
+/// digest of the judge prompts, so a prompt change starts a new cohort.
+pub(crate) fn judge_metadata(model: &str) -> Value {
+    let mut digest = Sha256::new();
+    for prompt in [
+        concepts::JUDGE_INSTRUCTIONS,
+        concepts::DESCRIBED_JUDGE_NOTE,
+        concepts::RELATION_INSTRUCTIONS,
+        SUPERSESSION_INSTRUCTIONS,
+    ] {
+        digest.update(prompt.as_bytes());
+        digest.update([0]);
+    }
+    let digest = format!("{:x}", digest.finalize());
+    json!({"provider": "codex", "model": model, "revision": format!("prompts-{}", &digest[..16])})
+}
+
 /// One judge task of an evaluation run.
 #[derive(Clone, Debug)]
 pub(crate) struct Task {
@@ -142,6 +161,14 @@ pub(crate) fn identity_label(verdict: MergeVerdict) -> Option<&'static str> {
     }
 }
 
+/// Whether a run's frozen judge is `judge`. The service echoes optional
+/// fields (`dimensions`) back as null.
+pub(crate) fn same_judge(frozen: &Value, judge: &Value) -> bool {
+    ["provider", "model", "revision"]
+        .iter()
+        .all(|key| frozen[key] == judge[key])
+}
+
 /// Whether the relation judge's answer for `a | b` is the proposed predicate.
 pub(crate) fn relation_label(relation: &str, proposed: &str) -> &'static str {
     let matches = matches!(
@@ -178,6 +205,15 @@ mod tests {
             vec![Some("supersedes"), None, None, None]
         );
         Ok(())
+    }
+
+    #[test]
+    fn frozen_judges_match_on_identity_fields() {
+        let judge = judge_metadata("gpt-5-mini");
+        let mut frozen = judge.clone();
+        frozen["dimensions"] = Value::Null;
+        assert!(same_judge(&frozen, &judge));
+        assert!(!same_judge(&judge_metadata("gpt-5"), &judge));
     }
 
     #[test]

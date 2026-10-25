@@ -453,8 +453,9 @@ impl KnowledgeCli {
                         serde_json::from_str(&std::fs::read_to_string(path)?)?;
                     let cases = corpus["cases"].as_array().cloned().unwrap_or_default();
                     space.ensure(serde_json::json!({})).await?;
+                    let judge = knowledge_admin::memory_judge(&config);
                     space
-                        .start_external_evaluation(&args.run, &args.run, &cases)
+                        .start_external_evaluation(&args.run, &args.run, &cases, Some(&judge))
                         .await?;
                     println!(
                         "uploaded {} cases and started run {}",

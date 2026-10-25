@@ -24,6 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub use control::clear_memory_roots_contents;
+pub use detached::extraction_model;
 pub use detached::sample_structured;
 pub use extensions::prune_old_extension_resources;
 pub use prompts::build_consolidation_prompt;

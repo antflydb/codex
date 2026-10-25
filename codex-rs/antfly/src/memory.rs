@@ -129,20 +129,23 @@ impl<'a> MemorySpace<'a> {
     }
 
     /// Submits verdicts for an external evaluation run, attributed to
-    /// `actor`. The judge's model is not declared: the service only accepts
-    /// model metadata for models it qualifies itself.
+    /// `actor`. `judge` must be the run's frozen judge, if it has one.
     pub async fn submit_verdicts(
         &self,
         run: &str,
         verdicts: Vec<Value>,
         actor: &str,
+        judge: Option<&Value>,
     ) -> AntflyResult<Value> {
         let expected_revision = self.revision().await?;
-        let body = json!({
+        let mut body = json!({
             "expected_revision": expected_revision,
             "verdicts": verdicts,
             "actor": actor,
         });
+        if let Some(judge) = judge {
+            body["model"] = judge.clone();
+        }
         let key = format!("verdicts-{run}-{expected_revision}");
         self.call("evaluation_verdict", Some(run), body, Some(&key))
             .await
@@ -155,12 +158,13 @@ impl<'a> MemorySpace<'a> {
     }
 
     /// Uploads labelled `cases` as dataset `dataset` and starts an external
-    /// evaluation run `run` over it.
+    /// evaluation run `run` over it, freezing `judge` as its judge.
     pub async fn start_external_evaluation(
         &self,
         dataset: &str,
         run: &str,
         cases: &[Value],
+        judge: Option<&Value>,
     ) -> AntflyResult<Value> {
         let mut batch: Vec<Value> = Vec::new();
         let mut batch_bytes = 0;
@@ -186,10 +190,19 @@ impl<'a> MemorySpace<'a> {
             }
         }
         let revision = self.revision().await?;
+        let mut start = json!({
+            "id": run,
+            "dataset": dataset,
+            "expected_revision": revision,
+            "mode": "external",
+        });
+        if let Some(judge) = judge {
+            start["judge"] = judge.clone();
+        }
         self.call(
             "start_evaluation",
             None,
-            json!({"id": run, "dataset": dataset, "expected_revision": revision, "mode": "external"}),
+            start,
             Some(&format!("start-{run}")),
         )
         .await
