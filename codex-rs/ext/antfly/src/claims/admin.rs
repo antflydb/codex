@@ -34,6 +34,7 @@ pub use super::concepts::Consolidation;
 pub use super::concepts::GenericScreen;
 pub use super::concepts::MergeVerdict;
 pub use super::concepts::Relations;
+pub use super::memory_eval::EvaluationReport;
 use super::now_ms;
 
 /// Threads [`plan`] examines when no limit is given.
@@ -688,4 +689,179 @@ pub async fn status(antfly: &Antfly) -> anyhow::Result<KnowledgeStatus> {
         merged_concepts: knowledge.merged_concept_count().await?,
         triage: codex_antfly::labels::triage_report(antfly, TRIAGE_THRESHOLDS).await?,
     })
+}
+
+/// Judges the tasks of an external Antfly memory evaluation run with the
+/// extraction model (concept identity, typed relations, four-way
+/// supersession) and submits the verdicts. Unsure answers abstain; failed
+/// model requests are submitted as invalid outputs.
+/// The judge metadata this Codex freezes on the external runs it starts.
+pub fn memory_judge(config: &Config) -> serde_json::Value {
+    super::memory_eval::judge_metadata(&codex_memories_write::extraction_model(config))
+}
+
+pub async fn judge_memory_evaluation(
+    thread_manager: &Arc<ThreadManager>,
+    config: &Config,
+    space: &codex_antfly::memory::MemorySpace<'_>,
+    run: &str,
+) -> anyhow::Result<(EvaluationReport, Vec<serde_json::Value>)> {
+    use super::memory_eval::Task;
+    use super::memory_eval::identity_label;
+    use super::memory_eval::relation_label;
+    const BATCH: usize = 40;
+    let claims = claims(config)?;
+    let model = super::extract_model(config);
+    let judge = memory_judge(config);
+    let frozen = space.evaluation(run).await?["run"]["judge"].clone();
+    if !frozen.is_null() && !super::memory_eval::same_judge(&frozen, &judge) {
+        anyhow::bail!("run {run} froze judge {frozen}, but this Codex judges as {judge}");
+    }
+    let worker = Worker::standalone(Arc::downgrade(thread_manager), usize::MAX, None);
+    let job = Job {
+        thread_id: String::new(),
+        claims,
+        settle: false,
+    };
+    let mut tasks = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = space.evaluation_tasks(run, cursor.as_deref(), 64).await?;
+        tasks.extend(
+            page["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Task::from_json),
+        );
+        match page["next_cursor"].as_str() {
+            Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+            _ => break,
+        }
+    }
+    let mut report = EvaluationReport {
+        tasks: tasks.len(),
+        ..EvaluationReport::default()
+    };
+    let mut verdicts: Vec<serde_json::Value> = Vec::new();
+    let mut record =
+        |report: &mut EvaluationReport, task: &Task, label: Option<&str>, invalid: bool| {
+            if invalid {
+                report.invalid += 1;
+            } else if label.is_some() {
+                report.labelled += 1;
+            } else {
+                report.abstained += 1;
+            }
+            verdicts.push(task.verdict(label, invalid));
+        };
+
+    let identity: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.kind == "identity")
+        .collect();
+    for chunk in identity.chunks(BATCH) {
+        let pairs = chunk
+            .iter()
+            .map(|task| (task.concept("a"), task.concept("b")))
+            .collect();
+        match worker.judge(&job, pairs).await {
+            Ok(judged) => {
+                for (task, verdict) in chunk.iter().zip(judged) {
+                    record(&mut report, task, identity_label(verdict), false);
+                }
+            }
+            Err(err) => {
+                tracing::warn!("antfly: identity judging failed: {err}");
+                for task in chunk {
+                    record(&mut report, task, None, true);
+                }
+            }
+        }
+    }
+
+    // One relation judgment per concept pair answers all its proposed
+    // predicates.
+    let relationship: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.kind == "relationship")
+        .collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for task in &relationship {
+        let pair = (task.concept("a"), task.concept("b"));
+        if !pairs.contains(&pair) {
+            pairs.push(pair);
+        }
+    }
+    let mut relations: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for chunk in pairs.chunks(BATCH) {
+        match worker.relate(&job, chunk.to_vec()).await {
+            Ok(judged) => {
+                relations.extend(chunk.iter().cloned().zip(judged));
+            }
+            Err(err) => tracing::warn!("antfly: relation judging failed: {err}"),
+        }
+    }
+    for task in relationship {
+        let pair = (task.concept("a"), task.concept("b"));
+        match relations.get(&pair) {
+            Some(relation) => {
+                let proposed = task.input["proposed_predicate"]
+                    .as_str()
+                    .unwrap_or_default();
+                record(
+                    &mut report,
+                    task,
+                    Some(relation_label(relation, proposed)),
+                    false,
+                );
+            }
+            None => record(&mut report, task, None, true),
+        }
+    }
+
+    let supersession: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.kind == "supersession")
+        .collect();
+    for chunk in supersession.chunks(BATCH) {
+        let pairs = chunk
+            .iter()
+            .map(|task| {
+                (
+                    task.input["earlier"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    task.input["later"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        match worker.supersede(&job, pairs).await {
+            Ok(judged) => {
+                for (task, verdict) in chunk.iter().zip(judged) {
+                    record(&mut report, task, verdict, false);
+                }
+            }
+            Err(err) => {
+                tracing::warn!("antfly: supersession judging failed: {err}");
+                for task in chunk {
+                    record(&mut report, task, None, true);
+                }
+            }
+        }
+    }
+    report.skipped = report.tasks - verdicts.len();
+    for batch in verdicts.chunks(32) {
+        space
+            .submit_verdicts(
+                run,
+                batch.to_vec(),
+                &format!("codex/judge/{model}"),
+                (!frozen.is_null()).then_some(&judge),
+            )
+            .await?;
+    }
+    Ok((report, verdicts))
 }

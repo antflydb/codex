@@ -23,6 +23,7 @@
 pub mod admin;
 mod concepts;
 mod extract;
+mod memory_eval;
 pub(crate) mod transcript;
 pub(crate) mod triage;
 
@@ -642,6 +643,30 @@ impl Worker {
                 Stop::Failed(err) => err,
             })?;
         concepts::parse_judgments(&answer, count)
+    }
+
+    /// The extraction model's four-way verdict on each (earlier, later)
+    /// claim pair: `supersedes`, `contradicts`, `restates` or
+    /// `independent`; `None` when it is unsure.
+    pub(crate) async fn supersede(
+        &self,
+        job: &Job,
+        pairs: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<Option<&'static str>>> {
+        let count = pairs.len();
+        let answer = self
+            .sample(
+                job,
+                memory_eval::SUPERSESSION_INSTRUCTIONS,
+                &memory_eval::supersession_input(&pairs),
+                memory_eval::supersession_schema(),
+            )
+            .await
+            .map_err(|stop| match stop {
+                Stop::NoHost => anyhow::anyhow!("no loaded thread to attribute the request to"),
+                Stop::Failed(err) => err,
+            })?;
+        memory_eval::parse_supersession(&answer, count)
     }
 
     /// The extraction model's verdict on whether each concept (rendered with

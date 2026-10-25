@@ -16,6 +16,16 @@ use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// The model `sample_structured` sends to: `memories.extract_model`, else
+/// the configured provider's preferred memory extraction model.
+pub fn extraction_model(config: &Config) -> String {
+    config.memories.extract_model.clone().unwrap_or_else(|| {
+        codex_model_provider::create_model_provider(config.model_provider.clone(), None)
+            .memory_extraction_preferred_model()
+            .to_string()
+    })
+}
+
 /// Sends `input` with `instructions` to the configured memory extraction
 /// model (`memories.extract_model`, else the provider's preferred one) and
 /// returns the text of a response constrained to `output_schema`.

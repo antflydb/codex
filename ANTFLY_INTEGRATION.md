@@ -164,7 +164,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `ddba6584b3` (C ABI version 3, `zig build capi`); CLI binaries and `codex-core` test
+  Antfly main at `730999bf2d` (C ABI version 3, `zig build capi`; main needs Zig 0.17); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +172,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `ddba6584b3` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `730999bf2d` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -515,7 +515,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `ddba6584b3`, which includes
+against Antfly 1258e8cfcb; the pin is now `730999bf2d`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -1420,6 +1420,81 @@ through `knowledge.search`.
 - **Privacy (remote).** Transcripts contain code and tool output that may
   include secrets. Decide what is mirrored, redact or truncate tool output,
   and keep the API key in an environment variable.
+
+## Antfly memory service (first steps)
+
+Antfly's native memory service (`/memory/v1`, merged in antflydb/antfly#1258) is
+the intended home for claims, identity policy, descriptions, relations, history
+episodes and recall. Codex has a client for it and has measured its judges
+through it; claims are not migrated yet.
+
+**Client.** `codex_antfly::memory::MemorySpace` runs memory actions in process
+on Lite (`Backend::memory` → `antfly_db_memory_json`) or over HTTP on a server.
+
+**External judging.** `codex knowledge memory-eval --space S --run R
+[--corpus FILE] [--url URL] [--save FILE]` has the extraction model judge an
+external evaluation run and submits the verdicts:
+- identity uses the merge judge (sure `same`/`different`; unsure abstains);
+- relations use the relation judge, one answer per pair for all proposed
+  predicates;
+- supersession uses a new four-way judge (`supersedes`, `contradicts`,
+  `restates`, `independent`).
+
+Runs it starts freeze an external judge, `{provider: "codex", model, revision}`:
+the model is the one judge requests go to (`memories.extract_model`, else the
+provider's preferred extraction model) and the revision digests the three judge
+prompts, so a prompt change starts a new cohort. Every verdict batch repeats
+it, and judging a run frozen with another judge is refused.
+
+With `--corpus` (written by Antfly's `scripts/bench/memory_judges.py
+--prepare-only`) it creates the space, uploads the cases and starts the run
+itself. On Lite, against the 248-case Codex corpus:
+
+| Task | Cases | Precision | Recall | Notes |
+| --- | --- | --- | --- | --- |
+| Identity, names only | 30 | 1.00 | 0.71 | Misses include spelling twins ("memory pipeline"/"memories pipeline") that Codex merges lexically before judging |
+| Identity, with descriptions | 64 | 0.93 | 0.72 | 4 more are unsure (proposals) |
+| Relations | 141 | 0.88 | 0.85 | |
+| Supersession (binary labels) | 13 | 0.83 | 0.71 | Stable over two runs, 1 unsure |
+
+The first supersession prompt let `restates` absorb updates that repeat a
+claim with new detail (recall 0.57); the prompt now counts any new or changed
+detail as `supersedes`.
+
+**Subjects for claims.** Supersession candidates must share a canonical
+subject. Codex claims are free text, so the first mapping tried is subject =
+project, predicate = `states`, value = the statement. Shadow-writing the 26
+fixture claims this way on Lite:
+- all 26 stay active (no implicit supersession under one subject/predicate);
+- with lexical discovery, all 7 replaced claims appear in their replacement's
+  top-10 candidates (five at rank 1, one at 4, one at 8). Four of the six
+  non-replacing pairs also appear; candidates are not verdicts, so the judge
+  decides.
+
+**On a server.** At `730999bf2d` the same run works over HTTP
+(`--url`, API key; antflydb/antfly#1287 fixed): 248 tasks, 244 labelled, 4
+abstained, judge `gpt-5.6-luna`.
+
+| Task | Cases | Precision | Recall |
+| --- | --- | --- | --- |
+| Identity | 94 | 0.96 | 0.75 (4 unsure) |
+| Relations | 141 | 0.92 | 0.85 |
+| Supersession | 13 | 0.75 | 0.86 |
+
+**Semantic candidates.** With `features.semantic_recall` and
+`models.embedder = {provider: "antfly", model: "google/embeddinggemma-2",
+revision: "current", dimensions: 768}` (`dimensions` is required; the
+revision is pinned at admission), the same 26 claims on Lite:
+
+| Mode | Replaced claim found | Ranks | Non-replacing pairs surfaced |
+| --- | --- | --- | --- |
+| lexical | 7/7 | 1, 1, 1, 4, 1, 8, 1 | 4/6 |
+| semantic | 7/7 | 1, 2, 1, 3, 1, 7, 1 | 2/6 |
+| union_search | 7/7 | 1, 2, 1, 3, 1, 7, 1 | 4/6 |
+
+Semantic keeps full recall with half the non-replacing candidates, so it is
+the mode to judge from. Lite still needs the memory `advance` action to make
+candidates ready.
 
 ## Durable sessions across processes
 

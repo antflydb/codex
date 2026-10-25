@@ -910,6 +910,18 @@ impl Backend for EmbeddedBackend {
         })
     }
 
+    fn memory(&self, space: String, request: Value) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async move {
+            let bytes = serde_json::to_vec(&request)?;
+            let raw = self
+                .call(move |db| {
+                    retry_busy(|| db.memory_json(&space, &bytes)).map_err(embedded("memory"))
+                })
+                .await?;
+            Ok(Some(serde_json::from_slice(&raw)?))
+        })
+    }
+
     fn propose_curation(
         &self,
         entity_table: String,

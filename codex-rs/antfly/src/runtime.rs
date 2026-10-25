@@ -301,6 +301,14 @@ impl Antfly {
             .await
     }
 
+    /// See [`crate::Backend::memory`].
+    pub async fn memory(&self, space: &str, request: Value) -> AntflyResult<Option<Value>> {
+        self.backend()
+            .await?
+            .memory(space.to_string(), request)
+            .await
+    }
+
     /// See [`crate::Backend::propose_curation`].
     pub async fn propose_curation(
         &self,

@@ -24,6 +24,7 @@ codex-secrets = { workspace = true }
 codex-tools = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["v4"] }
 tracing = { workspace = true }

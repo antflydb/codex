@@ -1105,6 +1105,18 @@ fn concepts_are_described_from_their_claims() -> Result<(), Box<dyn std::error::
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let key = key.ok_or("no concept with claims about it")?;
+        // Let extraction finish, so the second pass sees no new concepts.
+        let mut seen = 0;
+        let mut stable = 0;
+        for _ in 0..300 {
+            let count = knowledge.concepts().await?.len();
+            stable = if count == seen { stable + 1 } else { 0 };
+            seen = count;
+            if stable == 10 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
 
         let report = knowledge.describe_concepts(50).await?;
         assert!(report.described >= 1, "{report:?}");

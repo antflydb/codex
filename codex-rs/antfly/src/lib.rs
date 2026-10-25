@@ -15,6 +15,7 @@ pub mod history;
 pub mod keys;
 pub mod knowledge;
 pub mod labels;
+pub mod memory;
 mod remote;
 mod runtime;
 pub mod schema;

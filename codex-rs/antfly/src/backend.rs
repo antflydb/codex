@@ -1,5 +1,6 @@
 use futures::future::BoxFuture;
 use serde_json::Value;
+use serde_json::json;
 
 use crate::error::AntflyResult;
 
@@ -128,6 +129,13 @@ pub trait Backend: Send + Sync {
         _key: String,
         _request: Value,
     ) -> BackendFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Runs one native memory operation on `space`: `{"action", "id"?,
+    /// "body", "idempotency_key"?}` (Antfly's `/memory/v1` contract). `None`
+    /// when the backend has no in-process memory service.
+    fn memory(&self, _space: String, _request: Value) -> BackendFuture<'_, Option<Value>> {
         Box::pin(async { Ok(None) })
     }
 
@@ -275,4 +283,20 @@ pub(crate) fn parse_search_hits(body: &Value) -> Vec<SearchHit> {
         }
     }
     hits
+}
+
+/// How long a curation write waits for Antfly to apply it. Without a wait
+/// both the server and Lite accept before applying, and an immediate read
+/// (the CLI's next command, consolidation's next pair) would not see it. A
+/// write still pending after the wait is durable and applies later.
+pub(crate) const CURATION_WAIT_MS: u64 = 10_000;
+
+/// Adds the curation wait to `body` unless it sets one.
+pub(crate) fn with_wait(mut body: Value) -> Value {
+    if let Some(fields) = body.as_object_mut() {
+        fields
+            .entry("wait")
+            .or_insert_with(|| json!({"timeout_ms": CURATION_WAIT_MS}));
+    }
+    body
 }
