@@ -608,7 +608,10 @@ impl Worker {
             }
         }
         if job.settle {
-            knowledge.settle_thread(&job.thread_id).await?;
+            let judge = SettleJudge { worker: self, job };
+            knowledge
+                .settle_thread(&job.thread_id, Some(&judge))
+                .await?;
             claim_progress::settle(antfly, &job.thread_id, &self.owner, next).await?;
             self.consolidate_if_due(job).await;
         }
@@ -810,6 +813,29 @@ fn extract_model(config: &Config) -> String {
         .extract_model
         .clone()
         .unwrap_or_else(|| "provider_default".to_string())
+}
+
+/// Cross-thread supersession at settle time: the extraction model's
+/// four-way verdict.
+struct SettleJudge<'a> {
+    worker: &'a Worker,
+    job: &'a Job,
+}
+
+impl codex_antfly::knowledge::SupersessionJudge for SettleJudge<'_> {
+    fn judge<'a>(
+        &'a self,
+        pairs: &'a [(String, String)],
+    ) -> codex_antfly::BackendFuture<'a, Vec<Option<bool>>> {
+        Box::pin(async move {
+            let verdicts = self
+                .worker
+                .supersede(self.job, pairs.to_vec())
+                .await
+                .map_err(|err| codex_antfly::AntflyError::Remote(err.to_string()))?;
+            Ok(verdicts.into_iter().map(memory_eval::replaces).collect())
+        })
+    }
 }
 
 /// What one extraction request covered and found, per turn: the label for

@@ -4555,7 +4555,7 @@
               "type": "boolean"
             },
             "claim_memory": {
-              "description": "Mirror settled claims into Antfly's memory service and log its supersession candidates next to Codex's own decisions: `off` or `shadow` (the default). See `codex knowledge status`.",
+              "description": "Mirror settled claims into Antfly's memory service: `enforce` (the default) judges its supersession candidates when a thread settles, `shadow` keeps Codex's text search and only logs them, `off` skips the service. See `codex knowledge memory-shadow`.",
               "type": "string"
             },
             "claim_settle_minutes": {

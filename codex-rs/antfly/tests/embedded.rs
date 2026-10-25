@@ -43,6 +43,18 @@ fn runtime() -> TestRuntime {
     }
 }
 
+/// A supersession judge that replaces every candidate.
+struct AlwaysSupersedes;
+
+impl codex_antfly::knowledge::SupersessionJudge for AlwaysSupersedes {
+    fn judge<'a>(
+        &'a self,
+        pairs: &'a [(String, String)],
+    ) -> codex_antfly::BackendFuture<'a, Vec<Option<bool>>> {
+        Box::pin(async move { Ok(vec![Some(true); pairs.len()]) })
+    }
+}
+
 fn open(dir: &tempfile::TempDir, embedder: bool) -> Antfly {
     let mut config = AntflyConfig::embedded(dir.path().join("codex.aflite"));
     if !embedder {
@@ -334,7 +346,7 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
                 ],
             ))
             .await?;
-        knowledge.settle_thread("thread-a").await?;
+        knowledge.settle_thread("thread-a", None).await?;
         let a_decision = format!("turns:thread-a:{}:000", codex_antfly::keys::ordinal(0));
         // Supersession compares against claims that are already searchable;
         // indexing is asynchronous, so wait for thread A's decision to land.
@@ -361,7 +373,9 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
         // A provisional claim never supersedes another thread's claim.
         assert!(later[0].supersedes.is_empty());
         assert!(!later[0].settled);
-        knowledge.settle_thread("thread-b").await?;
+        // The memory service proposes thread A's decision; the judge (here
+        // one that always agrees) decides.
+        knowledge.settle_thread("thread-b", Some(&AlwaysSupersedes)).await?;
         let b_decision = later[0].id.clone();
         let later = knowledge
             .get(&b_decision)
@@ -630,7 +644,7 @@ fn turn_claims_replace_retract_and_track_progress() -> Result<(), Box<dyn std::e
         );
         assert_eq!(status(&first[1].id), Some((ClaimStatus::Retracted, None)));
         assert_eq!(status(&second[0].id), Some((ClaimStatus::Current, None)));
-        assert_eq!(knowledge.settle_thread("thread-a").await?, 3);
+        assert_eq!(knowledge.settle_thread("thread-a", None).await?, 3);
         assert!(
             knowledge
                 .thread_claims("thread-a")
@@ -1110,14 +1124,20 @@ fn claim_memory_shadow_uses_semantic_candidates() -> Result<(), Box<dyn std::err
                 "Run the test suite on every pull request in CI.",
             ))
             .await?;
-        knowledge.settle_thread("thread-a").await?;
+        knowledge.settle_thread("thread-a", None).await?;
         let later = knowledge
             .append_turn_claims(batch(
                 "thread-b",
                 "Continuous integration now checks each PR with the full tests plus clippy.",
             ))
             .await?;
-        knowledge.settle_thread("thread-b").await?;
+        knowledge.settle_thread("thread-b", None).await?;
+        // Without a judge, a different statement never supersedes.
+        let kept = knowledge
+            .get(&earlier[0].id)
+            .await?
+            .ok_or("earlier claim missing")?;
+        assert_eq!(kept.status, codex_antfly::knowledge::ClaimStatus::Current);
         let shadow = codex_antfly::labels::latest_responses(
             &antfly,
             codex_antfly::claim_memory::SHADOW_KIND,

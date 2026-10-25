@@ -1,15 +1,17 @@
-//! Shadow mirror of settled claims in Antfly's memory service.
+//! Codex's claims in Antfly's memory service.
 //!
 //! When a thread settles, its claims (all but retracted ones) are observed as
-//! settled assertions in the [`SPACE`] memory space: subject from the claim's
-//! working directory, the claim's kind, one evidence record per claim. For
-//! each of the thread's current claims, the space's supersession candidates
-//! are then logged to `codex_decision_log` (kind [`SHADOW_KIND`]) next to the
-//! candidates Codex searched and the claims it decided to supersede. Codex's
-//! supersession links are not written to the space, so its candidates are its
-//! own. [`report`] compares the two before claims move to the service.
+//! settled assertions in the [`SPACE`] memory space: the claim id as the
+//! assertion id, subject from the claim's working directory, the claim's
+//! kind, one evidence record per claim. Codex's supersession links are not
+//! written, so the space proposes candidates on its own.
+//!
+//! With `claim_memory = "enforce"` (the default) those candidates are what
+//! settling judges for cross-thread supersession; with `"shadow"` Codex keeps
+//! its own text search and the space's candidates are only logged. Either way
+//! each current claim's comparison goes to `codex_decision_log` (kind
+//! [`SHADOW_KIND`]), and [`report`] summarizes them.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -23,15 +25,15 @@ use crate::knowledge::Claim;
 use crate::knowledge::ClaimStatus;
 use crate::memory::MemorySpace;
 
-/// The memory space that mirrors Codex's claims.
+/// The memory space that holds Codex's claims.
 pub const SPACE: &str = "codex_claims";
-/// `codex_decision_log` kind of a shadow comparison; its subject is the
+/// `codex_decision_log` kind of a candidate comparison; its subject is the
 /// Codex claim id.
 pub const SHADOW_KIND: &str = "memory_supersession";
 const CANDIDATES: usize = 10;
 /// Observations per request (the service accepts up to 128).
 const OBSERVE_BATCH: usize = 32;
-/// Polls for candidate readiness before logging what is there.
+/// Polls for candidate readiness before using what is there.
 const READY_POLLS: usize = 50;
 const READY_POLL_DELAY: Duration = Duration::from_millis(200);
 /// Maintenance steps per poll on Lite, which runs memory work only when
@@ -41,11 +43,6 @@ const ADVANCE_STEPS: usize = 20;
 /// an explicit dimension (antflydb/antfly#1295); other embedders get
 /// semantic candidates only with `embedder_dims` set.
 const DEFAULT_EMBEDDER_DIMS: u32 = 768;
-
-/// The assertion id of Codex claim `claim_id`.
-pub fn memory_id(claim_id: &str) -> String {
-    format!("claim-{:016x}", crate::knowledge::fnv1a(claim_id))
-}
 
 fn subject(cwd: Option<&str>) -> String {
     match cwd
@@ -84,65 +81,69 @@ fn space_config(antfly: &Antfly) -> (Value, &'static str) {
     }
 }
 
-/// What Codex decided for one current claim when its thread settled.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Decision {
-    pub claim_id: String,
-    pub statement: String,
-    /// Claims Codex compared it with, most similar first.
-    pub candidates: Vec<String>,
-    /// Claims it supersedes, from its own thread and from others.
-    pub supersedes: Vec<String>,
+/// The claim space, created on first use.
+pub(crate) struct ClaimSpace<'a> {
+    antfly: &'a Antfly,
+    space: MemorySpace<'a>,
+    mode: &'static str,
+    embedded: bool,
 }
 
-/// Mirrors `claims` and logs the space's candidates for `decisions`.
-/// Failures are logged, never returned: this is a shadow.
-pub(crate) async fn shadow_settle(antfly: &Antfly, claims: &[Claim], decisions: &[Decision]) {
-    if let Err(err) = settle(antfly, claims, decisions).await {
-        tracing::warn!("antfly: claim memory shadow failed: {err}");
+/// A claim's supersession candidates from the space.
+#[derive(Clone, Debug)]
+pub(crate) struct Candidates {
+    pub mode: &'static str,
+    pub retrieval: Value,
+    pub semantic_discovery: Value,
+    /// Claim ids, best first.
+    pub ids: Vec<String>,
+}
+
+impl<'a> ClaimSpace<'a> {
+    pub(crate) async fn open(antfly: &'a Antfly) -> AntflyResult<Self> {
+        let space = antfly.memory_space(SPACE)?;
+        let (config, mode) = space_config(antfly);
+        space.ensure(config).await?;
+        Ok(Self {
+            antfly,
+            space,
+            mode,
+            embedded: matches!(antfly.config().backend, BackendConfig::Embedded { .. }),
+        })
     }
-}
 
-/// Observes `claims` (all but retracted ones) in the space, creating it
-/// first if needed. Returns how many were observed.
-pub(crate) async fn mirror(antfly: &Antfly, claims: &[Claim]) -> AntflyResult<usize> {
-    let space = antfly.memory_space(SPACE)?;
-    space.ensure(space_config(antfly).0).await?;
-    let observed: Vec<&Claim> = claims
-        .iter()
-        .filter(|claim| claim.status != ClaimStatus::Retracted)
-        .collect();
-    for chunk in observed.chunks(OBSERVE_BATCH) {
-        observe(&space, chunk).await?;
-    }
-    Ok(observed.len())
-}
-
-async fn settle(antfly: &Antfly, claims: &[Claim], decisions: &[Decision]) -> AntflyResult<()> {
-    mirror(antfly, claims).await?;
-    let space = antfly.memory_space(SPACE)?;
-    let mode = space_config(antfly).1;
-    let embedded = matches!(antfly.config().backend, BackendConfig::Embedded { .. });
-    // Codex ids by assertion id, for the claims this comparison can name.
-    let mut known: BTreeMap<String, String> = BTreeMap::new();
-    for id in claims.iter().map(|claim| &claim.id).chain(
-        decisions
+    /// Observes `claims` (all but retracted ones). Returns how many.
+    pub(crate) async fn mirror(&self, claims: &[Claim]) -> AntflyResult<usize> {
+        let observed: Vec<&Claim> = claims
             .iter()
-            .flat_map(|decision| decision.candidates.iter().chain(&decision.supersedes)),
-    ) {
-        known.insert(memory_id(id), id.clone());
-    }
-    for decision in decisions {
-        let page = candidates(&space, &memory_id(&decision.claim_id), mode, embedded).await?;
-        let found: Vec<String> = candidate_ids(&page)
-            .into_iter()
-            .map(|id| known.get(&id).cloned().unwrap_or(id))
+            .filter(|claim| claim.status != ClaimStatus::Retracted)
             .collect();
+        for chunk in observed.chunks(OBSERVE_BATCH) {
+            observe(&self.space, chunk).await?;
+        }
+        Ok(observed.len())
+    }
+
+    /// The space's supersession candidates for claim `id`, once its indexes
+    /// have caught up (or after [`READY_POLLS`]).
+    pub(crate) async fn candidates(&self, id: &str) -> AntflyResult<Candidates> {
+        let page = candidates(&self.space, id, self.mode, self.embedded).await?;
+        Ok(Candidates {
+            mode: self.mode,
+            retrieval: page["retrieval"].clone(),
+            semantic_discovery: page["semantic_discovery"].clone(),
+            ids: candidate_ids(&page),
+        })
+    }
+
+    /// Logs one claim's comparison: the space's candidates, the candidates
+    /// Codex judged, and the claims it superseded.
+    pub(crate) async fn record(&self, decision: &Decision, found: &Candidates) -> AntflyResult<()> {
         let response = json!({
-            "mode": mode,
-            "retrieval": page["retrieval"],
-            "semantic_discovery": page["semantic_discovery"],
-            "memory_candidates": found,
+            "mode": found.mode,
+            "retrieval": found.retrieval,
+            "semantic_discovery": found.semantic_discovery,
+            "memory_candidates": found.ids,
             "codex_candidates": decision.candidates,
             "codex_supersedes": decision.supersedes,
         });
@@ -150,13 +151,13 @@ async fn settle(antfly: &Antfly, claims: &[Claim], decisions: &[Decision]) -> An
             decision
                 .supersedes
                 .iter()
-                .all(|earlier| found.contains(earlier))
+                .all(|earlier| found.ids.contains(earlier))
         });
         crate::labels::record_decision(
-            antfly,
+            self.antfly,
             crate::labels::DecisionRecord {
                 kind: SHADOW_KIND,
-                model: mode,
+                model: found.mode,
                 subject: Some(decision.claim_id.clone()),
                 input: &decision.statement,
                 response: &response,
@@ -165,25 +166,34 @@ async fn settle(antfly: &Antfly, claims: &[Claim], decisions: &[Decision]) -> An
                 threshold_bp: None,
             },
         )
-        .await?;
+        .await
     }
-    Ok(())
+}
+
+/// What Codex decided for one current claim when its thread settled.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Decision {
+    pub claim_id: String,
+    pub statement: String,
+    /// Claims it was judged against, most similar first.
+    pub candidates: Vec<String>,
+    /// Claims it supersedes, from its own thread and from others.
+    pub supersedes: Vec<String>,
 }
 
 async fn observe(space: &MemorySpace<'_>, claims: &[&Claim]) -> AntflyResult<()> {
     let mut evidence = Vec::with_capacity(claims.len());
     let mut assertions = Vec::with_capacity(claims.len());
     for claim in claims {
-        let id = memory_id(&claim.id);
-        let evidence_id = format!("e-{id}");
+        let evidence_id = format!("evidence:{}", claim.id);
         evidence.push(json!({
             "id": evidence_id,
             "text": claim.statement,
             "source_id": claim.thread_id,
-            "source_version": id,
+            "source_version": claim.id,
         }));
         assertions.push(json!({
-            "id": id,
+            "id": claim.id,
             "subject": subject(claim.cwd.as_deref()),
             "predicate": "states",
             "value": claim.statement,

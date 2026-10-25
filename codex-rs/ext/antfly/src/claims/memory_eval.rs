@@ -112,6 +112,16 @@ pub(crate) fn judge_metadata(model: &str) -> Value {
     json!({"provider": "codex", "model": model, "revision": format!("prompts-{}", &digest[..16])})
 }
 
+/// Whether a four-way verdict replaces the earlier claim: an update or a
+/// restatement does; a contradiction or an unrelated claim keeps both.
+pub(crate) fn replaces(verdict: Option<&str>) -> Option<bool> {
+    match verdict? {
+        "supersedes" | "restates" => Some(true),
+        "contradicts" | "independent" => Some(false),
+        _ => None,
+    }
+}
+
 /// One judge task of an evaluation run.
 #[derive(Clone, Debug)]
 pub(crate) struct Task {
@@ -214,6 +224,15 @@ mod tests {
         frozen["dimensions"] = Value::Null;
         assert!(same_judge(&frozen, &judge));
         assert!(!same_judge(&judge_metadata("gpt-5"), &judge));
+    }
+
+    #[test]
+    fn updates_and_restatements_replace() {
+        assert_eq!(replaces(Some("supersedes")), Some(true));
+        assert_eq!(replaces(Some("restates")), Some(true));
+        assert_eq!(replaces(Some("contradicts")), Some(false));
+        assert_eq!(replaces(Some("independent")), Some(false));
+        assert_eq!(replaces(None), None);
     }
 
     #[test]

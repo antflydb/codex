@@ -96,6 +96,8 @@ const QUERY_EXTRACT_MAX_BYTES: usize = 600;
 /// Laya rejects over-long inputs; keep each statement well inside them.
 const DECIDE_STATEMENT_MAX_CHARS: usize = 600;
 const SUPERSEDE_CANDIDATES: usize = 3;
+/// Claim pairs per supersession judge request.
+const JUDGE_BATCH: usize = 40;
 /// Claims about a concept given to the generator that describes it.
 const DESCRIBE_EVIDENCE: usize = 8;
 /// Excerpts from memory notes added to a concept's evidence when claims
@@ -550,6 +552,16 @@ impl Claim {
     }
 }
 
+/// Decides cross-thread supersession when a thread settles.
+pub trait SupersessionJudge: Send + Sync {
+    /// One verdict per (earlier, later) statement pair: `Some(true)` when
+    /// the later claim should replace the earlier one, `None` when unsure.
+    fn judge<'a>(
+        &'a self,
+        pairs: &'a [(String, String)],
+    ) -> crate::BackendFuture<'a, Vec<Option<bool>>>;
+}
+
 /// A claim found by [`Knowledge::related`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RelatedClaim {
@@ -848,11 +860,18 @@ impl Knowledge<'_> {
         Ok(records)
     }
 
-    /// Settles `thread_id`'s provisional claims: each current one is checked
+    /// Settles `thread_id`'s provisional claims: each current one is judged
     /// against similar settled claims from other threads, which it may
-    /// supersede, and then marked settled. Supersession failures are logged
-    /// and never fail settling. Returns the number of claims settled.
-    pub async fn settle_thread(&self, thread_id: &str) -> AntflyResult<usize> {
+    /// supersede, and then marked settled. Candidates come from the memory
+    /// service (`claim_memory = "enforce"`) or Codex's own text search, and
+    /// `judge` decides; without one, only identical statements supersede.
+    /// Supersession failures are logged and never fail settling. Returns the
+    /// number of claims settled.
+    pub async fn settle_thread(
+        &self,
+        thread_id: &str,
+        judge: Option<&dyn SupersessionJudge>,
+    ) -> AntflyResult<usize> {
         let documents = self.antfly.documents(schema::KNOWLEDGE);
         let pending: Vec<Claim> = self
             .thread_claims(thread_id)
@@ -863,47 +882,124 @@ impl Knowledge<'_> {
         if pending.is_empty() {
             return Ok(0);
         }
-        let mut superseded: BTreeMap<String, String> = BTreeMap::new();
-        let mut writes = Vec::with_capacity(pending.len());
-        let mut settled = Vec::with_capacity(pending.len());
-        let mut decisions = Vec::new();
-        for mut claim in pending.iter().cloned() {
-            if claim.status == ClaimStatus::Current {
-                let mut considered = Vec::new();
-                match self
+        let mode = self.config.claim_memory;
+        let space = match mode {
+            crate::TriageMode::Off => None,
+            _ => match crate::claim_memory::ClaimSpace::open(self.antfly).await {
+                Ok(space) => match space.mirror(&pending).await {
+                    Ok(_) => Some(space),
+                    Err(err) => {
+                        tracing::warn!("antfly: claim memory observation failed: {err}");
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!("antfly: claim memory space unavailable: {err}");
+                    None
+                }
+            },
+        };
+
+        // Candidates for each current claim, and the space's own proposals.
+        let mut plans: Vec<(&Claim, Vec<Claim>, Option<crate::claim_memory::Candidates>)> =
+            Vec::new();
+        for claim in pending
+            .iter()
+            .filter(|claim| claim.status == ClaimStatus::Current)
+        {
+            let found = match &space {
+                Some(space) => match space.candidates(&claim.id).await {
+                    Ok(found) => Some(found),
+                    Err(err) => {
+                        tracing::warn!("antfly: claim memory candidates failed: {err}");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let candidates = match (&found, mode) {
+                (Some(found), crate::TriageMode::Enforce) => {
+                    self.settled_elsewhere(thread_id, &found.ids).await
+                }
+                _ => self
                     .supersede_candidates(thread_id, claim.kind, &claim.statement)
                     .await
-                {
-                    Ok(candidates) => {
-                        considered = candidates.iter().map(|c| c.id.clone()).collect();
-                        for earlier in candidates {
-                            if superseded.contains_key(&earlier.id) {
-                                continue;
-                            }
-                            match self.supersedes(&earlier.statement, &claim.statement).await {
-                                Ok(true) => {
-                                    superseded.insert(earlier.id.clone(), claim.id.clone());
-                                    claim.supersedes.push(earlier.id);
-                                }
-                                Ok(false) => {}
-                                Err(err) => {
-                                    tracing::warn!("antfly: supersession check failed: {err}")
-                                }
-                            }
+                    .unwrap_or_else(|err| {
+                        tracing::warn!("antfly: supersession search failed: {err}");
+                        Vec::new()
+                    }),
+            };
+            plans.push((claim, candidates, found));
+        }
+
+        // One verdict per (earlier, later) pair. Identical statements need no
+        // model; without a judge nothing else supersedes.
+        let pairs: Vec<(String, String)> = plans
+            .iter()
+            .flat_map(|(claim, candidates, _)| {
+                candidates
+                    .iter()
+                    .map(|earlier| (earlier.statement.clone(), claim.statement.clone()))
+            })
+            .collect();
+        let mut verdicts: Vec<Option<bool>> = pairs
+            .iter()
+            .map(|(earlier, later)| (normalized(earlier) == normalized(later)).then_some(true))
+            .collect();
+        if let Some(judge) = judge {
+            let open: Vec<usize> = (0..pairs.len())
+                .filter(|&i| verdicts[i].is_none())
+                .collect();
+            for chunk in open.chunks(JUDGE_BATCH) {
+                let batch: Vec<(String, String)> =
+                    chunk.iter().map(|&i| pairs[i].clone()).collect();
+                match judge.judge(&batch).await {
+                    Ok(judged) => {
+                        for (&i, verdict) in chunk.iter().zip(judged) {
+                            verdicts[i] = verdict;
                         }
                     }
-                    Err(err) => tracing::warn!("antfly: supersession search failed: {err}"),
+                    Err(err) => tracing::warn!("antfly: supersession judging failed: {err}"),
                 }
-                decisions.push(crate::claim_memory::Decision {
-                    claim_id: claim.id.clone(),
-                    statement: claim.statement.clone(),
-                    candidates: considered,
-                    supersedes: claim.supersedes.clone(),
-                });
+            }
+        }
+
+        let mut superseded: BTreeMap<String, String> = BTreeMap::new();
+        let mut supersedes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut verdict = verdicts.into_iter();
+        let mut decisions = Vec::new();
+        for (claim, candidates, found) in &plans {
+            for earlier in candidates {
+                if verdict.next().flatten() == Some(true) && !superseded.contains_key(&earlier.id) {
+                    superseded.insert(earlier.id.clone(), claim.id.clone());
+                    supersedes
+                        .entry(claim.id.clone())
+                        .or_default()
+                        .push(earlier.id.clone());
+                }
+            }
+            if let Some(found) = found {
+                let mut all = claim.supersedes.clone();
+                all.extend(supersedes.get(&claim.id).into_iter().flatten().cloned());
+                decisions.push((
+                    crate::claim_memory::Decision {
+                        claim_id: claim.id.clone(),
+                        statement: claim.statement.clone(),
+                        candidates: candidates.iter().map(|c| c.id.clone()).collect(),
+                        supersedes: all,
+                    },
+                    found.clone(),
+                ));
+            }
+        }
+
+        let mut writes = Vec::with_capacity(pending.len());
+        for mut claim in pending.iter().cloned() {
+            if let Some(ids) = supersedes.remove(&claim.id) {
+                claim.supersedes.extend(ids);
             }
             claim.settled = true;
             writes.push(Write::put(claim.id.clone(), claim.to_doc()?));
-            settled.push(claim);
         }
         {
             let _guard = self.antfly.lock().await;
@@ -920,10 +1016,37 @@ impl Knowledge<'_> {
             }
             documents.write(writes).await?;
         }
-        if self.config.claim_memory == crate::TriageMode::Shadow {
-            crate::claim_memory::shadow_settle(self.antfly, &settled, &decisions).await;
+        if let Some(space) = &space {
+            for (decision, found) in &decisions {
+                if let Err(err) = space.record(decision, found).await {
+                    tracing::debug!("failed to record claim memory comparison: {err}");
+                }
+            }
         }
         Ok(pending.len())
+    }
+
+    /// The current, settled claims among `ids` from threads other than
+    /// `thread_id`, in order, at most [`SUPERSEDE_CANDIDATES`].
+    async fn settled_elsewhere(&self, thread_id: &str, ids: &[String]) -> Vec<Claim> {
+        let mut claims = Vec::new();
+        for id in ids {
+            if claims.len() == SUPERSEDE_CANDIDATES {
+                break;
+            }
+            match self.get(id).await {
+                Ok(Some(claim))
+                    if claim.thread_id != thread_id
+                        && claim.settled
+                        && claim.status == ClaimStatus::Current =>
+                {
+                    claims.push(claim);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("antfly: candidate claim {id} unreadable: {err}"),
+            }
+        }
+        claims
     }
 
     /// Observes every settled claim in the memory service's claim space (see
@@ -943,7 +1066,10 @@ impl Knowledge<'_> {
             .filter_map(|document| Claim::from_doc(&document.key, document.doc))
             .filter(|claim| claim.settled)
             .collect();
-        crate::claim_memory::mirror(self.antfly, &claims).await
+        crate::claim_memory::ClaimSpace::open(self.antfly)
+            .await?
+            .mirror(&claims)
+            .await
     }
 
     /// Deletes every claim distilled from `thread_id`.

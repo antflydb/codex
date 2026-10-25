@@ -1496,23 +1496,34 @@ Semantic keeps full recall with half the non-replacing candidates, so it is
 the mode to judge from. Lite still needs the memory `advance` action to make
 candidates ready.
 
-**Claim memory shadow.** `claim_memory = "shadow"` (the default; `"off"`
-disables it) mirrors claims into the `codex_claims` memory space as threads
-settle, and logs the space's supersession candidates next to Codex's own:
-- each settled, non-retracted claim becomes a `settled` assertion: subject
-  `cwd:<working directory>`, predicate `states`, the claim's kind (the memory
-  service's kinds match Codex's), one evidence record; ids hash the claim id;
+**Claims in the memory service.** `claim_memory` mirrors claims into the
+`codex_claims` memory space as threads settle:
+- each settled, non-retracted claim becomes a `settled` assertion with the
+  claim id as its id: subject `cwd:<working directory>`, predicate `states`,
+  the claim's kind (the memory service's kinds match Codex's), one evidence
+  record;
 - Codex's `supersedes` links are not written, so the service proposes
   candidates on its own;
-- for each current claim, the candidates (10, semantic when the embedder's
-  dimension is known, else lexical) go to `codex_decision_log` as
-  `memory_supersession`, with the candidates Codex searched and the claims
-  it superseded. On Lite, Codex calls the memory `advance` action until the
-  candidates are indexed (bounded);
 - the default embedder's dimension (768) is filled in until the service
   detects it (antflydb/antfly#1295); other embedders need `embedder_dims`;
-- failures are logged and never fail settling.
+  without it candidates are lexical. On Lite, Codex calls the memory
+  `advance` action until candidates are indexed (bounded).
 
+Cross-thread supersession at settle time (October 25, after the first real
+run below):
+- `enforce` (the default): each current claim's candidates are the service's
+  top proposals that are settled, current claims from other threads (at most
+  three);
+- `shadow`: Codex's own full-text search, with the service's candidates only
+  logged; `off`: no memory service;
+- the extraction model's four-way supersession judge decides (`supersedes` and
+  `restates` replace, `contradicts` and `independent` keep both, unsure keeps
+  both), 40 pairs per request. Identical statements supersede without a
+  model. The local decide model no longer supersedes: on real data all of its
+  cross-thread supersessions were unrelated pairs. Without a judge (settling
+  outside the claims worker) only identical statements supersede.
+
+Each comparison is logged to `codex_decision_log` (`memory_supersession`).
 `codex knowledge status` reports the comparison (claims compared, Codex
 supersessions found among the service's candidates, candidate overlap), and
 `codex knowledge memory-mirror` observes claims that settled before the
