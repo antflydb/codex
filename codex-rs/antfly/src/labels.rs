@@ -78,6 +78,32 @@ pub async fn latest_results(
         .collect())
 }
 
+/// The latest response per subject for `kind`.
+pub async fn latest_responses(
+    antfly: &Antfly,
+    kind: &str,
+) -> AntflyResult<std::collections::BTreeMap<String, Value>> {
+    let sql = antfly.sql().await?;
+    let mut latest = std::collections::BTreeMap::new();
+    // Ascending, so later rows replace earlier ones.
+    for row in sql
+        .fetch_all(
+            "SELECT subject, response FROM codex_decision_log \
+             WHERE kind = $1 AND subject IS NOT NULL ORDER BY created_at_ms, id",
+            sql_params![kind],
+        )
+        .await?
+    {
+        if let (Ok(subject), Ok(response)) = (row.string("subject"), row.string("response")) {
+            latest.insert(
+                subject,
+                serde_json::from_str(&response).unwrap_or(Value::Null),
+            );
+        }
+    }
+    Ok(latest)
+}
+
 async fn latest_rows(
     antfly: &Antfly,
     kind: &str,

@@ -128,7 +128,7 @@ const PROVISIONAL_WEIGHT: f64 = 0.5;
 /// `part_of`, `alternative_to`) from a seed, not about a seed itself.
 const LINKED_WEIGHT: f64 = 0.5;
 
-fn fnv1a(text: &str) -> u64 {
+pub(crate) fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);
@@ -865,13 +865,17 @@ impl Knowledge<'_> {
         }
         let mut superseded: BTreeMap<String, String> = BTreeMap::new();
         let mut writes = Vec::with_capacity(pending.len());
+        let mut settled = Vec::with_capacity(pending.len());
+        let mut decisions = Vec::new();
         for mut claim in pending.iter().cloned() {
             if claim.status == ClaimStatus::Current {
+                let mut considered = Vec::new();
                 match self
                     .supersede_candidates(thread_id, claim.kind, &claim.statement)
                     .await
                 {
                     Ok(candidates) => {
+                        considered = candidates.iter().map(|c| c.id.clone()).collect();
                         for earlier in candidates {
                             if superseded.contains_key(&earlier.id) {
                                 continue;
@@ -890,24 +894,56 @@ impl Knowledge<'_> {
                     }
                     Err(err) => tracing::warn!("antfly: supersession search failed: {err}"),
                 }
+                decisions.push(crate::claim_memory::Decision {
+                    claim_id: claim.id.clone(),
+                    statement: claim.statement.clone(),
+                    candidates: considered,
+                    supersedes: claim.supersedes.clone(),
+                });
             }
             claim.settled = true;
             writes.push(Write::put(claim.id.clone(), claim.to_doc()?));
+            settled.push(claim);
         }
-        let _guard = self.antfly.lock().await;
-        for (earlier_id, later_id) in &superseded {
-            let Some(doc) = documents.get(earlier_id.clone()).await? else {
-                continue;
-            };
-            let Some(mut earlier) = Claim::from_doc(earlier_id, doc) else {
-                continue;
-            };
-            earlier.status = ClaimStatus::Superseded;
-            earlier.superseded_by = Some(later_id.clone());
-            writes.push(Write::put(earlier.id.clone(), earlier.to_doc()?));
+        {
+            let _guard = self.antfly.lock().await;
+            for (earlier_id, later_id) in &superseded {
+                let Some(doc) = documents.get(earlier_id.clone()).await? else {
+                    continue;
+                };
+                let Some(mut earlier) = Claim::from_doc(earlier_id, doc) else {
+                    continue;
+                };
+                earlier.status = ClaimStatus::Superseded;
+                earlier.superseded_by = Some(later_id.clone());
+                writes.push(Write::put(earlier.id.clone(), earlier.to_doc()?));
+            }
+            documents.write(writes).await?;
         }
-        documents.write(writes).await?;
+        if self.config.claim_memory == crate::TriageMode::Shadow {
+            crate::claim_memory::shadow_settle(self.antfly, &settled, &decisions).await;
+        }
         Ok(pending.len())
+    }
+
+    /// Observes every settled claim in the memory service's claim space (see
+    /// [`crate::claim_memory`]), so shadow comparisons can propose claims
+    /// that settled before the shadow was on. Returns how many were
+    /// observed.
+    pub async fn mirror_settled_claims(&self) -> AntflyResult<usize> {
+        let claims: Vec<Claim> = self
+            .antfly
+            .documents(schema::KNOWLEDGE)
+            .scan(ScanRequest::prefix(&format!(
+                "{}:",
+                crate::keys::escape(TURN_CLAIMS_VERSION)
+            )))
+            .await?
+            .into_iter()
+            .filter_map(|document| Claim::from_doc(&document.key, document.doc))
+            .filter(|claim| claim.settled)
+            .collect();
+        crate::claim_memory::mirror(self.antfly, &claims).await
     }
 
     /// Deletes every claim distilled from `thread_id`.

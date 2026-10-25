@@ -7,6 +7,7 @@
 
 mod backend;
 pub mod bench;
+pub mod claim_memory;
 pub mod claim_progress;
 mod config;
 mod embedded;

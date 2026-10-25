@@ -369,6 +369,24 @@ fn knowledge_links_claims_and_notes_through_concepts() -> Result<(), Box<dyn std
             .ok_or("thread B's decision missing")?;
         assert!(later.settled);
         assert_eq!(later.supersedes, vec![a_decision.clone()]);
+        // The memory service shadow logged its candidates for the decision
+        // next to Codex's, and found the claim Codex superseded.
+        let shadow = codex_antfly::labels::latest_responses(
+            &antfly,
+            codex_antfly::claim_memory::SHADOW_KIND,
+        )
+        .await?;
+        let logged = shadow.get(&b_decision).ok_or("no shadow comparison")?;
+        assert_eq!(logged["retrieval"], "indexed", "{logged}");
+        assert_eq!(logged["codex_supersedes"], json!([a_decision]));
+        assert!(
+            logged["memory_candidates"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&json!(a_decision))),
+            "{logged}"
+        );
+        let report = codex_antfly::claim_memory::report(&antfly).await?;
+        assert_eq!((report.supersessions, report.found), (1, 1), "{report:?}");
         antfly
             .documents(schema::MEMORY_NOTES)
             .write(vec![Write::put(
@@ -1051,6 +1069,69 @@ fn label_logs_record_decisions_and_extracted_turns() -> Result<(), Box<dyn std::
         };
         // Both turns produced claims; at 0.5 the second would be lost.
         assert_eq!((at(0), at(1)), ((2, 2, 0), (1, 2, 1)));
+        antfly.close().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
+}
+
+/// With the default embedder, the memory shadow compares semantic
+/// candidates, which find a reworded update.
+#[test]
+fn claim_memory_shadow_uses_semantic_candidates() -> Result<(), Box<dyn std::error::Error>> {
+    use codex_antfly::knowledge::ClaimKind;
+    use codex_antfly::knowledge::TurnClaim;
+    use codex_antfly::knowledge::TurnClaimBatch;
+    if !has_models("google") || !has_models("convaiinnovations") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    runtime().block_on(async {
+        let antfly = open(&dir, true);
+        let knowledge = antfly.knowledge().ok_or("knowledge graph disabled")?;
+        let batch = |thread: &str, statement: &str| TurnClaimBatch {
+            thread_id: thread.to_string(),
+            cwd: Some("/src/codex".to_string()),
+            source_updated_at_ms: 1,
+            claims: vec![TurnClaim {
+                kind: ClaimKind::Decision,
+                statement: statement.to_string(),
+                turn_id: Some("turn-1".to_string()),
+                turn_ordinal: 0,
+                replaces: Vec::new(),
+                motivates: Vec::new(),
+                rejected_in_favor_of: Vec::new(),
+            }],
+            retracts: Vec::new(),
+        };
+        let earlier = knowledge
+            .append_turn_claims(batch(
+                "thread-a",
+                "Run the test suite on every pull request in CI.",
+            ))
+            .await?;
+        knowledge.settle_thread("thread-a").await?;
+        let later = knowledge
+            .append_turn_claims(batch(
+                "thread-b",
+                "Continuous integration now checks each PR with the full tests plus clippy.",
+            ))
+            .await?;
+        knowledge.settle_thread("thread-b").await?;
+        let shadow = codex_antfly::labels::latest_responses(
+            &antfly,
+            codex_antfly::claim_memory::SHADOW_KIND,
+        )
+        .await?;
+        let logged = shadow.get(&later[0].id).ok_or("no shadow comparison")?;
+        assert_eq!(logged["mode"], "semantic", "{logged}");
+        assert_eq!(logged["semantic_discovery"], "indexed", "{logged}");
+        assert!(
+            logged["memory_candidates"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&json!(earlier[0].id))),
+            "{logged}"
+        );
         antfly.close().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;

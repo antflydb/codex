@@ -73,6 +73,10 @@ pub struct KnowledgeConfig {
     /// Whether consolidation screens concepts for generic words: `Shadow`
     /// (the default) logs proposals for review, `Enforce` ignores them.
     pub concept_screening: TriageMode,
+    /// Whether settled claims are mirrored into Antfly's memory service
+    /// (`Shadow`, the default) to compare its supersession candidates with
+    /// Codex's decisions. `Enforce` is not supported yet.
+    pub claim_memory: TriageMode,
 }
 
 impl Default for KnowledgeConfig {
@@ -84,6 +88,7 @@ impl Default for KnowledgeConfig {
             concept_aliases: Vec::new(),
             describe_model: Some(DEFAULT_DESCRIBE_MODEL.to_string()),
             concept_screening: TriageMode::Shadow,
+            claim_memory: TriageMode::Shadow,
         }
     }
 }
@@ -221,6 +226,7 @@ pub struct AntflyTomlSettings {
     pub claim_triage_threshold: Option<f64>,
     pub concept_aliases: Option<std::collections::BTreeMap<String, String>>,
     pub concept_screening: Option<String>,
+    pub claim_memory: Option<String>,
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -322,6 +328,16 @@ impl AntflyConfig {
                     Some(other) => {
                         return Err(AntflyError::Config(format!(
                             "concept_screening must be off, shadow, or enforce; got {other}"
+                        )));
+                    }
+                },
+                claim_memory: match settings.claim_memory.as_deref() {
+                    None => default.claim_memory,
+                    Some("off") => TriageMode::Off,
+                    Some("shadow") => TriageMode::Shadow,
+                    Some(other) => {
+                        return Err(AntflyError::Config(format!(
+                            "claim_memory must be off or shadow; got {other}"
                         )));
                     }
                 },

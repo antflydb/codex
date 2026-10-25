@@ -664,6 +664,8 @@ pub struct KnowledgeStatus {
     pub merged_concepts: u64,
     /// Shadow triage verdicts scored against extraction results.
     pub triage: codex_antfly::labels::TriageReport,
+    /// The memory service's supersession candidates against Codex's.
+    pub claim_memory: codex_antfly::claim_memory::ShadowReport,
 }
 
 /// Thresholds `codex knowledge status` reports triage at.
@@ -688,18 +690,19 @@ pub async fn status(antfly: &Antfly) -> anyhow::Result<KnowledgeStatus> {
         concepts: knowledge.concepts().await?.len(),
         merged_concepts: knowledge.merged_concept_count().await?,
         triage: codex_antfly::labels::triage_report(antfly, TRIAGE_THRESHOLDS).await?,
+        claim_memory: codex_antfly::claim_memory::report(antfly).await?,
     })
+}
+
+/// The judge metadata this Codex freezes on the external runs it starts.
+pub fn memory_judge(config: &Config) -> serde_json::Value {
+    super::memory_eval::judge_metadata(&codex_memories_write::extraction_model(config))
 }
 
 /// Judges the tasks of an external Antfly memory evaluation run with the
 /// extraction model (concept identity, typed relations, four-way
 /// supersession) and submits the verdicts. Unsure answers abstain; failed
 /// model requests are submitted as invalid outputs.
-/// The judge metadata this Codex freezes on the external runs it starts.
-pub fn memory_judge(config: &Config) -> serde_json::Value {
-    super::memory_eval::judge_metadata(&codex_memories_write::extraction_model(config))
-}
-
 pub async fn judge_memory_evaluation(
     thread_manager: &Arc<ThreadManager>,
     config: &Config,

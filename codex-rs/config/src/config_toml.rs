@@ -640,6 +640,10 @@ pub struct AntflyStoreToml {
     /// consolidation: `off`, `shadow` (log proposals to review with `codex
     /// knowledge proposals`; the default), or `enforce` (ignore them).
     pub concept_screening: Option<String>,
+    /// Mirror settled claims into Antfly's memory service and log its
+    /// supersession candidates next to Codex's own decisions: `off` or
+    /// `shadow` (the default). See `codex knowledge status`.
+    pub claim_memory: Option<String>,
 }
 
 /// Local typed-decision review of approval requests.

@@ -1496,6 +1496,30 @@ Semantic keeps full recall with half the non-replacing candidates, so it is
 the mode to judge from. Lite still needs the memory `advance` action to make
 candidates ready.
 
+**Claim memory shadow.** `claim_memory = "shadow"` (the default; `"off"`
+disables it) mirrors claims into the `codex_claims` memory space as threads
+settle, and logs the space's supersession candidates next to Codex's own:
+- each settled, non-retracted claim becomes a `settled` assertion: subject
+  `cwd:<working directory>`, predicate `states`, the claim's kind (the memory
+  service's kinds match Codex's), one evidence record; ids hash the claim id;
+- Codex's `supersedes` links are not written, so the service proposes
+  candidates on its own;
+- for each current claim, the candidates (10, semantic when the embedder's
+  dimension is known, else lexical) go to `codex_decision_log` as
+  `memory_supersession`, with the candidates Codex searched and the claims
+  it superseded. On Lite, Codex calls the memory `advance` action until the
+  candidates are indexed (bounded);
+- the default embedder's dimension (768) is filled in until the service
+  detects it (antflydb/antfly#1295); other embedders need `embedder_dims`;
+- failures are logged and never fail settling.
+
+`codex knowledge status` reports the comparison (claims compared, Codex
+supersessions found among the service's candidates, candidate overlap), and
+`codex knowledge memory-mirror` observes claims that settled before the
+shadow was on. Both embedded tests check it: lexical (the
+`knowledge_links` fixture finds Codex's supersession) and semantic (a
+reworded CI decision is found).
+
 ## Durable sessions across processes
 
 Prototype (October 23): could a Codex agent survive its process dying, with

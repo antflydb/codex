@@ -4554,6 +4554,10 @@
               "description": "Extract claims from finished turns with the memory extraction model (default `true` when the knowledge graph is on).",
               "type": "boolean"
             },
+            "claim_memory": {
+              "description": "Mirror settled claims into Antfly's memory service and log its supersession candidates next to Codex's own decisions: `off` or `shadow` (the default). See `codex knowledge status`.",
+              "type": "string"
+            },
             "claim_settle_minutes": {
               "description": "Idle time after which a thread's provisional claims are settled (default 30 minutes).",
               "format": "uint64",

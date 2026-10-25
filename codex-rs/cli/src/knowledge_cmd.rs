@@ -48,6 +48,9 @@ pub enum KnowledgeSubcommand {
     /// Judge an Antfly memory evaluation run with the extraction model
     /// (identity, typed relations, supersession) and submit the verdicts.
     MemoryEval(MemoryEvalArgs),
+    /// Observe every settled claim in Antfly's memory service, so the
+    /// claim memory shadow can propose claims that settled before it was on.
+    MemoryMirror,
     /// Write candidate concept pairs (JSONL) for labeling merges and
     /// relations.
     ExportPairs(ExportPairsArgs),
@@ -203,6 +206,17 @@ impl KnowledgeCli {
         let antfly = codex_antfly::shared(antfly_config);
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
+            KnowledgeSubcommand::MemoryMirror => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let observed = knowledge.mirror_settled_claims().await?;
+                println!(
+                    "observed {observed} settled claims in memory space {}",
+                    codex_antfly::claim_memory::SPACE
+                );
+                Ok(())
+            }
             KnowledgeSubcommand::Backfill(args) => backfill(&antfly, config, args).await,
             KnowledgeSubcommand::Unlink(args) => {
                 let knowledge = antfly
@@ -708,6 +722,23 @@ async fn print_status(antfly: &codex_antfly::Antfly) -> Result<()> {
                 point.threshold, point.kept_with_claims, point.with_claims, point.skipped
             );
         }
+    }
+    let shadow = &status.claim_memory;
+    if shadow.claims > 0 {
+        println!(
+            "claim memory shadow ({}): {} settled claims compared, {} before its indexes were ready",
+            shadow.mode.as_deref().unwrap_or("?"),
+            shadow.claims,
+            shadow.not_ready
+        );
+        println!(
+            "  Codex superseded {}; {} were among the memory service's candidates",
+            shadow.supersessions, shadow.found
+        );
+        println!(
+            "  candidates: {} from the memory service, {} from Codex, {} from both",
+            shadow.memory_candidates, shadow.codex_candidates, shadow.shared_candidates
+        );
     }
     for (thread, failures, error) in &status.progress.failing {
         println!("  failing {thread} ({failures}x): {error}");

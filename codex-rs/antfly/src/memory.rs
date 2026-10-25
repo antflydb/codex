@@ -209,6 +209,25 @@ impl<'a> MemorySpace<'a> {
     }
 }
 
+impl Antfly {
+    /// Memory space `space` on this database's backend: in process on Lite,
+    /// over HTTP (with the configured bearer token) on a server.
+    pub fn memory_space(&self, space: &str) -> AntflyResult<MemorySpace<'_>> {
+        match &self.config().backend {
+            crate::BackendConfig::Embedded { .. } => Ok(MemorySpace::embedded(self, space)),
+            crate::BackendConfig::Remote {
+                url, api_key_env, ..
+            } => MemorySpace::remote(
+                url,
+                space,
+                api_key_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok()),
+            ),
+        }
+    }
+}
+
 /// The HTTP method, URL and body for one memory action.
 fn http_route(
     base_url: &str,
