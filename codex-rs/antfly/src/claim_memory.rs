@@ -297,15 +297,34 @@ pub struct ShadowReport {
     pub codex_candidates: usize,
     /// Claims both Codex and the memory service proposed.
     pub shared_candidates: usize,
+    /// Supersessions within one thread (the extractor's `replaces`), and
+    /// how many of them the memory service proposed.
+    pub within_thread: usize,
+    pub within_thread_found: usize,
+    /// Codex supersessions the memory service did not propose.
+    pub misses: Vec<Miss>,
+}
+
+/// A claim Codex superseded that was not among the memory service's
+/// candidates for its replacement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Miss {
+    pub claim: String,
+    pub superseded: String,
+    pub within_thread: bool,
+    /// The memory service's candidates, best first.
+    pub memory_candidates: Vec<String>,
+}
+
+/// The thread a claim id belongs to (`<version>:<thread>:...`).
+fn thread_of(claim_id: &str) -> Option<&str> {
+    claim_id.split(':').nth(1)
 }
 
 /// Compares the latest shadow comparison of each claim.
 pub async fn report(antfly: &Antfly) -> AntflyResult<ShadowReport> {
     let mut report = ShadowReport::default();
-    for response in crate::labels::latest_responses(antfly, SHADOW_KIND)
-        .await?
-        .into_values()
-    {
+    for (claim, response) in crate::labels::latest_responses(antfly, SHADOW_KIND).await? {
         let ids = |field: &str| -> BTreeSet<String> {
             response[field]
                 .as_array()
@@ -324,6 +343,27 @@ pub async fn report(antfly: &Antfly) -> AntflyResult<ShadowReport> {
         }
         report.supersessions += supersedes.len();
         report.found += supersedes.intersection(&memory).count();
+        for earlier in &supersedes {
+            let within_thread = thread_of(earlier) == thread_of(&claim);
+            let found = memory.contains(earlier);
+            if within_thread {
+                report.within_thread += 1;
+                report.within_thread_found += usize::from(found);
+            }
+            if !found {
+                report.misses.push(Miss {
+                    claim: claim.clone(),
+                    superseded: earlier.clone(),
+                    within_thread,
+                    memory_candidates: response["memory_candidates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect(),
+                });
+            }
+        }
         report.memory_candidates += memory.len();
         report.codex_candidates += codex.len();
         report.shared_candidates += codex.intersection(&memory).count();
@@ -341,6 +381,15 @@ mod tests {
         assert_eq!(subject(Some("/src/codex/")), "cwd:/src/codex");
         assert_eq!(subject(None), "cwd:unknown");
         assert_eq!(subject(Some("")), "cwd:unknown");
+    }
+
+    #[test]
+    fn claim_ids_name_their_thread() {
+        assert_eq!(
+            thread_of("turns:thread-a:00000000000000000000:000"),
+            Some("thread-a")
+        );
+        assert_eq!(thread_of("claim-1"), None);
     }
 
     #[test]

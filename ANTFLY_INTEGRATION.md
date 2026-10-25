@@ -1520,6 +1520,21 @@ shadow was on. Both embedded tests check it: lexical (the
 `knowledge_links` fixture finds Codex's supersession) and semantic (a
 reworded CI decision is found).
 
+**First real run** (October 25). 11 recent threads from the `antfly` repo,
+imported into a scratch database and backfilled oldest first: 136 settled
+claims compared, all with indexes ready.
+
+| Codex supersession | Proposed by the memory service | On inspection |
+| --- | --- | --- |
+| within a thread (extractor `replaces`) | 25 of 27 | real updates |
+| across threads (settle-time decide model) | 0 of 7 | all 7 wrong |
+
+The cross-thread misses are the decide model superseding unrelated claims
+("PR #1155 was squash-merged" over a Discord failover decision), which hides
+valid claims from retrieval. Candidate pools barely overlap (16 shared of 568
+from the service and 329 from Codex). `codex knowledge memory-shadow` prints
+this split and each miss with its statements and the service's candidates.
+
 ## Durable sessions across processes
 
 Prototype (October 23): could a Codex agent survive its process dying, with

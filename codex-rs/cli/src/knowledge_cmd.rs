@@ -51,6 +51,9 @@ pub enum KnowledgeSubcommand {
     /// Observe every settled claim in Antfly's memory service, so the
     /// claim memory shadow can propose claims that settled before it was on.
     MemoryMirror,
+    /// Compare the memory service's supersession candidates with Codex's
+    /// decisions, listing the supersessions it did not propose.
+    MemoryShadow,
     /// Write candidate concept pairs (JSONL) for labeling merges and
     /// relations.
     ExportPairs(ExportPairsArgs),
@@ -206,6 +209,46 @@ impl KnowledgeCli {
         let antfly = codex_antfly::shared(antfly_config);
         match self.subcommand {
             KnowledgeSubcommand::Status => print_status(&antfly).await,
+            KnowledgeSubcommand::MemoryShadow => {
+                let knowledge = antfly
+                    .knowledge()
+                    .ok_or_else(|| anyhow::anyhow!("the knowledge graph is off"))?;
+                let report = codex_antfly::claim_memory::report(&antfly).await?;
+                println!(
+                    "{} settled claims compared ({}); Codex superseded {}, {} among the memory service's candidates",
+                    report.claims,
+                    report.mode.as_deref().unwrap_or("?"),
+                    report.supersessions,
+                    report.found
+                );
+                println!(
+                    "  within a thread: {} of {}; across threads: {} of {}",
+                    report.within_thread_found,
+                    report.within_thread,
+                    report.found - report.within_thread_found,
+                    report.supersessions - report.within_thread
+                );
+                let statement = async |id: &str| -> String {
+                    match knowledge.get(id).await {
+                        Ok(Some(claim)) => format!("[{}] {}", claim.kind.as_str(), claim.statement),
+                        _ => id.to_string(),
+                    }
+                };
+                for miss in &report.misses {
+                    let scope = if miss.within_thread {
+                        "within thread"
+                    } else {
+                        "across threads"
+                    };
+                    println!("\nmissed ({scope}):");
+                    println!("  later:   {}", statement(&miss.claim).await);
+                    println!("  earlier: {}", statement(&miss.superseded).await);
+                    for candidate in miss.memory_candidates.iter().take(3) {
+                        println!("  memory proposed: {}", statement(candidate).await);
+                    }
+                }
+                Ok(())
+            }
             KnowledgeSubcommand::MemoryMirror => {
                 let knowledge = antfly
                     .knowledge()
