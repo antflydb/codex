@@ -2184,28 +2184,42 @@ impl Knowledge<'_> {
                 return linked;
             }
         };
-        let request = json!({
-            "graph_queries": {"links": {"index": index, "traverse": {
-                "start": {"keys": keys},
-                "direction": "both",
-                "edge_types": CONCEPT_LINK_KINDS,
-                "max_depth": 1,
-                "include_documents": false, "include_paths": true,
-                "deduplicate_nodes": false, "limit": 200,
-            }}},
-            "limit": 1,
-        });
-        let response = match documents.query(request).await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::debug!("antfly: concept links traversal failed: {err}");
-                return linked;
-            }
-        };
-        for node in reached_nodes(&response, "links") {
-            let neighbors = linked.entry(node.from.clone()).or_default();
-            if node.key != node.from && !neighbors.contains(&node.key) {
-                neighbors.push(node.key);
+        // One deduplicated traversal per start preserves its identity across
+        // Lite and server without enumerating duplicate paths. Bound each RPC
+        // and its retained results independently of the caller's seed count.
+        for chunk in keys.chunks(32) {
+            let queries: serde_json::Map<String, Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(position, key)| {
+                    (
+                        format!("links{position}"),
+                        json!({"index": index, "traverse": {
+                            "start": {"keys": [key]},
+                            "direction": "both",
+                            "edge_types": CONCEPT_LINK_KINDS,
+                            "max_depth": 1,
+                            "include_documents": false, "include_paths": true, "deduplicate_nodes": true,
+                            "limit": 200,
+                        }}),
+                    )
+                })
+                .collect();
+            let request = json!({"graph_queries": queries, "limit": 1});
+            let response = match documents.query(request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::debug!("antfly: concept links traversal failed: {err}");
+                    continue;
+                }
+            };
+            for (position, key) in chunk.iter().enumerate() {
+                for node in reached_nodes(&response, &format!("links{position}")) {
+                    let neighbors = linked.entry(key.clone()).or_default();
+                    if node.key != *key && !neighbors.contains(&node.key) {
+                        neighbors.push(node.key);
+                    }
+                }
             }
         }
         linked

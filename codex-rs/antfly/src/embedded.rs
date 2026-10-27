@@ -97,6 +97,8 @@ pub struct EmbeddedBackend {
     /// `table:desired graph name` → the graph index actually serving it.
     /// Differs while a replacement of an older version is still building.
     serving: Mutex<HashMap<String, String>>,
+    /// Managed replacement lineage survives refreshes of the serving-name cache.
+    graph_replacements: Arc<Mutex<HashMap<(String, String), String>>>,
 }
 
 /// How long opening waits for a graph replacement before letting it finish
@@ -366,6 +368,7 @@ impl EmbeddedBackend {
             executor,
             known_indexes: Mutex::new(HashSet::new()),
             serving: Mutex::new(HashMap::new()),
+            graph_replacements: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -497,6 +500,55 @@ fn names(listing: &[u8]) -> HashSet<String> {
         .collect()
 }
 
+/// Rewrite only graph index references whose managed predecessor has retired.
+/// Follow known successive replacements with a finite cycle bound. Literal
+/// document fields and missing/unmanaged names retain their original meaning.
+fn retarget_retired_graph_queries(
+    request: &mut Value,
+    table: &str,
+    replacements: &HashMap<(String, String), String>,
+    active: &HashSet<String>,
+) -> bool {
+    let retarget = |index: &mut Value| {
+        let Some(original) = index.as_str() else {
+            return false;
+        };
+        if active.contains(original) {
+            return false;
+        }
+        let mut candidate = original;
+        for _ in 0..replacements.len() {
+            let Some(next) = replacements.get(&(table.to_string(), candidate.to_string())) else {
+                return false;
+            };
+            if active.contains(next) {
+                *index = Value::String(next.clone());
+                return true;
+            }
+            candidate = next;
+        }
+        false
+    };
+    let mut changed = false;
+    if let Some(queries) = request
+        .get_mut("graph_queries")
+        .and_then(Value::as_object_mut)
+    {
+        for query in queries.values_mut() {
+            if let Some(index) = query.get_mut("index") {
+                changed |= retarget(index);
+            }
+        }
+    }
+    if let Some(index) = request
+        .get_mut("graph_metric")
+        .and_then(|metric| metric.get_mut("index"))
+    {
+        changed |= retarget(index);
+    }
+    changed
+}
+
 impl EmbeddedBackend {
     /// Adds a graph index when missing, dropping stale versions of it. Its
     /// inline artifact producers and resolvers register with the index.
@@ -514,6 +566,8 @@ impl EmbeddedBackend {
         let prefix = graph.replaces_prefix;
         let config = graph.config;
         let enrichments = graph.enrichments;
+        let graph_replacements = Arc::clone(&self.graph_replacements);
+        let route_table = table.to_string();
         let state = self
             .call_in(table.to_string(), move |db| {
                 ensure_enrichments(db, &enrichments)?;
@@ -541,6 +595,14 @@ impl EmbeddedBackend {
                 // once the replacement has swapped in. A refused replacement
                 // leaves the old version serving rather than failing setup.
                 let old = stale.last().map(|old| old.as_str());
+                // Register before publication can retire the old name. A
+                // query already holding that name can then recover the race.
+                if let Some(old) = old {
+                    graph_replacements
+                        .lock()
+                        .map_err(|_| AntflyError::ExecutorUnavailable)?
+                        .insert((route_table.clone(), old.to_string()), name.clone());
+                }
                 let result = match old {
                     Some(_) => migrate_resolver_namespaces(db, &config)
                         .and_then(|()| reconcile_graph(db, &name, old, &config)),
@@ -668,12 +730,44 @@ impl Backend for EmbeddedBackend {
         })
     }
 
-    fn query(&self, table: String, request: Value) -> BackendFuture<'_, Value> {
+    fn query(&self, table: String, mut request: Value) -> BackendFuture<'_, Value> {
         Box::pin(async move {
             let bytes = serde_json::to_vec(&request)?;
+            let graph_replacements = Arc::clone(&self.graph_replacements);
+            let route_table = table.clone();
             let raw = self
                 .call_in(table, move |db| {
-                    db.search_json(&bytes).map_err(embedded("search"))
+                    match db.search_json(&bytes) {
+                        Ok(response) => Ok(response),
+                        Err(err)
+                            if is_kind(&err, antfly_embedded::Error::NotFound)
+                                && (request.get("graph_queries").is_some()
+                                    || request.get("graph_metric").is_some()) =>
+                        {
+                            // Serving-name discovery and search are separate
+                            // calls. Retry only a confirmed managed retirement,
+                            // once, without masking other missing objects.
+                            let active =
+                                names(&db.indexes_json().map_err(embedded("list graph indexes"))?);
+                            let changed = {
+                                let replacements = graph_replacements
+                                    .lock()
+                                    .map_err(|_| AntflyError::ExecutorUnavailable)?;
+                                retarget_retired_graph_queries(
+                                    &mut request,
+                                    &route_table,
+                                    &replacements,
+                                    &active,
+                                )
+                            };
+                            if !changed {
+                                return Err(embedded("search")(err));
+                            }
+                            db.search_json(serde_json::to_vec(&request)?)
+                                .map_err(embedded("search replacement graph"))
+                        }
+                        Err(err) => Err(embedded("search")(err)),
+                    }
                 })
                 .await?;
             Ok(serde_json::from_slice(&raw)?)
@@ -1124,6 +1218,74 @@ impl Drop for LocalDecider {
         };
         if let Ok(sender) = self.executor.sender.lock() {
             let _ = sender.send(Box::new(move || drop(inference)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_replacement_query_tests {
+    use super::*;
+
+    #[test]
+    fn retired_graph_routes_cover_traversal_metrics_and_successive_upgrades() {
+        let replacements = HashMap::from([
+            (("graphs".to_string(), "v1".to_string()), "v2".to_string()),
+            (("graphs".to_string(), "v2".to_string()), "v3".to_string()),
+        ]);
+        let active = HashSet::from(["v3".to_string()]);
+        let mut request = json!({
+            "graph_queries": {"q": {"index": "v1", "traverse": {"start": {"keys": ["v1"]}}}},
+            "graph_metric": {"index": "v2", "metric": "pagerank"},
+            "filter": {"index": "v1"},
+        });
+        assert!(retarget_retired_graph_queries(
+            &mut request,
+            "graphs",
+            &replacements,
+            &active
+        ));
+        assert_eq!(request["graph_queries"]["q"]["index"], "v3");
+        assert_eq!(request["graph_metric"]["index"], "v3");
+        assert_eq!(
+            request["graph_queries"]["q"]["traverse"]["start"]["keys"][0],
+            "v1"
+        );
+        assert_eq!(request["filter"]["index"], "v1");
+    }
+
+    #[test]
+    fn graph_routes_preserve_live_unmanaged_cross_table_and_cyclic_references() {
+        let replacements = HashMap::from([
+            (("graphs".to_string(), "old".to_string()), "new".to_string()),
+            (
+                ("graphs".to_string(), "cycle-a".to_string()),
+                "cycle-b".to_string(),
+            ),
+            (
+                ("graphs".to_string(), "cycle-b".to_string()),
+                "cycle-a".to_string(),
+            ),
+        ]);
+        for (table, index, active) in [
+            (
+                "graphs",
+                "old",
+                HashSet::from(["old".to_string(), "new".to_string()]),
+            ),
+            ("other", "old", HashSet::from(["new".to_string()])),
+            ("graphs", "unmanaged", HashSet::from(["new".to_string()])),
+            ("graphs", "old", HashSet::new()),
+            ("graphs", "cycle-a", HashSet::new()),
+        ] {
+            let original = json!({"graph_queries": {"q": {"index": index}}});
+            let mut request = original.clone();
+            assert!(!retarget_retired_graph_queries(
+                &mut request,
+                table,
+                &replacements,
+                &active
+            ));
+            assert_eq!(request, original);
         }
     }
 }

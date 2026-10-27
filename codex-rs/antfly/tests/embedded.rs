@@ -538,6 +538,20 @@ fn graph_upgrades_replace_the_old_version_without_a_gap() -> Result<(), Box<dyn 
                 ],
             )
             .await?;
+        // A write receipt does not promise the graph has indexed it; what
+        // the replacement must preserve is what v1 already serves.
+        let mut indexed = false;
+        for _ in 0..200 {
+            let hits = backend
+                .query("graphs".to_string(), traverse("links_graph_v1"))
+                .await?;
+            if hits.to_string().contains("\"b\"") {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(indexed, "v1 never indexed a -> b");
         backend.close().await?;
 
         // A new version on reopen replaces v1; v1 serves until the swap.
@@ -562,6 +576,19 @@ fn graph_upgrades_replace_the_old_version_without_a_gap() -> Result<(), Box<dyn 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(serving, "links_graph_v2");
+        // Deterministically model a reader that selected v1 immediately
+        // before activation. The managed adapter must retry against v2.
+        let retired = backend
+            .query("graphs".to_string(), traverse("links_graph_v1"))
+            .await
+            .map_err(|err| format!("query graph retired during replacement: {err}"))?;
+        assert!(retired.to_string().contains("\"b\""), "{retired}");
+        assert!(
+            backend
+                .query("graphs".to_string(), traverse("unmanaged_missing_graph"))
+                .await
+                .is_err()
+        );
         // Reopening with the same version is a no-op and v1 is gone.
         backend.close().await?;
         let backend = EmbeddedBackend::open(&path, None)?;
@@ -1291,6 +1318,21 @@ fn concept_links_are_recorded_and_traversable() -> Result<(), Box<dyn std::error
         let mut from_gemma = linked.get(gemma).cloned().unwrap_or_default();
         from_gemma.sort();
         assert_eq!(from_gemma, vec![embedder.to_string(), qwen.to_string()]);
+        // Crossing the RPC batch bound preserves each root's neighbors and
+        // does not duplicate them when a root appears more than once.
+        let many: Vec<String> = [embedder, gemma]
+            .repeat(17)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let batched = knowledge.linked_concepts(&many).await;
+        assert_eq!(batched.len(), linked.len());
+        for (key, mut neighbors) in batched {
+            neighbors.sort();
+            let mut expected = linked.get(&key).ok_or("unexpected concept root")?.clone();
+            expected.sort();
+            assert_eq!(neighbors, expected);
+        }
 
         // Unlinking removes the edge whichever way it points, and the pair
         // stays judged so it is not linked again.

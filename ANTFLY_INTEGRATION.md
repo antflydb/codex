@@ -87,6 +87,15 @@ implementation differs and why.
 
 ### Antfly findings
 
+- Graph replacement (#1313) preserves the old index's visible state; a
+  `sync_level: "write"` receipt alone does not establish graph visibility.
+  Callers needing that guarantee must use `full_index` or observe a visibility
+  fence before replacement. Serving-name discovery can also race activation:
+  the embedded adapter records managed replacement lineage before publication
+  and retries a failed search once only when a typed `NotFound` and the catalog
+  confirm that the referenced graph retired and its replacement is active.
+  This covers traversal and graph metrics without an extra catalog call on
+  successful searches; unmanaged names and unrelated errors retain their meaning.
 - `libantfly.dylib` used to export `___dso_handle`, libc, compiler-rt, and
   internal symbols, which broke linking with aws-lc (antflydb/antfly#1023).
   Fixed in Antfly `8a8f338623` (#1022): the export trie now holds exactly the
@@ -164,7 +173,7 @@ Known limitations:
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
 - Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` built from
-  Antfly main at `809b5d8be0` (C ABI version 3, `zig build capi`; main needs Zig 0.17); CLI binaries and `codex-core` test
+  Antfly main at `55d97ce423` (C ABI version 3, `zig build capi`; main needs Zig 0.17); CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -172,7 +181,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` pinned to `809b5d8be0` (with the `sqlx`
+  `github.com/antflydb/antfly` pinned to `55d97ce423` (with the `sqlx`
   feature); bump `rev` together
   with the `libantfly` build.
 
@@ -515,7 +524,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `809b5d8be0`, which includes
+against Antfly 1258e8cfcb; the pin is now `55d97ce423`, which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
@@ -1268,7 +1277,10 @@ merged.
   graph index (`codex_concept_links_v1`) makes them traversable.
 - **Retrieval:** `knowledge.search` expands its seed concepts one link in
   either direction. Claims about a linked concept rank at half weight, and
-  the result lists `linked_concepts`.
+  the result lists `linked_concepts`. Each root gets a deduplicated traversal,
+  batched up to 32 roots per request with a 200-node limit per root. This
+  preserves the root-to-neighbor association on Lite and server without
+  requesting unsupported multi-root, non-deduplicated incoming traversal.
 - **On the E2E database:** two passes judged 72 pairs and made 15 links.
   About 11 were clearly right ("EmbeddingGemma 2 is_a embedder",
   "Codex semantic search part_of Codex"). Two were wrong: one reversed, and
