@@ -333,7 +333,7 @@ core_test_support = { path = "core/tests/common" }
 # External
 age = "0.12.1"
 ansi-to-tui = "8.0.1"
-antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "b0b39178d60c13617ca1f9c79b00f706093da244", features = ["libantfly", "sqlx"] }
+antfly-embedded = { git = "https://github.com/antflydb/antfly", rev = "809b5d8be027e9c6ee9ddf3b3e91f1402a92381b", features = ["libantfly", "sqlx"] }
 anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"

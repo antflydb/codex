@@ -39,10 +39,6 @@ const READY_POLL_DELAY: Duration = Duration::from_millis(200);
 /// Maintenance steps per poll on Lite, which runs memory work only when
 /// asked.
 const ADVANCE_STEPS: usize = 20;
-/// Output size of the default embedder (EmbeddingGemma 2). Memory spaces need
-/// an explicit dimension (antflydb/antfly#1295); other embedders get
-/// semantic candidates only with `embedder_dims` set.
-const DEFAULT_EMBEDDER_DIMS: u32 = 768;
 
 fn subject(cwd: Option<&str>) -> String {
     match cwd
@@ -55,30 +51,27 @@ fn subject(cwd: Option<&str>) -> String {
 }
 
 /// The space configuration, and the candidate mode it supports: semantic
-/// when the embedder's dimension is known, else lexical.
+/// with an embedder (the service resolves its revision and, unless
+/// `embedder_dims` truncates it, its native dimension), else lexical.
 fn space_config(antfly: &Antfly) -> (Value, &'static str) {
     let Some(embedder) = &antfly.config().embedder else {
         return (json!({}), "lexical");
     };
-    let default = crate::EmbedderConfig::default();
-    let dims = embedder
-        .dims
-        .or((embedder.model == default.model).then_some(DEFAULT_EMBEDDER_DIMS));
-    match dims {
-        Some(dims) => (
-            json!({
-                "features": {"semantic_recall": true},
-                "models": {"embedder": {
-                    "provider": "antfly",
-                    "model": embedder.model,
-                    "revision": "current",
-                    "dimensions": dims,
-                }},
-            }),
-            "semantic",
-        ),
-        None => (json!({}), "lexical"),
+    let mut model = json!({
+        "provider": "antfly",
+        "model": embedder.model,
+        "revision": "current",
+    });
+    if let Some(dims) = embedder.dims {
+        model["dimensions"] = json!(dims);
     }
+    (
+        json!({
+            "features": {"semantic_recall": true},
+            "models": {"embedder": model},
+        }),
+        "semantic",
+    )
 }
 
 /// The claim space, created on first use.
