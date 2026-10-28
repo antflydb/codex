@@ -2606,18 +2606,43 @@ pub const USER_ACTOR: &str = "codex/user";
 /// Proposals listed per request.
 const PROPOSAL_PAGE: usize = 200;
 
-/// Keys an entity action released or suppressed with its target, across
-/// resolvers.
+/// Keys an entity action released or suppressed with its target: the
+/// unique keys across the response's namespace outcomes.
 fn absorbed_keys(result: &Value) -> Vec<String> {
     let mut keys = BTreeSet::new();
-    for resolver in result["results"].as_array().into_iter().flatten() {
-        for absorbed in resolver["absorbed"].as_array().into_iter().flatten() {
+    for namespace in result["namespaces"].as_array().into_iter().flatten() {
+        for absorbed in namespace["absorbed"].as_array().into_iter().flatten() {
             if let Some(key) = absorbed["key"].as_str() {
                 keys.insert(key.to_string());
             }
         }
     }
     keys.into_iter().collect()
+}
+
+#[cfg(test)]
+mod absorbed_tests {
+    use super::absorbed_keys;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn absorbed_keys_are_unique_across_namespaces() {
+        let response = json!({
+            "results": [{"key_template": "concept/{slug}", "progress": {}}],
+            "namespaces": [
+                {"absorbed": [{"key": "concept/notes", "disposition": "suppress"}]},
+                {"absorbed": [
+                    {"key": "concept/notes", "disposition": "suppress"},
+                    {"key": "concept/memo", "disposition": "suppress"},
+                ]},
+            ],
+        });
+        assert_eq!(
+            absorbed_keys(&response),
+            vec!["concept/memo", "concept/notes"]
+        );
+    }
 }
 
 impl ConceptCuration {
