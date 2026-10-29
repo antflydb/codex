@@ -193,7 +193,7 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` at main `d35a1ef33e` (after `v0.3.0-rc.5`, with
+  `github.com/antflydb/antfly` at main `207cd9ca3b` (after `v0.3.0-rc.5`, with
   the `sqlx` feature). Pin by `tag` for a release and by `rev` between
   releases, and keep `ANTFLY_LIB_DIR` on the matching library.
 
@@ -536,7 +536,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now main `d35a1ef33e` (after `v0.3.0-rc.5`), which includes
+against Antfly 1258e8cfcb; the pin is now main `207cd9ca3b` (after `v0.3.0-rc.5`), which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135

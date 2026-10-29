@@ -1233,13 +1233,19 @@ fn concepts_are_described_from_their_claims() -> Result<(), Box<dyn std::error::
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let key = key.ok_or("no concept with claims about it")?;
-        // Let extraction finish, so the second pass sees no new concepts.
-        let mut seen = 0;
+        // Let extraction finish, so the second pass sees no new concepts and
+        // no new evidence for the ones already described.
+        let mut seen = Vec::new();
         let mut stable = 0;
         for _ in 0..300 {
-            let count = knowledge.concepts().await?.len();
-            stable = if count == seen { stable + 1 } else { 0 };
-            seen = count;
+            let mut snapshot = Vec::new();
+            for concept in knowledge.concepts().await? {
+                let evidence = knowledge.concept_evidence(&concept.key, 8).await;
+                snapshot.push((concept.key, evidence));
+            }
+            snapshot.sort();
+            stable = if snapshot == seen { stable + 1 } else { 0 };
+            seen = snapshot;
             if stable == 10 {
                 break;
             }
