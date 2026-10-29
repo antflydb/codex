@@ -172,9 +172,9 @@ Known limitations:
   publication protocol (retry `53300`; after `55000`, poll for the new
   table). Antfly Cloud does not expose the PostgreSQL listener yet
   (antflydb/colony#766).
-- Building requires `ANTFLY_LIB_DIR` pointing at the `lib/` of the pinned
-  release's `antfly-embedded_<version>_<OS>_<arch>.tar.gz` (C ABI version 3),
-  for example:
+- Building requires `ANTFLY_LIB_DIR` pointing at a `libantfly` (C ABI
+  version 3) matching the pin. When the pin is a release, use the `lib/` of
+  its `antfly-embedded_<version>_<OS>_<arch>.tar.gz`, for example:
   ```sh
   gh release download v0.3.0-rc.5 --repo antflydb/antfly \
     --pattern 'antfly-embedded_0.3.0-rc.5_Darwin_arm64.tar.gz' --pattern antfly_zig_checksums.txt
@@ -183,8 +183,9 @@ Known limitations:
   tar xzf antfly-embedded_0.3.0-rc.5_Darwin_arm64.tar.gz -C ~/.antfly/embedded/v0.3.0-rc.5
   export ANTFLY_LIB_DIR=~/.antfly/embedded/v0.3.0-rc.5/lib
   ```
-  Building `libantfly` from source (`zig build capi`, Zig 0.17) is only needed
-  between releases. CLI binaries and `codex-core` test
+  When the pin is a main commit, as now, build it from that commit
+  (`zig build antfly capi -Doptimize=ReleaseFast -j4`, Zig 0.17) and point
+  `ANTFLY_LIB_DIR` at `zig-out/lib`. CLI binaries and `codex-core` test
   binaries embed it as an rpath (the fs sandbox helper re-execs the binary
   with `DYLD_LIBRARY_PATH` stripped). Other crates' test binaries still need
   `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`.
@@ -192,8 +193,9 @@ Known limitations:
   overflows the default 2 MiB test-thread stack on upstream `3342ee8c07` as
   well; run `codex-core` unit tests with `RUST_MIN_STACK=16777216`.
 - The workspace `Cargo.toml` takes `antfly-embedded` from
-  `github.com/antflydb/antfly` at tag `v0.3.0-rc.5` (commit `ff2c66bd7b`, with
-  the `sqlx` feature); bump the tag together with the release tarball.
+  `github.com/antflydb/antfly` at main `d35a1ef33e` (after `v0.3.0-rc.5`, with
+  the `sqlx` feature). Pin by `tag` for a release and by `rev` between
+  releases, and keep `ANTFLY_LIB_DIR` on the matching library.
 
 ## Goals
 
@@ -534,7 +536,7 @@ Antfly-backed or the store is non-local: `core/src/session/session.rs:1139`,
 
 Status: claims, concepts, supersession, retrieval and the `knowledge.search`
 tool are implemented; see "Not built yet" for the rest. Findings were made
-against Antfly 1258e8cfcb; the pin is now `v0.3.0-rc.5` (`ff2c66bd7b`), which includes
+against Antfly 1258e8cfcb; the pin is now main `d35a1ef33e` (after `v0.3.0-rc.5`), which includes
 antflydb/antfly#1096 (fixes for #1089 and #1084), #1111 (query-time
 resolution, durable merges), #1114 (resolver ownership, shadow index
 replacement), #1127 (NUL diagnostics, statement context in errors), #1135
